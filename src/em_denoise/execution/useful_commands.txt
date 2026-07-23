@@ -1,0 +1,3 @@
+python run_experiment.py --config config.yaml
+tensorboard --logdir=/Users/ganctoma/SW/sort/N2V/run_18/experiments/run_03_new_metrics_epochs_10/logs  --reload_interval=5 --port=6006
+python run_inference.py --config config.yaml
