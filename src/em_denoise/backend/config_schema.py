@@ -33,6 +33,7 @@ class TrainingConfig(BaseModel):
 
 class PipelineConfig(BaseModel):
     paths: PathsConfig
+    checkpoints: dict[str, Path] = Field(default_factory=dict)
     dataset: DatasetConfig
     unet: UNetConfigSchema
     training: TrainingConfig
@@ -43,5 +44,5 @@ class PipelineConfig(BaseModel):
         if not yaml_path.exists():
             raise FileNotFoundError(f"Configuration file missing: {yaml_path}")
         with open(yaml_path, "r") as f:
-            data = yaml.safe_load(f)
+            data = yaml.safe_load(f) or {}
         return cls(**data)

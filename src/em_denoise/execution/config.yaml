@@ -1,7 +1,14 @@
 paths:
-  sandbox_root: "/Users/ganctoma/SW/sort/N2V/run_19/supervised_sandbox"
-#  sandbox_root: "/Users/ganctoma/SW/sort/N2V/run_xx"
-  experiment_dir: "/Users/ganctoma/SW/sort/N2V/run_19/experiments/run_00_epochs_10"
+  sandbox_root: "/Users/ganctoma/SW/sort/N2V/run_20/supervised_sandbox"
+  experiment_dir: "/Users/ganctoma/SW/sort/N2V"
+
+checkpoints:
+  Run_00: "/Users/ganctoma/SW/sort/N2V/run_18/experiments/run_01_supervised_baseline/checkpoints/best_model.pt"
+  Run_01: "/Users/ganctoma/SW/sort/N2V/run_18/experiments/run_02_new_metrics/checkpoints/best_model.pt"
+  Run_02: "/Users/ganctoma/SW/sort/N2V/run_18/experiments/run_03_new_metrics_epochs_10/checkpoints/best_model.pt"
+  Run_03: "/Users/ganctoma/SW/sort/N2V/run_19/experiments/run_00_epochs_10/checkpoints/best_model.pt"
+  Run_04: "/Users/ganctoma/SW/sort/N2V/run_20/experiments/run_0/checkpoints/best_model.pt"
+  Run_05: "/Users/ganctoma/SW/sort/N2V/run_20/experiments/run_1/checkpoints/best_model.pt"
 
 dataset:
   batch_size: 16
