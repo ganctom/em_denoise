@@ -197,7 +197,7 @@ def extract_and_save_sbem_patches_split(
 # ========================== Usage ==========================
 if __name__ == "__main__":
     sbem_dir = "/Volumes/tachyon/groups/scratch/gmicro_sem/gfriedri/_EM_acquisitions/20260201_RoLi_F1/tiles/g0000"
-    root_dir = "/Users/ganctoma/SW/sort/N2V/run_20"
+    root_dir = "/Users/ganctoma/SW/sort/N2V/run_22/supervised_sandbox"
     raw_dir = "raw_patches"
     fn_tile_ids = "all_tile_ids.txt"
     section_start = 2000
@@ -209,8 +209,8 @@ if __name__ == "__main__":
     extract_and_save_sbem_patches_split(
         root=sbem_dir,
         dest_root=root_dir,
-        tile_ids_file="/Users/ganctoma/SW/sort/N2V/run_18/all_tile_ids.txt",
-        total_images=200,  # total full images to sample
+        tile_ids_file="/Users/ganctoma/SW/sort/N2V/all_tile_ids.txt",
+        total_images=1000,  # total full images to sample
         train_ratio=0.8,
         val_ratio=0.1,
         patches_per_image=12,  # you can use more for train

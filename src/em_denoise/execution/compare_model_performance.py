@@ -7,11 +7,27 @@ import seaborn as sns
 import tifffile
 import torch
 from torch.utils.data import DataLoader
+from scipy.ndimage import sobel
 
 from em_denoise.backend.architecture import ResidualUNet, UNetConfig
 from em_denoise.backend.config_schema import PipelineConfig
 from em_denoise.backend.dataset import SupervisedEMDataset
 from em_denoise.backend.metrics import compute_psnr, compute_ssim
+
+
+def calculate_espi(raw: np.ndarray, denoised: np.ndarray) -> float:
+    """Computes edge preservation index"""
+    raw_f, den_f = raw.astype(np.float32), denoised.astype(np.float32)
+
+    grad_raw = np.hypot(sobel(raw_f, axis=1), sobel(raw_f, axis=0))
+    grad_den = np.hypot(sobel(den_f, axis=1), sobel(den_f, axis=0))
+
+    threshold = np.percentile(grad_raw, 90)
+    edge_mask = grad_raw > threshold
+    if not np.any(edge_mask):
+        return 0.0
+
+    return float(np.mean(grad_den[edge_mask]) / (np.mean(grad_raw[edge_mask]) + 1e-8))
 
 
 def compute_aufrc(pred: np.ndarray, target: np.ndarray) -> float:
@@ -89,9 +105,14 @@ def resolve_checkpoints(
 
 
 def _plot_metric_distributions(df_metrics: pd.DataFrame, save_path: Path) -> None:
-    """Renders visual comparative distributions (PSNR, SSIM, AUFRC) per model variant."""
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-    metrics = [("PSNR", "PSNR (dB)"), ("SSIM", "SSIM Index"), ("AUFRC", "AUFRC Score")]
+    """Renders visual comparative distributions (PSNR, SSIM, AUFRC, ESPI) per model variant."""
+    fig, axes = plt.subplots(1, 4, figsize=(16, 5))
+    metrics = [
+        ("PSNR", "PSNR (dB)"),
+        ("SSIM", "SSIM Index"),
+        ("AUFRC", "AUFRC Score"),
+        ("ESPI", "Edges Score"),
+    ]
 
     for idx, (metric_key, label) in enumerate(metrics):
         sns.boxplot(
@@ -166,17 +187,35 @@ def run_benchmark(
         pin_memory=(device.type == "cuda"),
     )
 
-    # Model instantiation
-    unet_config = UNetConfig(**cfg.unet.model_dump())
-    loaded_models: dict[str, ResidualUNet] = {}
+    # Store tuple of (model, predict_residual_flag) to support mixed-architecture benchmarks
+    loaded_models: dict[str, tuple[ResidualUNet, bool]] = {}
 
     for tag, path in ckpt_map.items():
-        model = ResidualUNet(unet_config).to(device)
-        checkpoint = torch.load(path, map_location=device, weights_only=True)
-        state_dict = checkpoint.get("model_state_dict", checkpoint)
-        model.load_state_dict(state_dict)
+        checkpoint = torch.load(path, map_location=device, weights_only=False)
+
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+            state_dict = checkpoint["model_state_dict"]
+            predict_residual = checkpoint.get("predict_residual", True)
+        else:
+            state_dict = checkpoint
+            predict_residual = True
+
+        # Check if the state_dict actually contains parameterized downsampling weights
+        has_downsample_weights = any(
+            "down_samples" in k and "conv" in k for k in state_dict.keys()
+        )
+
+        # Override the UNet config dynamically for this specific checkpoint
+        cfg_dict = cfg.unet.model_dump()
+        cfg_dict["use_conv_downsample"] = (
+            has_downsample_weights  # Map to your UNetConfig schema attribute
+        )
+        active_unet_cfg = UNetConfig(**cfg_dict)
+
+        model = ResidualUNet(active_unet_cfg).to(device)
+        model.load_state_dict(state_dict, strict=True)
         model.eval()
-        loaded_models[tag] = model
+        loaded_models[tag] = (model, predict_residual)
 
     out_dir = cfg.paths.experiment_dir / "benchmarks"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -185,14 +224,23 @@ def run_benchmark(
 
     print(f"[*] Benchmarking on test set ({len(test_dataset)} samples)...")
     for idx, (noisy, clean) in enumerate(test_loader):
-        noisy_dev = noisy.to(device, non_blocking=True)
-        clean_dev = clean.to(device, non_blocking=True)
+        noisy_dev = noisy.to(device=device, non_blocking=True)
+        clean_dev = clean.to(device=device, non_blocking=True)
 
         clean_np = clean_dev[0, 0].cpu().numpy()
         panel_tensors = [noisy_dev[0, 0]]
 
-        for tag, model in loaded_models.items():
-            denoised = torch.clamp(model(noisy_dev), 0.0, 1.0)
+        # Unpack both the model and its specific residual flag
+        for tag, (model, predict_residual) in loaded_models.items():
+            model_output = model(noisy_dev)
+
+            # Rank 2: Signal Reconstruction
+            if predict_residual:
+                denoised_signal = noisy_dev - model_output
+            else:
+                denoised_signal = model_output
+
+            denoised = torch.clamp(denoised_signal, 0.0, 1.0)
 
             psnr_val = compute_psnr(denoised, clean_dev)
             ssim_val = compute_ssim(denoised, clean_dev)
@@ -206,6 +254,7 @@ def run_benchmark(
 
             denoised_np = denoised[0, 0].cpu().numpy()
             aufrc_scalar = compute_aufrc(denoised_np, clean_np)
+            espi_scalar = calculate_espi(clean_np, denoised_np)
 
             metrics_records.append(
                 {
@@ -214,6 +263,7 @@ def run_benchmark(
                     "PSNR": psnr_scalar,
                     "SSIM": ssim_scalar,
                     "AUFRC": aufrc_scalar,
+                    "ESPI": espi_scalar,
                 }
             )
 
@@ -243,8 +293,9 @@ def run_benchmark(
             {
                 "Model": tag,
                 "PSNR (dB)": f"{sub_df['PSNR'].mean():.2f} ± {sub_df['PSNR'].std():.2f}",
-                "SSIM": f"{sub_df['SSIM'].mean():.4f} ± {sub_df['SSIM'].std():.4f}",
-                "AUFRC": f"{sub_df['AUFRC'].mean():.4f} ± {sub_df['AUFRC'].std():.4f}",
+                "SSIM": f"{sub_df['SSIM'].mean():.3f} ± {sub_df['SSIM'].std():.3f}",
+                "AUFRC": f"{sub_df['AUFRC'].mean():.3f} ± {sub_df['AUFRC'].std():.3f}",
+                "ESPI": f"{sub_df['ESPI'].mean():.1f} ± {sub_df['AUFRC'].std():.1f}",
             }
         )
 

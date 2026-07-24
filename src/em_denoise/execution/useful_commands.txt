@@ -1,3 +1,7 @@
 python run_experiment.py --config config.yaml
-tensorboard --logdir=/Users/ganctoma/SW/sort/N2V/run_18/experiments/run_03_new_metrics_epochs_10/logs  --reload_interval=5 --port=6006
+tensorboard --logdir=/Users/ganctoma/logs  --reload_interval=5 --port=6006
+tensorboard --logdir=/Users/ganctoma/SW/sort/N2V/run_22/experiments/logs  --reload_interval=5 --port=6006
+tensorboard --logdir=/Users/ganctoma/SW/sort/N2V/run_22/experiments/03_ep_10_lr_0001_wd_0001/logs  --reload_interval=5 --port=6006
 python run_inference.py --config config.yaml
+
+uv run src/em_denoise/execution/run_experiment.py --config src/em_denoise/execution/config.yaml

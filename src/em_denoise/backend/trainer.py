@@ -1,11 +1,13 @@
+from pathlib import Path
+from typing import Tuple
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from pathlib import Path
 from tqdm import tqdm
 
-from metrics import compute_psnr, compute_ssim
+from em_denoise.backend.metrics import compute_psnr, compute_ssim
 
 
 class SupervisedTrainer:
@@ -15,10 +17,11 @@ class SupervisedTrainer:
         train_loader: DataLoader,
         val_loader: DataLoader,
         optimizer: torch.optim.Optimizer,
-        scheduler: torch.optim.lr_scheduler.LRScheduler,
+        scheduler: torch.optim.lr_scheduler.LRScheduler | None,
         criterion: nn.Module,
         device: torch.device,
         output_dir: Path,
+        predict_residual: bool = True,  # Rank 2 configuration flag
     ):
         self.model = model.to(device)
         self.train_loader = train_loader
@@ -27,6 +30,7 @@ class SupervisedTrainer:
         self.scheduler = scheduler
         self.criterion = criterion
         self.device = device
+        self.predict_residual = predict_residual
 
         self.output_dir = Path(output_dir)
         self.checkpoint_dir = self.output_dir / "checkpoints"
@@ -37,6 +41,18 @@ class SupervisedTrainer:
 
         self.best_val_psnr = -float("inf")
 
+    def _get_denoised_estimate(
+        self, noisy: torch.Tensor, model_output: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Rank 2 Target Formulation Mapping:
+        If predict_residual=True, model outputs noise residual n_hat.
+        Reconstructed clean image x_hat = y - n_hat.
+        """
+        if self.predict_residual:
+            return noisy - model_output
+        return model_output
+
     def train_epoch(self, epoch: int) -> float:
         self.model.train()
         running_loss = 0.0
@@ -46,11 +62,13 @@ class SupervisedTrainer:
             noisy, clean = noisy.to(self.device), clean.to(self.device)
 
             self.optimizer.zero_grad()
-            output = self.model(noisy)
-            loss = self.criterion(output, clean)
+            model_output = self.model(noisy)
+
+            # Reconstruct signal prior to computing hybrid loss
+            denoised = self._get_denoised_estimate(noisy, model_output)
+            loss = self.criterion(denoised, clean)
 
             loss.backward()
-            # Gradient clipping prevents exploding gradients during deep U-Net backprop
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
 
@@ -62,7 +80,7 @@ class SupervisedTrainer:
         return epoch_loss
 
     @torch.no_grad()
-    def validate(self, epoch: int) -> tuple[float, float, float]:
+    def validate(self, epoch: int) -> Tuple[float, float, float]:
         self.model.eval()
         running_loss = 0.0
         total_psnr = 0.0
@@ -70,15 +88,18 @@ class SupervisedTrainer:
 
         for noisy, clean in self.val_loader:
             noisy, clean = noisy.to(self.device), clean.to(self.device)
-            output = self.model(noisy)
+            model_output = self.model(noisy)
 
-            loss = self.criterion(output, clean)
+            denoised = self._get_denoised_estimate(noisy, model_output)
+            loss = self.criterion(denoised, clean)
             running_loss += loss.item() * noisy.size(0)
 
-            # Clamp output to valid dynamic range before calculating evaluation metrics
-            output_clamped = torch.clamp(output, 0.0, 1.0)
-            total_psnr += compute_psnr(output_clamped, clean) * noisy.size(0)
-            total_ssim += compute_ssim(output_clamped, clean) * noisy.size(0)
+            # Clamp output to valid dynamic range [0, 1] before computing metrics
+            denoised_clamped = torch.clamp(denoised, 0.0, 1.0)
+
+            # Explicit scalar conversion (.item()) prevents CUDA memory leaks
+            total_psnr += compute_psnr(denoised_clamped, clean).item() * noisy.size(0)
+            total_ssim += compute_ssim(denoised_clamped, clean).item() * noisy.size(0)
 
         val_loss = running_loss / len(self.val_loader.dataset)
         val_psnr = total_psnr / len(self.val_loader.dataset)
@@ -95,7 +116,7 @@ class SupervisedTrainer:
 
     def fit(self, num_epochs: int):
         print(
-            f"[*] Starting training loop for {num_epochs} epochs on device: {self.device}"
+            f"[*] Starting training loop for {num_epochs} epochs | Device: {self.device} | Residual Mode: {self.predict_residual}"
         )
 
         for epoch in range(1, num_epochs + 1):
@@ -113,7 +134,6 @@ class SupervisedTrainer:
                 f"Val SSIM: {val_ssim:.4f}"
             )
 
-            # Checkpoint management: Save state on validation PSNR improvements
             if val_psnr > self.best_val_psnr:
                 self.best_val_psnr = val_psnr
                 ckpt_path = self.checkpoint_dir / "best_model.pt"
@@ -124,6 +144,7 @@ class SupervisedTrainer:
                         "optimizer_state_dict": self.optimizer.state_dict(),
                         "val_psnr": val_psnr,
                         "val_ssim": val_ssim,
+                        "predict_residual": self.predict_residual,
                     },
                     ckpt_path,
                 )

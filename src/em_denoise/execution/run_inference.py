@@ -1,169 +1,3 @@
-# import argparse
-# import os
-# import torch
-# import numpy as np
-# from pathlib import Path
-# from PIL import Image
-# import torchvision.transforms.functional as TF
-# from torch.utils.data import Dataset, DataLoader
-# from config_schema import PipelineConfig
-# from architecture import ResidualUNet, UNetConfig
-#
-#
-# # ==========================================
-# # 1. Custom Image Dataset for Testing
-# # ==========================================
-# class SingleDirectoryImageDataset(Dataset):
-#     """
-#     Loads grayscale/single-channel images from a test directory.
-#     Supports .png, .tif, .tiff, .jpg, and .npy arrays.
-#     """
-#
-#     def __init__(self, image_dir: str | Path, transform=None):
-#         self.image_dir = Path(image_dir)
-#         self.transform = transform
-#
-#         # Collect supported image files
-#         valid_extensions = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".npy"}
-#         self.image_paths = sorted([
-#             p for p in self.image_dir.iterdir()
-#             if p.suffix.lower() in valid_extensions
-#         ])
-#
-#         if not self.image_paths:
-#             raise FileNotFoundError(f"No valid image files found in {self.image_dir}")
-#
-#     def __len__(self) -> int:
-#         return len(self.image_paths)
-#
-#     def __getitem__(self, idx: int) -> tuple[torch.Tensor, str]:
-#         img_path = self.image_paths[idx]
-#
-#         if img_path.suffix.lower() == ".npy":
-#             # Direct NumPy load (preserves float32/float64 precision)
-#             arr = np.load(img_path).astype(np.float32)
-#             tensor = torch.from_numpy(arr)
-#             if tensor.ndim == 2:
-#                 tensor = tensor.unsqueeze(0)  # Shape: (1, H, W)
-#         else:
-#             # Standard image load via PIL
-#             pil_img = Image.open(img_path).convert("L")  # Convert to 1-channel grayscale
-#             tensor = TF.to_tensor(pil_img)  # Scales uint8 [0, 255] -> float32 [0.0, 1.0]
-#
-#         return tensor, img_path.name
-#
-#
-# # ==========================================
-# # 2. Batch Inference Function
-# # ==========================================
-# def run_directory_inference(
-#         model: torch.nn.Module,
-#         checkpoint_path: str | Path,
-#         test_dir: str | Path,
-#         output_dir: str | Path,
-#         batch_size: int = 16,
-#         num_workers: int = 2,
-#         device: str = "cuda" if torch.cuda.is_available() else "cpu"
-# ):
-#     """
-#     Runs batched inference on all images in test_dir and saves outputs to output_dir.
-#     """
-#     test_path = Path(test_dir)
-#     out_path = Path(output_dir)
-#     out_path.mkdir(parents=True, exist_ok=True)
-#
-#     # Load Model Weights
-#     print(f"Loading checkpoint from: {checkpoint_path}")
-#     checkpoint = torch.load(checkpoint_path, map_location=device)
-#     state_dict = checkpoint.get("model_state_dict", checkpoint)
-#     model.load_state_dict(state_dict)
-#
-#     model.to(device)
-#     model.eval()
-#
-#     # Instantiate DataLoader
-#     dataset = SingleDirectoryImageDataset(test_path)
-#     loader = DataLoader(
-#         dataset,
-#         batch_size=batch_size,
-#         shuffle=False,
-#         num_workers=num_workers,
-#         pin_memory=(device == "cuda")
-#     )
-#
-#     print(f"Executing inference on {len(dataset)} images via {device}...")
-#
-#     with torch.no_grad():
-#         for batch_tensors, filenames in loader:
-#             batch_tensors = batch_tensors.to(device)
-#
-#             # UNet forward pass
-#             outputs = model(batch_tensors)
-#
-#             # Post-processing: Bound output to valid intensity range [0, 1]
-#             outputs = torch.clamp(outputs, 0.0, 1.0)
-#
-#             # Serialization to disk
-#             for i in range(outputs.size(0)):
-#                 out_tensor = outputs[i].cpu()
-#                 filename = filenames[i]
-#
-#                 # Convert (1, H, W) tensor back to uint8 image
-#                 out_np = (out_tensor.squeeze(0).numpy() * 255.0).astype(np.uint8)
-#                 out_pil = Image.fromarray(out_np)
-#
-#                 # Save processed file
-#                 save_file_path = out_path / f"denoised_{filename}"
-#                 out_pil.save(save_file_path)
-#
-#     print(f"Inference complete. Exported results to: {out_path.resolve()}")
-#
-#
-#
-# if __name__ == "__main__":
-#
-#     # 1. Parse configuration
-#     parser = argparse.ArgumentParser(description="Run Supervised Denoising Inference Pipeline")
-#     parser.add_argument(
-#         "--config",
-#         type=Path,
-#         default=Path("config.yaml"),
-#         help="Path to YAML configuration file",
-#     )
-#     args = parser.parse_args()
-#     cfg = PipelineConfig.from_yaml(args.config)
-#
-#     device = torch.device(
-#         "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
-#     )
-#
-#     unet_config = UNetConfig(**cfg.unet.model_dump())
-#     model = ResidualUNet(unet_config).to(device)
-#
-#     # CHECKPOINT_PATH
-#     ckpt_path = cfg.paths.experiment_dir / "checkpoints" / "best_model.pt"
-#     if not ckpt_path.exists():
-#         raise FileNotFoundError(f"Checkpoint binary missing at {ckpt_path}")
-#
-#     # SANDBOX_DIR
-#     test_dir = cfg.paths.sandbox_root / "test" / "noisy"
-#     if not test_dir.exists():
-#         raise FileNotFoundError(f"Test dir missing at {test_dir}")
-#
-#     # OUTPUT_DIR
-#     output_dir = cfg.paths.experiment_dir / "predictions"
-#
-#     # 3. Execute Pipeline
-#     run_directory_inference(
-#         model=model,
-#         checkpoint_path=ckpt_path,
-#         test_dir=test_dir,
-#         output_dir=output_dir,
-#         batch_size=cfg.dataset.batch_size,
-#         num_workers=cfg.dataset.num_workers_val
-#     )
-
-
 import argparse
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -173,7 +7,7 @@ import numpy as np
 import torch
 import torchvision.transforms.functional as TF
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset
 
 from em_denoise.backend.architecture import ResidualUNet, UNetConfig
 from em_denoise.backend.config_schema import PipelineConfig
@@ -244,9 +78,12 @@ def run_directory_inference(
     device: torch.device = torch.device("cpu"),
     use_amp: bool = True,
     max_io_workers: int = 4,
+    patch_size: int = 512,
+    overlap: int = 64,
 ) -> None:
     """
-    Executes batched neural network inference over input artifacts in test_dir.
+    Executes sliding-window tile inference over large high-resolution micrographs
+    to prevent MPS/CUDA out-of-memory errors.
     """
     test_path = Path(test_dir)
     out_path = Path(output_dir)
@@ -254,56 +91,128 @@ def run_directory_inference(
 
     logging.info("Deserializing checkpoint from: %s", checkpoint_path)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    state_dict = checkpoint.get("model_state_dict", checkpoint)
-    model.load_state_dict(state_dict)
 
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+        predict_residual = checkpoint.get("predict_residual", True)
+    else:
+        state_dict = checkpoint
+        predict_residual = True
+
+    model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
 
     dataset = SingleDirectoryImageDataset(test_path)
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=(device.type == "cuda"),
-        persistent_workers=(num_workers > 0),
-    )
-
     logging.info(
-        "Executing inference on %d samples via target device: %s", len(dataset), device
+        "Executing tile-based sliding-window inference on %d samples via target device: %s | Residual Mode: %s",
+        len(dataset),
+        device,
+        predict_residual,
     )
 
     amp_device = (
         "cuda" if device.type == "cuda" else ("mps" if device.type == "mps" else "cpu")
     )
+    stride = patch_size - overlap
 
     with (
         torch.inference_mode(),
         ThreadPoolExecutor(max_workers=max_io_workers) as io_executor,
     ):
-        for batch_tensors, filenames in loader:
-            batch_tensors = batch_tensors.to(device, non_blocking=True)
+        for idx in range(len(dataset)):
+            tensor, filename = dataset[idx]  # Shape: (1, H, W)
+            _, h, w = tensor.shape
 
-            with torch.autocast(
-                device_type=amp_device, enabled=use_amp and device.type != "cpu"
-            ):
-                outputs = model(batch_tensors)
-                outputs = torch.clamp(outputs, 0.0, 1.0)
+            # Initialize empty output canvas and weight mask for blending
+            canvas = torch.zeros((1, h, w), dtype=torch.float32)
+            weight_mask = torch.zeros((1, h, w), dtype=torch.float32)
 
-            outputs_cpu = outputs.cpu()
+            # Create a 2D Hann/Cosine blending window for smooth tile stitching
+            wy = np.hanning(patch_size)
+            wx = np.hanning(patch_size)
+            window_2d = torch.from_numpy(np.outer(wy, wx)).float()
 
-            for i in range(outputs_cpu.size(0)):
-                out_tensor = outputs_cpu[i]
-                filename = filenames[i]
-                save_file_path = out_path / f"denoised_{filename}"
+            # Generate coordinate grid for sliding window
+            y_coords = list(range(0, max(1, h - patch_size + stride), stride))
+            x_coords = list(range(0, max(1, w - patch_size + stride), stride))
 
-                io_executor.submit(_save_image_artifact, out_tensor, save_file_path)
+            # Ensure edge boundaries cover the full image dimensions
+            if y_coords[-1] + patch_size < h:
+                y_coords.append(h - patch_size)
+            if x_coords[-1] + patch_size < w:
+                x_coords.append(w - patch_size)
+
+            patches_buffer = []
+            coords_buffer = []
+
+            for y in y_coords:
+                for x in x_coords:
+                    y_end = min(y + patch_size, h)
+                    x_end = min(x + patch_size, w)
+
+                    # Extract patch (handle boundary padding if necessary)
+                    patch = tensor[:, y:y_end, x:x_end]
+                    actual_h, actual_w = patch.shape[1], patch.shape[2]
+
+                    if actual_h < patch_size or actual_w < patch_size:
+                        # Pad patch to match standard patch_size for the network
+                        padded_patch = torch.nn.functional.pad(
+                            patch,
+                            (0, patch_size - actual_w, 0, patch_size - actual_h),
+                            mode="reflect",
+                        )
+                        patches_buffer.append(padded_patch)
+                    else:
+                        patches_buffer.append(patch)
+
+                    coords_buffer.append((y, y_end, x, x_end, actual_h, actual_w))
+
+                    # Process when batch is full or at the end of image tiles
+                    if len(patches_buffer) == batch_size or (
+                        y == y_coords[-1] and x == x_coords[-1]
+                    ):
+                        batch_tensor = torch.stack(patches_buffer).to(
+                            device, non_blocking=True
+                        )
+
+                        with torch.autocast(
+                            device_type=amp_device,
+                            enabled=use_amp and device.type != "cpu",
+                        ):
+                            model_output = model(batch_tensor)
+                            if predict_residual:
+                                denoised_signal = batch_tensor - model_output
+                            else:
+                                denoised_signal = model_output
+                            batch_out = torch.clamp(denoised_signal, 0.0, 1.0)
+
+                        batch_out_cpu = batch_out.cpu()
+
+                        for b_idx, (py, py_end, px, px_end, ah, aw) in enumerate(
+                            coords_buffer
+                        ):
+                            p_out = batch_out_cpu[b_idx, :, :ah, :aw]
+                            p_window = window_2d[:ah, :aw].unsqueeze(0)
+
+                            canvas[:, py:py_end, px:px_end] += p_out * p_window
+                            weight_mask[:, py:py_end, px:px_end] += p_window
+
+                        patches_buffer.clear()
+                        coords_buffer.clear()
+
+            # Normalize by accumulated weights to remove seam lines
+            weight_mask = torch.clamp(weight_mask, min=1e-5)
+            final_tensor = canvas / weight_mask
+
+            save_file_path = out_path / f"denoised_{filename}"
+            io_executor.submit(_save_image_artifact, final_tensor, save_file_path)
+            logging.info("Completed tiled inference for: %s", filename)
 
     logging.info("Inference complete. Exported artifacts to: %s", out_path.resolve())
 
 
-def main() -> None:
+def main(test_dir: str | None = None, ckpt_path: str | None = None) -> None:
     parser = argparse.ArgumentParser(
         description="Supervised Denoising Inference Engine"
     )
@@ -326,12 +235,15 @@ def main() -> None:
     unet_config = UNetConfig(**cfg.unet.model_dump())
     model = ResidualUNet(unet_config)
 
-    ckpt_path = cfg.paths.experiment_dir / "checkpoints" / "best_model.pt"
-    if not ckpt_path.exists():
+    if ckpt_path is None:
+        ckpt_path = cfg.paths.experiment_dir / "checkpoints" / "best_model.pt"
+    if not Path(ckpt_path).exists():
         raise FileNotFoundError(f"Checkpoint binary missing at {ckpt_path}")
 
-    test_dir = cfg.paths.sandbox_root / "test" / "noisy"
-    if not test_dir.exists():
+    if test_dir is None:
+        test_dir = cfg.paths.sandbox_root / "test" / "noisy"
+
+    if not Path(test_dir).exists():
         raise FileNotFoundError(f"Test directory missing at {test_dir}")
 
     output_dir = cfg.paths.experiment_dir / "predictions"
@@ -349,4 +261,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    test_dir = "/Users/ganctoma/SW/sort/N2V/run_22/experiments/testing/raw"
+    checkpoint_path = "/Users/ganctoma/SW/sort/N2V/run_22/experiments/04_ep_10_lr_001_wd_0001/checkpoints/best_model.pt"
+
+    main(test_dir, checkpoint_path)

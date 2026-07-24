@@ -1,13 +1,13 @@
 import argparse
 from pathlib import Path
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from em_denoise.backend.dataset import SupervisedEMDataset
 from em_denoise.backend.architecture import ResidualUNet, UNetConfig
 from em_denoise.backend.trainer import SupervisedTrainer
 from em_denoise.backend.config_schema import PipelineConfig
+from em_denoise.backend.loss import CombinedL1SSIMLoss
 
 
 def main(config_path: Path):
@@ -48,12 +48,19 @@ def main(config_path: Path):
     model = ResidualUNet(unet_config)
 
     # Optimization Strategy
-    criterion = nn.L1Loss()
+    criterion = CombinedL1SSIMLoss(
+        alpha=0.84,
+        channels=unet_config.in_channels,
+        data_range=1.0,
+    ).to(device)
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=cfg.training.lr,
         weight_decay=cfg.training.weight_decay,
     )
+
+    # Scheduler
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=cfg.training.epochs,
@@ -75,6 +82,7 @@ def main(config_path: Path):
         criterion=criterion,
         device=device,
         output_dir=cfg.paths.experiment_dir,
+        predict_residual=True,
     )
 
     trainer.fit(num_epochs=cfg.training.epochs)

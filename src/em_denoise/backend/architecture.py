@@ -47,7 +47,6 @@ class ResBlock(nn.Module):
 
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
-        # 1x1 conv projection if channel dimensions change across the residual connection
         if in_channels != out_channels:
             self.shortcut = nn.Conv2d(
                 in_channels, out_channels, kernel_size=1, bias=False
@@ -90,12 +89,12 @@ class ResidualUNet(nn.Module):
         super().__init__()
         self.config = config
 
-        # Initial projection
         self.init_conv = nn.Conv2d(
             config.in_channels, config.base_channels, kernel_size=3, padding=1
         )
 
         self.down_blocks = nn.ModuleList()
+        self.down_samples = nn.ModuleList()
         self.up_blocks = nn.ModuleList()
 
         # --- Encoder ---
@@ -109,6 +108,7 @@ class ResidualUNet(nn.Module):
                 ]
             )
             self.down_blocks.append(blocks)
+            self.down_samples.append(Downsample(out_ch))
             in_ch = out_ch
 
         # --- Bottleneck ---
@@ -121,7 +121,6 @@ class ResidualUNet(nn.Module):
         reversed_mults = list(reversed(config.channel_multipliers))
         for i, mult in enumerate(reversed_mults):
             out_ch = config.base_channels * mult
-            # Input to up block is current channels + skip connection channels
             skip_ch = config.base_channels * reversed_mults[i]
 
             self.up_blocks.append(Upsample(in_ch, out_ch))
@@ -139,7 +138,6 @@ class ResidualUNet(nn.Module):
             self.up_blocks.append(blocks)
             in_ch = out_ch
 
-        # Final projection to output space
         self.final_norm = nn.GroupNorm(8, in_ch)
         self.final_act = nn.GELU()
         self.final_conv = nn.Conv2d(
@@ -150,11 +148,11 @@ class ResidualUNet(nn.Module):
         x = self.init_conv(x)
 
         skips = []
-        # Encoder pass
-        for block in self.down_blocks:
+        # Encoder pass with learned strided downsampling
+        for block, downsample in zip(self.down_blocks, self.down_samples):
             x = block(x)
             skips.append(x)
-            x = F.max_pool2d(x, kernel_size=2, stride=2)  # Downsample
+            x = downsample(x)
 
         # Bottleneck
         x = self.bottleneck(x)
@@ -167,7 +165,6 @@ class ResidualUNet(nn.Module):
             x = up_layer(x)
             skip = skips.pop()
 
-            # Handle potential padding differences
             if x.shape != skip.shape:
                 x = F.interpolate(x, size=skip.shape[2:], mode="bilinear")
 
