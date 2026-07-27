@@ -27,8 +27,19 @@ class UNetConfigSchema(BaseModel):
 class TrainingConfig(BaseModel):
     epochs: int = Field(50, gt=0)
     lr: float = Field(1e-3, gt=0.0)
-    weight_decay: float = Field(1e-4, ge=0.0)
     eta_min: float = Field(1e-6, ge=0.0)
+    weight_decay: float = Field(
+        default=1e-4, description="L2 penalty decoupled via AdamW."
+    )
+    warmup_epochs: int = Field(
+        default=5, description="Number of epochs for linear LR warmup."
+    )
+    min_lr: float = Field(
+        default=1e-6, description="Minimum learning rate for CosineAnnealingLR."
+    )
+    max_grad_norm: float = Field(
+        default=1.0, description="Threshold for gradient clipping."
+    )
 
 
 class PipelineConfig(BaseModel):

@@ -1,15 +1,20 @@
 paths:
-  sandbox_root: "/Users/ganctoma/SW/sort/N2V/run_22/supervised_sandbox"
-  experiment_dir: "/Users/ganctoma/SW/sort/N2V/run_22/experiments/07_ep_10_lr_0005_wd_0001"
+  sandbox_root: "/Users/ganctoma/SW/sort/N2V/run_23/supervised_sandbox"
+  experiment_dir: "/Users/ganctoma/SW/sort/N2V/run_23/experiments/00_ep_10_lr_001_wd_0001_cosine_warmup_"
 
 checkpoints:
-  lr_1: "/Users/ganctoma/SW/sort/N2V/run_22/experiments/03_ep_10_lr_0001_wd_0001/checkpoints/best_model.pt"
-  lr_5: "/Users/ganctoma/SW/sort/N2V/run_22/experiments/07_ep_10_lr_0005_wd_0001/checkpoints/best_model.pt"
-  lr_10: "/Users/ganctoma/SW/sort/N2V/run_22/experiments/04_ep_10_lr_001_wd_0001/checkpoints/best_model.pt"
-  lr_13: "/Users/ganctoma/SW/sort/N2V/run_22/experiments/06_ep_10_lr_0013_wd_0001/checkpoints/best_model.pt"
-  lr_17: "/Users/ganctoma/SW/sort/N2V/run_22/experiments/05_ep_10_lr_0017_wd_0001/checkpoints/best_model.pt"
-  lr_25: "/Users/ganctoma/SW/sort/N2V/run_22/experiments/02_ep_10_lr_0025_wd_0001/checkpoints/best_model.pt"
-  lr_40: "/Users/ganctoma/SW/sort/N2V/run_22/experiments/01_ep_10_lr_004_wd_0001/checkpoints/best_model.pt"
+#  lr_1: "/Users/ganctoma/SW/sort/N2V/run_22/experiments/03_ep_10_lr_0001_wd_0001/checkpoints/best_model.pt"
+#  lr_5: "/Users/ganctoma/SW/sort/N2V/run_22/experiments/07_ep_10_lr_0005_wd_0001/checkpoints/best_model.pt"
+#  lr_10: "/Users/ganctoma/SW/sort/N2V/run_22/experiments/04_ep_10_lr_001_wd_0001/checkpoints/best_model.pt"
+#  lr_13: "/Users/ganctoma/SW/sort/N2V/run_22/experiments/06_ep_10_lr_0013_wd_0001/checkpoints/best_model.pt"
+#  lr_17: "/Users/ganctoma/SW/sort/N2V/run_22/experiments/05_ep_10_lr_0017_wd_0001/checkpoints/best_model.pt"
+#  lr_25: "/Users/ganctoma/SW/sort/N2V/run_22/experiments/02_ep_10_lr_0025_wd_0001/checkpoints/best_model.pt"
+#  lr_40: "/Users/ganctoma/SW/sort/N2V/run_22/experiments/01_ep_10_lr_004_wd_0001/checkpoints/best_model.pt"
+
+#  cos_simple: "/Users/ganctoma/SW/sort/N2V/run_22/experiments/04_ep_10_lr_001_wd_0001/checkpoints/best_model.pt"
+#  cos_warmup: "/Users/ganctoma/SW/sort/N2V/run_22/experiments/08_ep_10_lr_001_wd_0001_cosine_warmup/checkpoints/best_model.pt"
+  cos_warmup_patch_128: "/Users/ganctoma/SW/sort/N2V/run_23/experiments/00_ep_10_lr_001_wd_0001_cosine_warmup/checkpoints/best_model.pt"
+  cos_warmup_patch_128_II: "/Users/ganctoma/SW/sort/N2V/run_24/experiments/00_ep_10_lr_001_wd_0001_cosine_warmup/checkpoints/best_model.pt"
 
 dataset:
   batch_size: 16
@@ -26,6 +31,6 @@ unet:
 
 training:
   epochs: 10
-  lr: 0.0005
+  lr: 0.001
   weight_decay: 0.0001
   eta_min: 0.000001

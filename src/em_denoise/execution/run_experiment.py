@@ -2,6 +2,7 @@ import argparse
 from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 
 from em_denoise.backend.dataset import SupervisedEMDataset
 from em_denoise.backend.architecture import ResidualUNet, UNetConfig
@@ -11,7 +12,6 @@ from em_denoise.backend.loss import CombinedL1SSIMLoss
 
 
 def main(config_path: Path):
-    # Load and validate configuration
     cfg = PipelineConfig.from_yaml(config_path)
 
     device = torch.device(
@@ -20,7 +20,6 @@ def main(config_path: Path):
         else ("mps" if torch.backends.mps.is_available() else "cpu")
     )
 
-    # Instantiate DataLoaders using schema attributes
     train_dataset = SupervisedEMDataset(
         data_dir=cfg.paths.sandbox_root / "train", augment=True
     )
@@ -42,12 +41,10 @@ def main(config_path: Path):
         num_workers=cfg.dataset.num_workers_val,
     )
 
-    # Model Architecture
     unet_kwargs = cfg.unet.model_dump()
     unet_config = UNetConfig(**unet_kwargs)
-    model = ResidualUNet(unet_config)
+    model = ResidualUNet(unet_config).to(device)
 
-    # Optimization Strategy
     criterion = CombinedL1SSIMLoss(
         alpha=0.84,
         channels=unet_config.in_channels,
@@ -60,19 +57,26 @@ def main(config_path: Path):
         weight_decay=cfg.training.weight_decay,
     )
 
-    # Scheduler
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    warmup_epochs = getattr(cfg.training, "warmup_epochs", 5)
+    warmup_scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs)
+
+    cosine_epochs = cfg.training.epochs - warmup_epochs
+    cosine_scheduler = CosineAnnealingLR(
         optimizer,
-        T_max=cfg.training.epochs,
+        T_max=max(1, cosine_epochs),
         eta_min=cfg.training.eta_min,
     )
 
-    # Save a copy of current config to experiment target for auditability
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_epochs],
+    )
+
     cfg.paths.experiment_dir.mkdir(parents=True, exist_ok=True)
     with open(cfg.paths.experiment_dir / "resolved_config.yaml", "w") as f:
         f.write(config_path.read_text())
 
-    # Execute Training
     trainer = SupervisedTrainer(
         model=model,
         train_loader=train_loader,

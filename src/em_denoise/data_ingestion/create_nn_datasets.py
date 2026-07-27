@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 import tifffile
 from pathlib import Path
@@ -57,8 +59,8 @@ def prepare_supervised_from_patches(
         clean_source_dir = patches_root / split_name
 
         if not clean_source_dir.exists():
-            print(f"Warning: {clean_source_dir} does not exist, skipping...")
-            continue
+            print(f"Warning: {clean_source_dir} does not exist, creating...")
+            os.mkdir(clean_source_dir)
 
         # Output directories
         split_clean_dir = output_base_dir / split_name / "clean"
@@ -96,10 +98,8 @@ def prepare_supervised_from_patches(
 
 # ========================== Usage ==========================
 if __name__ == "__main__":
-    PATCHES_ROOT = Path(
-        "/Users/ganctoma/SW/sort/N2V/run_22/patches"
-    )  # your new split folders
-    SANDBOX_ROOT = Path("/Users/ganctoma/SW/sort/N2V/run_22/supervised_sandbox")
+    PATCHES_ROOT = Path("/Users/ganctoma/SW/sort/N2V/run_24/patches")
+    SANDBOX_ROOT = Path("/Users/ganctoma/SW/sort/N2V/run_24/supervised_sandbox")
 
     prepare_supervised_from_patches(
         patches_root=PATCHES_ROOT,

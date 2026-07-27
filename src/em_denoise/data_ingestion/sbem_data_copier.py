@@ -64,13 +64,13 @@ def is_informative_patch(
     if np.std(patch) < min_std:
         return False
 
-    # 3. Reject resin patches contaminated with dark silver particles
-    # Calculate fraction of pixels falling below dark threshold
-    dark_pixel_count = np.count_nonzero(patch < dark_pixel_thresh)
-    dark_pixel_ratio = dark_pixel_count / patch.size
-
-    if dark_pixel_ratio > max_dark_pixel_ratio:
-        return False
+    # # 3. Reject resin patches contaminated with dark silver particles
+    # # Calculate fraction of pixels falling below dark threshold
+    # dark_pixel_count = np.count_nonzero(patch < dark_pixel_thresh)
+    # dark_pixel_ratio = dark_pixel_count / patch.size
+    #
+    # if dark_pixel_ratio > max_dark_pixel_ratio:
+    #     return False
 
     return True
 
@@ -197,8 +197,9 @@ def extract_and_save_sbem_patches_split(
 # ========================== Usage ==========================
 if __name__ == "__main__":
     sbem_dir = "/Volumes/tachyon/groups/scratch/gmicro_sem/gfriedri/_EM_acquisitions/20260201_RoLi_F1/tiles/g0000"
-    root_dir = "/Users/ganctoma/SW/sort/N2V/run_22/supervised_sandbox"
+    root_dir = "/Users/ganctoma/SW/sort/N2V/run_24/"
     raw_dir = "raw_patches"
+    sandbox_dir = "supervised_sandbox"
     fn_tile_ids = "all_tile_ids.txt"
     section_start = 2000
     section_end = 9000
@@ -208,17 +209,28 @@ if __name__ == "__main__":
 
     extract_and_save_sbem_patches_split(
         root=sbem_dir,
-        dest_root=root_dir,
+        dest_root=root_dir / raw_dir,
         tile_ids_file="/Users/ganctoma/SW/sort/N2V/all_tile_ids.txt",
-        total_images=1000,  # total full images to sample
+        total_images=800,  # total full images to sample
         train_ratio=0.8,
         val_ratio=0.1,
         patches_per_image=12,  # you can use more for train
-        patch_size=256,
+        patch_size=128,
         section_range=range(2000, 9000),
         random_seed=43,
         min_std=20.0,
         max_mean_ratio=0.55,
         dark_pixel_thresh=15.0,
         max_dark_pixel_ratio=0.05,
+    )
+
+    from create_nn_datasets import prepare_supervised_from_patches
+
+    prepare_supervised_from_patches(
+        patches_root=root_dir / raw_dir,
+        output_base_dir=root_dir / sandbox_dir,
+        photon_scale=0.04,  # adjust for stronger/weaker noise
+        read_std=8.0,
+        gain_variance=0.02,
+        random_seed=42,
     )
