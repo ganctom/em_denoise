@@ -1,10 +1,12 @@
+import itertools
 from pathlib import Path
 import random
+import shutil
+from typing import Dict, Optional, Set
+
 import numpy as np
 import tifffile
 from tqdm import tqdm
-import itertools
-from typing import Set, Optional, Dict
 
 
 def load_tile_ids(txt_path: str | Path) -> Set[int]:
@@ -32,24 +34,10 @@ def is_informative_patch(
     dark_pixel_thresh: float = 15.0,
     max_dark_pixel_ratio: float = 0.05,
 ) -> bool:
-    """
-    Evaluates whether an EM patch contains valid structural information while filtering
-    out resin, empty background, and silver precipitate contamination.
+    """Evaluates whether an EM patch contains valid structural information while
 
-    Parameters
-    ----------
-    patch : np.ndarray
-        Extracted image patch.
-    min_std : float
-        Minimum pixel standard deviation threshold to reject flat/empty resin.
-    max_mean_ratio : float
-        Maximum allowed mean intensity relative to dynamic range maximum.
-    dark_pixel_thresh : float
-        Absolute pixel intensity boundary below which a pixel is classified as 'dark/silver'.
-        For 8-bit images, values < 10-20 typically represent silver precipitates.
-    max_dark_pixel_ratio : float
-        Maximum allowed fraction (0.0 to 1.0) of dark pixels in a patch. If exceeded,
-        the patch is classified as contaminated resin and rejected.
+    filtering out resin, empty background, and silver precipitate
+    contamination.
     """
     dtype_info = (
         np.iinfo(patch.dtype) if np.issubdtype(patch.dtype, np.integer) else None
@@ -63,14 +51,6 @@ def is_informative_patch(
     # 2. Reject featureless patches (low variance)
     if np.std(patch) < min_std:
         return False
-
-    # # 3. Reject resin patches contaminated with dark silver particles
-    # # Calculate fraction of pixels falling below dark threshold
-    # dark_pixel_count = np.count_nonzero(patch < dark_pixel_thresh)
-    # dark_pixel_ratio = dark_pixel_count / patch.size
-    #
-    # if dark_pixel_ratio > max_dark_pixel_ratio:
-    #     return False
 
     return True
 
@@ -87,17 +67,26 @@ def extract_and_save_sbem_patches_split(
     section_range: range = range(0, 21000),
     random_seed: Optional[int] = 42,
     max_attempts: int = 10_000_000,
+    n_test_raw: Optional[int] = None,
     **filter_kwargs,
 ) -> Dict[str, int]:
-    """
-    Extract patches with proper train/val/test split at IMAGE level.
+    """Extract patches with proper train/val/test split at IMAGE level.
+
+    Creates two distinct test directories: - test_patches: patch-level crop dataset
+    (like train/val) - test_raw: full-scale raw .tif image targets
     """
     root = Path(root)
     dest_root = Path(dest_root)
 
-    # Create three folders
-    for split in ["train", "val", "test"]:
-        (dest_root / split).mkdir(parents=True, exist_ok=True)
+    # Directories structure setup
+    split_dirs = {
+        "train": dest_root / "train",
+        "val": dest_root / "val",
+        "test_patches": dest_root / "test_patches",
+        "test_raw": dest_root / "test_raw",
+    }
+    for d in split_dirs.values():
+        d.mkdir(parents=True, exist_ok=True)
 
     if random_seed is not None:
         random.seed(random_seed)
@@ -121,20 +110,29 @@ def extract_and_save_sbem_patches_split(
     test_images = all_possible_images[n_train + n_val : n_train + n_val + n_test]
 
     print("Split summary:")
-    print(f"  Train images : {len(train_images)}")
-    print(f"  Val images   : {len(val_images)}")
-    print(f"  Test images  : {len(test_images)}")
+    print(f"  Train images      : {len(train_images)}")
+    print(f"  Val images        : {len(val_images)}")
+    print(f"  Test images total : {len(test_images)}")
 
-    # === Step 3: Process each split separately ===
     splits = {"train": train_images, "val": val_images, "test": test_images}
-
     total_saved = {}
 
+    # Set threshold for how many full-scale test files to dump to test_raw
+    max_raw_test_count = n_test_raw if n_test_raw is not None else len(test_images)
+
     for split_name, image_list in splits.items():
-        print(f"\n=== Extracting {split_name} patches ===")
+        print(f"\n=== Extracting {split_name} data ===")
         saved_count = 0
+        raw_saved_count = 0
         rejected = 0
         pbar = tqdm(total=len(image_list), desc=f"{split_name}", unit="img")
+
+        # Map current split target directory for standard patches
+        patch_dest_dir = (
+            split_dirs["test_patches"]
+            if split_name == "test"
+            else split_dirs[split_name]
+        )
 
         for tile_id, section in image_list:
             tile_str = f"{tile_id:04d}"
@@ -145,6 +143,12 @@ def extract_and_save_sbem_patches_split(
             src_path = root / folder_name / filename
             if not src_path.exists():
                 continue
+
+            # Process full-scale image output for test dataset split
+            if split_name == "test" and raw_saved_count < max_raw_test_count:
+                dest_raw_path = split_dirs["test_raw"] / filename
+                shutil.copy2(src_path, dest_raw_path)
+                raw_saved_count += 1
 
             try:
                 img = tifffile.imread(str(src_path))
@@ -174,7 +178,7 @@ def extract_and_save_sbem_patches_split(
                     patch_filename = (
                         f"t{tile_str}_s{slice_str}_p{saved_from_this:02d}.tif"
                     )
-                    dest_path = dest_root / split_name / patch_filename
+                    dest_path = patch_dest_dir / patch_filename
 
                     tifffile.imwrite(str(dest_path), patch)
                     saved_count += 1
@@ -190,6 +194,8 @@ def extract_and_save_sbem_patches_split(
         pbar.close()
         total_saved[split_name] = saved_count
         print(f"  Saved {saved_count:,} patches | Rejected {rejected:,}")
+        if split_name == "test":
+            print(f"  Saved {raw_saved_count:,} full-scale .tif images to test_raw")
 
     return total_saved
 
@@ -197,13 +203,10 @@ def extract_and_save_sbem_patches_split(
 # ========================== Usage ==========================
 if __name__ == "__main__":
     sbem_dir = "/Volumes/tachyon/groups/scratch/gmicro_sem/gfriedri/_EM_acquisitions/20260201_RoLi_F1/tiles/g0000"
-    root_dir = "/Users/ganctoma/SW/sort/N2V/run_24/"
+    root_dir = "/Users/ganctoma/SW/sort/N2V/run_25/"
     raw_dir = "raw_patches"
     sandbox_dir = "supervised_sandbox"
     fn_tile_ids = "all_tile_ids.txt"
-    section_start = 2000
-    section_end = 9000
-    nr_of_patches = 80
 
     sbem_dir, root_dir = map(Path, (sbem_dir, root_dir))
 
@@ -214,10 +217,11 @@ if __name__ == "__main__":
         total_images=800,  # total full images to sample
         train_ratio=0.8,
         val_ratio=0.1,
-        patches_per_image=12,  # you can use more for train
+        patches_per_image=12,
         patch_size=128,
         section_range=range(2000, 9000),
         random_seed=43,
+        n_test_raw=20,  # Define explicit number of raw full-scale .tif files for test_raw
         min_std=20.0,
         max_mean_ratio=0.55,
         dark_pixel_thresh=15.0,
@@ -229,7 +233,7 @@ if __name__ == "__main__":
     prepare_supervised_from_patches(
         patches_root=root_dir / raw_dir,
         output_base_dir=root_dir / sandbox_dir,
-        photon_scale=0.04,  # adjust for stronger/weaker noise
+        photon_scale=0.04,
         read_std=8.0,
         gain_variance=0.02,
         random_seed=42,

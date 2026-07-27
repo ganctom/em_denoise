@@ -262,6 +262,6 @@ def main(test_dir: str | None = None, ckpt_path: str | None = None) -> None:
 
 if __name__ == "__main__":
     test_dir = "/Users/ganctoma/SW/sort/N2V/testing/raw"
-    checkpoint_path = "/Users/ganctoma/SW/sort/N2V/run_24/experiments/00_ep_10_lr_001_wd_0001_cosine_warmup/checkpoints/best_model.pt"
+    checkpoint_path = "/Users/ganctoma/SW/sort/N2V/run_25/experiments/00_ep_10_lr_001_wd_0001_cosine_warmup_new_loss/checkpoints/best_model.pt"
 
     main(test_dir, checkpoint_path)

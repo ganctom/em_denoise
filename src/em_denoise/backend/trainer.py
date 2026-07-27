@@ -8,6 +8,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from em_denoise.backend.metrics import compute_psnr, compute_ssim
+from em_denoise.backend.loss import ESPILoss, AUFRCLoss
 
 
 class SupervisedTrainer:
@@ -21,7 +22,7 @@ class SupervisedTrainer:
         criterion: nn.Module,
         device: torch.device,
         output_dir: Path,
-        predict_residual: bool = True,  # Rank 2 configuration flag
+        predict_residual: bool = True,
     ):
         self.model = model.to(device)
         self.train_loader = train_loader
@@ -39,16 +40,15 @@ class SupervisedTrainer:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.writer = SummaryWriter(log_dir=str(self.log_dir))
 
-        self.best_val_psnr = -float("inf")
+        self.best_val_score = -float("inf")
+
+        # Instantiate metric evaluators for validation
+        self.espi_eval = ESPILoss(channels=1).to(device)
+        self.aufrc_eval = AUFRCLoss().to(device)
 
     def _get_denoised_estimate(
         self, noisy: torch.Tensor, model_output: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Rank 2 Target Formulation Mapping:
-        If predict_residual=True, model outputs noise residual n_hat.
-        Reconstructed clean image x_hat = y - n_hat.
-        """
         if self.predict_residual:
             return noisy - model_output
         return model_output
@@ -64,7 +64,6 @@ class SupervisedTrainer:
             self.optimizer.zero_grad()
             model_output = self.model(noisy)
 
-            # Reconstruct signal prior to computing hybrid loss
             denoised = self._get_denoised_estimate(noisy, model_output)
             loss = self.criterion(denoised, clean)
 
@@ -80,11 +79,14 @@ class SupervisedTrainer:
         return epoch_loss
 
     @torch.no_grad()
-    def validate(self, epoch: int) -> Tuple[float, float, float]:
+    def validate(self, epoch: int) -> Tuple[float, dict]:
         self.model.eval()
         running_loss = 0.0
+
         total_psnr = 0.0
         total_ssim = 0.0
+        total_espi = 0.0
+        total_aufrc = 0.0
 
         for noisy, clean in self.val_loader:
             noisy, clean = noisy.to(self.device), clean.to(self.device)
@@ -94,62 +96,100 @@ class SupervisedTrainer:
             loss = self.criterion(denoised, clean)
             running_loss += loss.item() * noisy.size(0)
 
-            # Clamp output to valid dynamic range [0, 1] before computing metrics
             denoised_clamped = torch.clamp(denoised, 0.0, 1.0)
+            batch_size = noisy.size(0)
 
-            # Explicit scalar conversion (.item()) prevents CUDA memory leaks
-            total_psnr += compute_psnr(denoised_clamped, clean).item() * noisy.size(0)
-            total_ssim += compute_ssim(denoised_clamped, clean).item() * noisy.size(0)
+            total_psnr += compute_psnr(denoised_clamped, clean).item() * batch_size
+            total_ssim += compute_ssim(denoised_clamped, clean).item() * batch_size
 
-        val_loss = running_loss / len(self.val_loader.dataset)
-        val_psnr = total_psnr / len(self.val_loader.dataset)
-        val_ssim = total_ssim / len(self.val_loader.dataset)
+            # Subtracted from 1.0 to convert loss-form back to standard metric [0, 1]
+            total_espi += (
+                1.0 - self.espi_eval(denoised_clamped, clean).item()
+            ) * batch_size
+            total_aufrc += (
+                1.0 - self.aufrc_eval(denoised_clamped, clean).item()
+            ) * batch_size
+
+        N = len(self.val_loader.dataset)
+        val_loss = running_loss / N
+
+        metrics = {
+            "psnr": total_psnr / N,
+            "ssim": total_ssim / N,
+            "espi": total_espi / N,
+            "aufrc": total_aufrc / N,
+        }
 
         self.writer.add_scalar("Loss/Validation", val_loss, epoch)
-        self.writer.add_scalar("Metrics/PSNR", val_psnr, epoch)
-        self.writer.add_scalar("Metrics/SSIM", val_ssim, epoch)
+        self.writer.add_scalar("Metrics/PSNR", metrics["psnr"], epoch)
+        self.writer.add_scalar("Metrics/SSIM", metrics["ssim"], epoch)
+        self.writer.add_scalar("Metrics/ESPI", metrics["espi"], epoch)
+        self.writer.add_scalar("Metrics/AUFRC", metrics["aufrc"], epoch)
         self.writer.add_scalar(
             "Params/LearningRate", self.optimizer.param_groups[0]["lr"], epoch
         )
 
-        return val_loss, val_psnr, val_ssim
+        return val_loss, metrics
+
+    def _compute_compound_score(self, metrics: dict) -> float:
+        """
+        Synthesizes a compound score for checkpoint acceptance.
+        Assumes PSNR practical max is ~40.0 dB for normalization mapping.
+        Weights can be adapted based on artifact sensitivity parameters.
+        """
+        psnr_norm = min(metrics["psnr"] / 40.0, 1.0)
+
+        fct_psnr = 0.20
+        fct_ssim = 0.30
+        fct_espi = 0.25
+        fct_aufrc = 0.25
+
+        score = float(
+            fct_psnr * psnr_norm
+            + fct_ssim * metrics["ssim"]
+            + fct_espi * metrics["espi"]
+            + fct_aufrc * metrics["aufrc"]
+        )
+        return score
 
     def fit(self, num_epochs: int):
         print(
-            f"[*] Starting training loop for {num_epochs} epochs | Device: {self.device} | Residual Mode: {self.predict_residual}"
+            f"[*] Starting training loop | Device: {self.device} | Residual Mode: {self.predict_residual}"
         )
 
         for epoch in range(1, num_epochs + 1):
             train_loss = self.train_epoch(epoch)
-            val_loss, val_psnr, val_ssim = self.validate(epoch)
+            val_loss, metrics = self.validate(epoch)
 
             if self.scheduler is not None:
                 self.scheduler.step()
 
+            compound_score = self._compute_compound_score(metrics)
+
             print(
                 f"Epoch {epoch:03d}/{num_epochs:03d} | "
-                f"Train Loss: {train_loss:.5f} | "
-                f"Val Loss: {val_loss:.5f} | "
-                f"Val PSNR: {val_psnr:.2f} dB | "
-                f"Val SSIM: {val_ssim:.4f}"
+                f"Train Loss: {train_loss:.5f} | Val Loss: {val_loss:.5f} | "
+                f"PSNR: {metrics['psnr']:.2f} | SSIM: {metrics['ssim']:.4f} | "
+                f"ESPI: {metrics['espi']:.4f} | AUFRC: {metrics['aufrc']:.4f} | "
+                f"Score: {compound_score:.4f}"
             )
 
-            if val_psnr > self.best_val_psnr:
-                self.best_val_psnr = val_psnr
+            if compound_score > self.best_val_score:
+                self.best_val_score = compound_score
                 ckpt_path = self.checkpoint_dir / "best_model.pt"
                 torch.save(
                     {
                         "epoch": epoch,
                         "model_state_dict": self.model.state_dict(),
                         "optimizer_state_dict": self.optimizer.state_dict(),
-                        "val_psnr": val_psnr,
-                        "val_ssim": val_ssim,
+                        "metrics": metrics,
+                        "compound_score": compound_score,
                         "predict_residual": self.predict_residual,
                     },
                     ckpt_path,
                 )
                 print(
-                    f"  [+] Saved new best checkpoint -> {ckpt_path.name} (PSNR: {val_psnr:.2f} dB)"
+                    f"  [+] Saved new best checkpoint -> {ckpt_path.name} (Score: {compound_score:.4f})"
                 )
 
         self.writer.close()

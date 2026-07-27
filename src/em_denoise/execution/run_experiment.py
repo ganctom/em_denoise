@@ -8,7 +8,7 @@ from em_denoise.backend.dataset import SupervisedEMDataset
 from em_denoise.backend.architecture import ResidualUNet, UNetConfig
 from em_denoise.backend.trainer import SupervisedTrainer
 from em_denoise.backend.config_schema import PipelineConfig
-from em_denoise.backend.loss import CombinedL1SSIMLoss
+from em_denoise.backend.loss import ComprehensiveEMLoss
 
 
 def main(config_path: Path):
@@ -45,10 +45,13 @@ def main(config_path: Path):
     unet_config = UNetConfig(**unet_kwargs)
     model = ResidualUNet(unet_config).to(device)
 
-    criterion = CombinedL1SSIMLoss(
-        alpha=0.84,
+    # Initialize the new multi-objective criterion
+    criterion = ComprehensiveEMLoss(
+        w_l1=0.4,
+        w_ssim=0.4,
+        w_espi=0.1,
+        w_aufrc=0.1,
         channels=unet_config.in_channels,
-        data_range=1.0,
     ).to(device)
 
     optimizer = torch.optim.AdamW(
