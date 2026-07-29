@@ -47,8 +47,8 @@ def main(config_path: Path):
 
     # Initialize the new multi-objective criterion
     criterion = ComprehensiveEMLoss(
-        w_l1=0.4,
-        w_ssim=0.4,
+        w_l1=0.5,
+        w_ssim=0.3,
         w_espi=0.1,
         w_aufrc=0.1,
         channels=unet_config.in_channels,

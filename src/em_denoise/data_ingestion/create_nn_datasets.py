@@ -98,8 +98,8 @@ def prepare_supervised_from_patches(
 
 # ========================== Usage ==========================
 if __name__ == "__main__":
-    PATCHES_ROOT = Path("/Users/ganctoma/SW/sort/N2V/run_24/patches")
-    SANDBOX_ROOT = Path("/Users/ganctoma/SW/sort/N2V/run_24/supervised_sandbox")
+    PATCHES_ROOT = Path("/Users/ganctoma/SW/sort/N2V/run_30/raw_patches")
+    SANDBOX_ROOT = Path("/Users/ganctoma/SW/sort/N2V/run_30/supervised_sandbox")
 
     prepare_supervised_from_patches(
         patches_root=PATCHES_ROOT,
