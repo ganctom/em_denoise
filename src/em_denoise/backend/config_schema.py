@@ -42,12 +42,20 @@ class TrainingConfig(BaseModel):
     )
 
 
+class EMLossConfig(BaseModel):
+    l1: float = 0.5
+    ssim: float = 0.3
+    espi: float = 0.1
+    aufrc: float = 0.1
+
+
 class PipelineConfig(BaseModel):
     paths: PathsConfig
     checkpoints: dict[str, Path] = Field(default_factory=dict)
     dataset: DatasetConfig
     unet: UNetConfigSchema
     training: TrainingConfig
+    em_loss: EMLossConfig
 
     @classmethod
     def from_yaml(cls, yaml_path: Path | str) -> "PipelineConfig":

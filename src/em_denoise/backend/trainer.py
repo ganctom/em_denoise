@@ -139,15 +139,10 @@ class SupervisedTrainer:
         """
         psnr_norm = min(metrics["psnr"] / 40.0, 1.0)
 
-        fct_psnr = 0.5
-        fct_ssim = 0.30
-        fct_espi = 0.1
-        fct_aufrc = 0.1
-
-        # fct_psnr = 0.40
-        # fct_ssim = 0.50
-        # fct_espi = 0.05
-        # fct_aufrc = 0.05
+        fct_psnr = self.criterion.w_l1
+        fct_ssim = self.criterion.w_ssim
+        fct_espi = self.criterion.w_espi
+        fct_aufrc = self.criterion.w_aufrc
 
         score = float(
             fct_psnr * psnr_norm

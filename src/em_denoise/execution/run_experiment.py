@@ -10,6 +10,8 @@ from em_denoise.backend.trainer import SupervisedTrainer
 from em_denoise.backend.config_schema import PipelineConfig
 from em_denoise.backend.loss import ComprehensiveEMLoss
 
+import run_inference
+
 
 def main(config_path: Path):
     cfg = PipelineConfig.from_yaml(config_path)
@@ -47,10 +49,10 @@ def main(config_path: Path):
 
     # Initialize the new multi-objective criterion
     criterion = ComprehensiveEMLoss(
-        w_l1=0.5,
-        w_ssim=0.3,
-        w_espi=0.1,
-        w_aufrc=0.1,
+        w_l1=cfg.em_loss.l1,
+        w_ssim=cfg.em_loss.ssim,
+        w_espi=cfg.em_loss.espi,
+        w_aufrc=cfg.em_loss.aufrc,
         channels=unet_config.in_channels,
     ).to(device)
 
@@ -93,6 +95,11 @@ def main(config_path: Path):
     )
 
     trainer.fit(num_epochs=cfg.training.epochs)
+
+    # INFERENCE
+    test_dir = Path(cfg.paths.sandbox_root).parent / "raw_patches/test_raw"
+    checkpoint_path = Path(cfg.paths.experiment_dir) / "checkpoints/best_model.pt"
+    run_inference.main(str(test_dir), str(checkpoint_path))
 
 
 if __name__ == "__main__":
