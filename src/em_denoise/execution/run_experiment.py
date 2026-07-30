@@ -8,7 +8,7 @@ from em_denoise.backend.dataset import SupervisedEMDataset
 from em_denoise.backend.architecture import ResidualUNet, UNetConfig
 from em_denoise.backend.trainer import SupervisedTrainer
 from em_denoise.backend.config_schema import PipelineConfig
-from em_denoise.backend.loss import ComprehensiveEMLoss
+from em_denoise.backend.loss import DynamicEMLoss
 
 import run_inference
 
@@ -47,19 +47,26 @@ def main(config_path: Path):
     unet_config = UNetConfig(**unet_kwargs)
     model = ResidualUNet(unet_config).to(device)
 
-    # Initialize the new multi-objective criterion
-    criterion = ComprehensiveEMLoss(
-        w_l1=cfg.em_loss.l1,
-        w_ssim=cfg.em_loss.ssim,
-        w_espi=cfg.em_loss.espi,
-        w_aufrc=cfg.em_loss.aufrc,
-        channels=unet_config.in_channels,
-    ).to(device)
+    # # Initialize the new multi-objective criterion
+    # criterion = ComprehensiveEMLoss(
+    #     w_l1=cfg.em_loss.l1,
+    #     w_ssim=cfg.em_loss.ssim,
+    #     w_espi=cfg.em_loss.espi,
+    #     w_aufrc=cfg.em_loss.aufrc,
+    #     channels=unet_config.in_channels,
+    # ).to(device)
+    #
+    # optimizer = torch.optim.AdamW(
+    #     model.parameters(),
+    #     lr=cfg.training.lr,
+    #     weight_decay=cfg.training.weight_decay,
+    # )
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=cfg.training.lr,
-        weight_decay=cfg.training.weight_decay,
+    criterion = DynamicEMLoss(channels=1)
+
+    # Critical: chain the parameters of the model and the loss module
+    optimizer = torch.optim.Adam(
+        list(model.parameters()) + list(criterion.parameters()), lr=1e-4
     )
 
     warmup_epochs = getattr(cfg.training, "warmup_epochs", 5)

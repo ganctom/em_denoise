@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -18,7 +18,7 @@ class SupervisedTrainer:
         train_loader: DataLoader,
         val_loader: DataLoader,
         optimizer: torch.optim.Optimizer,
-        scheduler: torch.optim.lr_scheduler.LRScheduler | None,
+        scheduler: Optional[torch.optim.lr_scheduler.LRScheduler],
         criterion: nn.Module,
         device: torch.device,
         output_dir: Path,
@@ -29,7 +29,7 @@ class SupervisedTrainer:
         self.val_loader = val_loader
         self.optimizer = optimizer
         self.scheduler = scheduler
-        self.criterion = criterion
+        self.criterion = criterion.to(device)
         self.device = device
         self.predict_residual = predict_residual
 
@@ -56,26 +56,39 @@ class SupervisedTrainer:
     def train_epoch(self, epoch: int) -> float:
         self.model.train()
         running_loss = 0.0
+        running_metrics = {}
 
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch:03d} [Train]")
         for noisy, clean in pbar:
             noisy, clean = noisy.to(self.device), clean.to(self.device)
+            batch_size = noisy.size(0)
 
             self.optimizer.zero_grad()
             model_output = self.model(noisy)
-
             denoised = self._get_denoised_estimate(noisy, model_output)
-            loss = self.criterion(denoised, clean)
+
+            # Unpack dynamic loss and component metrics
+            loss, batch_metrics = self.criterion(denoised, clean)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
 
-            running_loss += loss.item() * noisy.size(0)
+            running_loss += loss.item() * batch_size
+
+            # Accumulate dynamic weights and raw loss components for TensorBoard
+            for k, v in batch_metrics.items():
+                running_metrics[k] = running_metrics.get(k, 0.0) + v * batch_size
+
             pbar.set_postfix({"loss": f"{loss.item():.5f}"})
 
-        epoch_loss = running_loss / len(self.train_loader.dataset)
+        N = len(self.train_loader.dataset)
+        epoch_loss = running_loss / N
         self.writer.add_scalar("Loss/Train", epoch_loss, epoch)
+
+        for k, v in running_metrics.items():
+            self.writer.add_scalar(f"DynamicLoss/{k}", v / N, epoch)
+
         return epoch_loss
 
     @torch.no_grad()
@@ -90,14 +103,16 @@ class SupervisedTrainer:
 
         for noisy, clean in self.val_loader:
             noisy, clean = noisy.to(self.device), clean.to(self.device)
-            model_output = self.model(noisy)
+            batch_size = noisy.size(0)
 
+            model_output = self.model(noisy)
             denoised = self._get_denoised_estimate(noisy, model_output)
-            loss = self.criterion(denoised, clean)
-            running_loss += loss.item() * noisy.size(0)
+
+            # Discard metrics dict during validation loop
+            loss, _ = self.criterion(denoised, clean)
+            running_loss += loss.item() * batch_size
 
             denoised_clamped = torch.clamp(denoised, 0.0, 1.0)
-            batch_size = noisy.size(0)
 
             total_psnr += compute_psnr(denoised_clamped, clean).item() * batch_size
             total_ssim += compute_ssim(denoised_clamped, clean).item() * batch_size
@@ -125,30 +140,33 @@ class SupervisedTrainer:
         self.writer.add_scalar("Metrics/SSIM", metrics["ssim"], epoch)
         self.writer.add_scalar("Metrics/ESPI", metrics["espi"], epoch)
         self.writer.add_scalar("Metrics/AUFRC", metrics["aufrc"], epoch)
-        self.writer.add_scalar(
-            "Params/LearningRate", self.optimizer.param_groups[0]["lr"], epoch
-        )
+
+        if self.scheduler is not None:
+            self.writer.add_scalar(
+                "Params/LearningRate", self.optimizer.param_groups[0]["lr"], epoch
+            )
 
         return val_loss, metrics
 
     def _compute_compound_score(self, metrics: dict) -> float:
         """
         Synthesizes a compound score for checkpoint acceptance.
-        Assumes PSNR practical max is ~40.0 dB for normalization mapping.
-        Weights can be adapted based on artifact sensitivity parameters.
+        Uses static heuristic weights to evaluate structural preservation quality,
+        decoupled from the dynamic loss log-variances.
         """
         psnr_norm = min(metrics["psnr"] / 40.0, 1.0)
 
-        fct_psnr = self.criterion.w_l1
-        fct_ssim = self.criterion.w_ssim
-        fct_espi = self.criterion.w_espi
-        fct_aufrc = self.criterion.w_aufrc
+        # Fixed validation metric priorities
+        w_psnr = 0.2
+        w_ssim = 0.3
+        w_espi = 0.25
+        w_aufrc = 0.25
 
         score = float(
-            fct_psnr * psnr_norm
-            + fct_ssim * metrics["ssim"]
-            + fct_espi * metrics["espi"]
-            + fct_aufrc * metrics["aufrc"]
+            w_psnr * psnr_norm
+            + w_ssim * metrics["ssim"]
+            + w_espi * metrics["espi"]
+            + w_aufrc * metrics["aufrc"]
         )
         return score
 
@@ -177,11 +195,14 @@ class SupervisedTrainer:
             if compound_score > self.best_val_score:
                 self.best_val_score = compound_score
                 ckpt_path = self.checkpoint_dir / "best_model.pt"
+
+                # Bundle criterion state_dict to save learned variances
                 torch.save(
                     {
                         "epoch": epoch,
                         "model_state_dict": self.model.state_dict(),
                         "optimizer_state_dict": self.optimizer.state_dict(),
+                        "criterion_state_dict": self.criterion.state_dict(),
                         "metrics": metrics,
                         "compound_score": compound_score,
                         "predict_residual": self.predict_residual,

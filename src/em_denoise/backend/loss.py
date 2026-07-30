@@ -1,3 +1,5 @@
+from typing import Dict, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -273,3 +275,160 @@ class ComprehensiveEMLoss(nn.Module):
         if self.w_aufrc > 0:
             loss += self.w_aufrc * self.aufrc_loss(pred, target)
         return loss
+
+
+class CharbonnierLoss(nn.Module):
+    """
+    Smooth L1 (Pseudo-Huber) Loss.
+    Provides L2-like stability near zero error and L1-like robustness to heavy-tailed outliers.
+    """
+
+    def __init__(self, eps: float = 1e-3):
+        super().__init__()
+        self.eps2 = eps**2
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        diff = pred - target
+        return torch.mean(torch.sqrt(diff * diff + self.eps2))
+
+
+class FocalFrequencyLoss(nn.Module):
+    """
+    2D Fourier space spatial-frequency synthesis enforcement.
+    Dynamically down-weights easily restorable low frequencies.
+    """
+
+    def __init__(self, alpha: float = 1.0, eps: float = 1e-8):
+        super().__init__()
+        self.alpha = alpha
+        self.eps = eps
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        f_pred = torch.fft.rfft2(pred, norm="ortho")
+        f_target = torch.fft.rfft2(target, norm="ortho")
+
+        # Squared magnitude of the frequency error
+        freq_distance = torch.abs(f_pred - f_target) ** 2
+
+        # Compute dynamic focal weights (normalized per batch)
+        weight = freq_distance**self.alpha
+        weight = weight / (weight.detach().max() + self.eps)
+
+        loss = weight * freq_distance
+        return torch.mean(loss)
+
+
+class GeneralizedAnscombeLoss(nn.Module):
+    """
+    Evaluates L1 distance in a Variance-Stabilized Transformation (VST) space.
+    Converts intensity-dependent Poisson-Gaussian noise to approximate homoscedastic Gaussian noise.
+    """
+
+    def __init__(
+        self,
+        alpha: float = 1.0,
+        sigma: float = 0.0,
+        gain: float = 0.0,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.alpha = alpha
+        self.sigma = sigma
+        self.gain = gain
+        self.eps = eps
+
+    def _anscombe(self, x: torch.Tensor) -> torch.Tensor:
+        # Prevent negative arguments under the square root due to sub-zero network predictions
+        val = (
+            self.alpha * x
+            + (3.0 / 8.0) * (self.alpha**2)
+            + (self.sigma**2)
+            - (self.alpha * self.gain)
+        )
+        return (2.0 / self.alpha) * torch.sqrt(torch.clamp(val, min=self.eps))
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # Applying standard L1 in the transformed variance-stabilized space
+        return F.l1_loss(self._anscombe(pred), self._anscombe(target))
+
+
+class LaplacianLoss(nn.Module):
+    """
+    Enforces isotropic second-order derivative consistency
+    to preserve fine structural boundaries.
+    """
+
+    def __init__(self, channels: int = 1):
+        super().__init__()
+        kernel = torch.tensor(
+            [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]], dtype=torch.float32
+        )
+        kernel = kernel.view(1, 1, 3, 3).repeat(channels, 1, 1, 1)
+        self.register_buffer("kernel", kernel)
+        self.channels = channels
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        lap_pred = F.conv2d(pred, self.kernel, padding=1, groups=self.channels)
+        lap_target = F.conv2d(target, self.kernel, padding=1, groups=self.channels)
+        return F.l1_loss(lap_pred, lap_target)
+
+
+class DynamicEMLoss(nn.Module):
+    """
+    Composite Loss Factory evaluating Charbonnier, FFL, VST, and Laplacian losses.
+    Utilizes learnable homoscedastic uncertainty for dynamic gradient balancing.
+    """
+
+    def __init__(
+        self,
+        channels: int = 1,
+        charbonnier_eps: float = 1e-3,
+        ffl_alpha: float = 1.0,
+        vst_alpha: float = 1.0,
+        vst_sigma: float = 0.0,
+        vst_gain: float = 0.0,
+    ):
+        super().__init__()
+
+        self.charbonnier = CharbonnierLoss(eps=charbonnier_eps)
+        self.ffl = FocalFrequencyLoss(alpha=ffl_alpha)
+        self.vst = GeneralizedAnscombeLoss(
+            alpha=vst_alpha, sigma=vst_sigma, gain=vst_gain
+        )
+        self.laplacian = LaplacianLoss(channels=channels)
+
+        # Learnable log-variance parameters for the FOUR loss components.
+        # Initialized to zero (corresponding to a weight of 1.0)
+        self.log_vars = nn.Parameter(torch.zeros(4, dtype=torch.float32))
+
+    def forward(
+        self, pred: torch.Tensor, target: torch.Tensor
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        l_charb = self.charbonnier(pred, target)
+        l_ffl = self.ffl(pred, target)
+        l_vst = self.vst(pred, target)
+        l_lap = self.laplacian(pred, target)
+
+        losses = torch.stack([l_charb, l_ffl, l_vst, l_lap])
+
+        # precision = exp(-log_var)
+        precision = torch.exp(-self.log_vars)
+
+        # Composite objective: sum( L_i * precision_i + log_var_i )
+        dynamic_loss = torch.sum(precision * losses + self.log_vars)
+
+        # Detach and package independent metrics for TensorBoard/logging
+        with torch.no_grad():
+            weights = precision.cpu().numpy()
+            metrics = {
+                "loss_raw/charbonnier": l_charb.item(),
+                "loss_raw/ffl": l_ffl.item(),
+                "loss_raw/vst": l_vst.item(),
+                "loss_raw/laplacian": l_lap.item(),
+                "weight/charbonnier": float(weights[0]),
+                "weight/ffl": float(weights[1]),
+                "weight/vst": float(weights[2]),
+                "weight/laplacian": float(weights[3]),
+            }
+
+        return dynamic_loss, metrics
