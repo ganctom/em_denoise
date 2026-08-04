@@ -339,10 +339,33 @@ def main(config_path: Path | str = "config.yaml"):
 
     print(f"Using execution device: {device}")
 
+    # MPS autocast can stall/hang Metal shader compilation with large batch sizes (batch_size >= 64).
+    # Enable AMP strictly on CUDA backends or when explicitly stable.
+    if device.type == "cuda":
+        use_amp = True
+        autocast_device = "cuda"
+        autocast_dtype = torch.float16
+        print(
+            f"Automatic Mixed Precision (AMP) enabled for CUDA (dtype={autocast_dtype})"
+        )
+    else:
+        use_amp = False
+        autocast_device = "cpu"
+        autocast_dtype = torch.float32
+        print(f"Running full float32 precision for {device.type.upper()} stability.")
+
     print("\n--- 2. Instantiating ConnectomicsDenoisingNet & Monitoring ---")
     model = ConnectomicsDenoisingNet(in_channels=1, out_channels=1, base_dim=32).to(
         device
     )
+
+    try:
+        if hasattr(torch, "compile") and device.type == "cuda":
+            print("Compiling model graph via torch.compile()...")
+            model = torch.compile(model)
+    except Exception as e:
+        print(f"torch.compile skipped: {e}")
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.training.learning_rate)
     criterion = nn.MSELoss()
 
@@ -381,8 +404,14 @@ def main(config_path: Path | str = "config.yaml"):
             noisy_b, clean_b = noisy_b.to(device), clean_b.to(device)
 
             optimizer.zero_grad()
-            pred_b = model(noisy_b)
-            loss = criterion(pred_b, clean_b)
+            if use_amp:
+                with torch.autocast(device_type=autocast_device, dtype=autocast_dtype):
+                    pred_b = model(noisy_b)
+                    loss = criterion(pred_b, clean_b)
+            else:
+                pred_b = model(noisy_b)
+                loss = criterion(pred_b, clean_b)
+
             loss.backward()
             optimizer.step()
 
@@ -419,8 +448,15 @@ def main(config_path: Path | str = "config.yaml"):
         with torch.no_grad():
             for noisy_b, clean_b, _ in val_pbar:
                 noisy_b, clean_b = noisy_b.to(device), clean_b.to(device)
-                pred_b = model(noisy_b)
-                loss = criterion(pred_b, clean_b)
+                if use_amp:
+                    with torch.autocast(
+                        device_type=autocast_device, dtype=autocast_dtype
+                    ):
+                        pred_b = model(noisy_b)
+                        loss = criterion(pred_b, clean_b)
+                else:
+                    pred_b = model(noisy_b)
+                    loss = criterion(pred_b, clean_b)
                 val_loss += loss.item() * noisy_b.size(0)
 
                 # Compute batch validation metrics
@@ -550,8 +586,12 @@ def main(config_path: Path | str = "config.yaml"):
             noisy_b, clean_b = noisy_b.to(device), clean_b.to(device)
 
             # Predict denoised tensor
-            pred_b = model(noisy_b)
-            pred_b = torch.clamp(pred_b, 0.0, 1.0)
+            if use_amp:
+                with torch.autocast(device_type=autocast_device, dtype=autocast_dtype):
+                    pred_b = model(noisy_b)
+            else:
+                pred_b = model(noisy_b)
+            pred_b = torch.clamp(pred_b.float(), 0.0, 1.0)
 
             # Convert to numpy arrays (H, W) in range [0.0, 1.0]
             clean_np = clean_b.squeeze().cpu().numpy()
