@@ -88,6 +88,13 @@ def main(config_path: Path | str = "config.yaml"):
     patch_w = cfg.extraction.patch_size
     max_patches_per_tile = cfg.extraction.patches_per_tile
 
+    lmdb_path = base_output_dir / "patch_store.lmdb"
+    from em_denoise_refactor.etl.lmdb_store import LMDBStoreWriter
+
+    lmdb_writer = LMDBStoreWriter(map_size=100 * 1024 * 1024 * 1024)
+    lmdb_writer.initialize(lmdb_path)
+    print(f"LMDB Patch Store initialized at: {lmdb_path}")
+
     def extract_and_save(metadata, target_count, split_name, clean_dir, noisy_dir):
         print(f"\nExtracting {target_count} patches for {split_name}...")
 
@@ -153,6 +160,10 @@ def main(config_path: Path | str = "config.yaml"):
                         tifffile.imwrite(clean_dir / filename, clean_patch)
                         tifffile.imwrite(noisy_dir / filename, noisy_patch)
 
+                        # Write clean patch directly into LMDB binary store
+                        patch_key = f"{split_name}_{patch_count:08d}"
+                        lmdb_writer.write_patch(patch_key, clean_patch)
+
                         patch_count += 1
                         section_coverage[section_id] += 1
                         pbar.update(1)
@@ -174,6 +185,10 @@ def main(config_path: Path | str = "config.yaml"):
     extract_and_save(
         test_metadata, cfg.extraction.target_test_patches, "test", *split_dirs["test"]
     )
+
+    lmdb_writer.commit_transaction()
+    lmdb_writer.close()
+    print(f"\n✓ LMDB patch store successfully committed at: {lmdb_path}")
 
 
 if __name__ == "__main__":
