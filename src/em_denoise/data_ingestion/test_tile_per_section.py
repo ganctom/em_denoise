@@ -121,7 +121,7 @@ def test_load_result():
     filepath = config.get_fp_out()
     assert filepath == "/Users/ganctoma/SW/sort/N2V/tst/sections/tiles_per_section.txt"
 
-    result = load_result(config)
+    result = load_result(str(config.get_fp_out()))
     assert result == {
         1250: 18,
         1251: 18,

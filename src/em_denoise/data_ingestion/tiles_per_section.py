@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 from typing import NamedTuple
 from concurrent.futures import ProcessPoolExecutor
+
 from pydantic import BaseModel, Field
 from tqdm import tqdm
 
@@ -114,15 +115,14 @@ def store_result(config: Config, data: dict[int, int]) -> None:
     fp.write_text("".join(lines), encoding="utf-8")
 
 
-def load_result(config: Config) -> dict[int, int]:
+def load_result(fp_out: str) -> dict[int, int]:
     """Load comma-separated section tile database back into a dictionary."""
-    fp = config.get_fp_out()
-    if not fp.is_file():
+    if not Path(fp_out).is_file():
         return {}
 
     result = {}
     try:
-        with open(fp, "r", encoding="utf-8") as f:
+        with open(fp_out, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#"):
@@ -134,7 +134,7 @@ def load_result(config: Config) -> dict[int, int]:
                     except ValueError:
                         continue
     except Exception as e:
-        print(f"Warning: Failed to load result file {fp}: {e}")
+        print(f"Warning: Failed to load result file {fp_out}: {e}")
         return {}
 
     return result

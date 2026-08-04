@@ -1,6 +1,6 @@
 paths:
   sandbox_root: "/Users/ganctoma/SW/sort/N2V/run_26/supervised_sandbox"
-  experiment_dir: "/Users/ganctoma/SW/sort/N2V/run_31/experiments/`04_DynamicEMLoss_020_030_025_025_ep_20_lr00002`"
+  experiment_dir: "/Users/ganctoma/SW/sort/N2V/run_31/experiments/06_DynamicEMLoss_010_030_035_025_ep_20_lr0004"
 
 checkpoints:
   cos_warmup_patch_128_new_loss: "/Users/ganctoma/SW/sort/N2V/run_25/experiments/00_ep_10_lr_0002_wd_0001_cosine_warmup_new_loss/checkpoints/best_model.pt"
@@ -20,12 +20,12 @@ unet:
 
 training:
   epochs: 20
-  lr: 0.0002
+  lr: 0.0004
   weight_decay: 0.0001
   eta_min: 0.000001
 
 em_loss:
-  l1: 0.2
+  l1: 0.1
   ssim: 0.3
-  espi: 0.25
+  espi: 0.35
   aufrc: 0.25

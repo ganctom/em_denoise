@@ -1,0 +1,28 @@
+v_0.1
+Implementing the N2V2 (Noise2Void 2.0) architecture directly targets the checkerboard
+artifacts and spatial frequency leakage caused by the standard N2V baseline.Based on
+the original 2022 N2V2 specification by Höck et al., the transition requires three
+fundamental changes:Deterministic Median Masking: Replacing random neighbor sampling
+with the median of the $3 \times 3$ neighborhood (excluding the center pixel).
+
+Anti-aliased Downsampling: Replacing MaxPool2d with MaxBlurPool2d to prevent shift-variance
+and sub-pixel checkerboard artifacts.Architectural Rollback: Removing the topmost skip
+connection (which leaks high-frequency noise directly to the output) and reverting
+block-level residual connections to standard sequential convolutions.Below are the
+drop-in replacements for your script to upgrade the pipeline to N2V2.1. V
+ectorized Median MaskingReplace the _apply_vectorized_mask static method in
+your StochasticPatchDataset with this deterministic median implementation. This
+leverages localized index extraction rather than shifting full tensors, maintaining
+ high dataloader throughput.
+
+ 2. Max-BlurPool Downsampling LayerAdd this module to handle the N2V2 anti-aliased downsampling
+ specification. It executes a standard max-pool followed by a $3 \times 3$ binomial blur filter.
+
+ Replace ResConvBlock and ModernUNet entirely with these classes. The topmost encoder-to-decoder
+ skip connection is severed, and block-level residuals are removed to prevent pure noise
+ transmission to the final prediction layer.
+
+ v_0.2
+ StructN2V - defineable window that can hide determinsitic noise
+
+ v_0.3

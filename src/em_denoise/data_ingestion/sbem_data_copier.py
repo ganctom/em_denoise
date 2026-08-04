@@ -205,14 +205,16 @@ class SBEMPatchPipeline:
             random.seed(config.random_seed)
             np.random.seed(config.random_seed)
 
-    def get_tile_path(self, tile_id: int, section_num: int) -> [str, str]:
+    def get_tile_path(self, tile_id: int, section_num: int) -> Tuple[str, str]:
         tile_str = f"{tile_id:04d}"
         slice_str = f"{section_num:05d}"
         exp_name = f"{self.cfg.sbem_root.name}"
         grid_num = self.cfg.grid_num
         grid_str = "g" + (str(grid_num).zfill(4))
         filename = f"{exp_name}_{grid_str}_t{tile_str}_s{slice_str}.tif"
-        filepath = self.cfg.sbem_root / "tiles" / grid_str / f"t{tile_str}" / filename
+        filepath = str(
+            self.cfg.sbem_root / "tiles" / grid_str / f"t{tile_str}" / filename
+        )
         return filepath, filename
 
     def get_patch_name(self, tile_id: int, section_num: int, section_counts) -> str:
@@ -252,7 +254,7 @@ class SBEMPatchPipeline:
                 continue
 
             if split_name == "test" and raw_saved_count < self.cfg.n_test_raw:
-                self.writer.save_raw(src_path, filename)
+                self.writer.save_raw(Path(src_path), filename)
                 raw_saved_count += 1
 
             try:
