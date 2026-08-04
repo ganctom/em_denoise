@@ -1,6 +1,8 @@
 # src/em_denoise_refactor/tests/validate_step9_train_and_infer.py
 
 import sys
+from typing import Tuple
+
 import math
 import time
 from pathlib import Path
@@ -58,28 +60,83 @@ def compute_ssim(img1: np.ndarray, img2: np.ndarray, data_range: float = 1.0) ->
 
 
 class PatchFolderDataset(Dataset):
-    def __init__(self, clean_dir: Path, noisy_dir: Path):
+    def __init__(
+        self,
+        clean_dir: Path,
+        noisy_dir: Path,
+        cache_in_ram: bool = True,
+        augment: bool = False,
+    ):
         self.clean_dir = Path(clean_dir)
         self.noisy_dir = Path(noisy_dir)
+        self.augment = augment
+        self.cache_in_ram = cache_in_ram
 
         self.filenames = sorted([f.name for f in self.clean_dir.glob("*.tif")])
         if not self.filenames:
             raise FileNotFoundError(f"No .tif patches found in {self.clean_dir}")
 
+        self.cached_samples = []
+        if self.cache_in_ram:
+            print(
+                f"Caching {len(self.filenames)} patches from {self.clean_dir.parent.name} into RAM for fast training..."
+            )
+            for fname in tqdm(
+                self.filenames, desc=f"RAM Caching ({self.clean_dir.parent.name})"
+            ):
+                clean_path = self.clean_dir / fname
+                noisy_path = self.noisy_dir / fname
+
+                clean_img = tifffile.imread(str(clean_path)).astype(np.float32) / 255.0
+                noisy_img = tifffile.imread(str(noisy_path)).astype(np.float32) / 255.0
+
+                clean_tensor = torch.from_numpy(clean_img).unsqueeze(0)
+                noisy_tensor = torch.from_numpy(noisy_img).unsqueeze(0)
+
+                self.cached_samples.append((noisy_tensor, clean_tensor, fname))
+
     def __len__(self) -> int:
         return len(self.filenames)
 
+    def _apply_augmentation(
+        self, noisy: torch.Tensor, clean: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # D4 Dihedral Group Symmetry: random flips + 90-degree rotations
+        if torch.rand(1).item() > 0.5:
+            noisy = torch.flip(noisy, dims=[-1])
+            clean = torch.flip(clean, dims=[-1])
+
+        if torch.rand(1).item() > 0.5:
+            noisy = torch.flip(noisy, dims=[-2])
+            clean = torch.flip(clean, dims=[-2])
+
+        k = torch.randint(0, 4, (1,)).item()
+        if k > 0:
+            noisy = torch.rot90(noisy, k, dims=[-2, -1])
+            clean = torch.rot90(clean, k, dims=[-2, -1])
+
+        return noisy, clean
+
     def __getitem__(self, idx: int):
-        fname = self.filenames[idx]
-        clean_path = self.clean_dir / fname
-        noisy_path = self.noisy_dir / fname
+        if self.cache_in_ram:
+            noisy_tensor, clean_tensor, fname = self.cached_samples[idx]
+            noisy_tensor = noisy_tensor.clone()
+            clean_tensor = clean_tensor.clone()
+        else:
+            fname = self.filenames[idx]
+            clean_path = self.clean_dir / fname
+            noisy_path = self.noisy_dir / fname
 
-        clean_img = tifffile.imread(str(clean_path)).astype(np.float32) / 255.0
-        noisy_img = tifffile.imread(str(noisy_path)).astype(np.float32) / 255.0
+            clean_img = tifffile.imread(str(clean_path)).astype(np.float32) / 255.0
+            noisy_img = tifffile.imread(str(noisy_path)).astype(np.float32) / 255.0
 
-        # Add channel dimension (C, H, W)
-        clean_tensor = torch.from_numpy(clean_img).unsqueeze(0)
-        noisy_tensor = torch.from_numpy(noisy_img).unsqueeze(0)
+            clean_tensor = torch.from_numpy(clean_img).unsqueeze(0)
+            noisy_tensor = torch.from_numpy(noisy_img).unsqueeze(0)
+
+        if self.augment:
+            noisy_tensor, clean_tensor = self._apply_augmentation(
+                noisy_tensor, clean_tensor
+            )
 
         return noisy_tensor, clean_tensor, fname
 
@@ -107,8 +164,12 @@ def main(config_path: Path | str = "config.yaml"):
     test_denoised_dir.mkdir(parents=True, exist_ok=True)
 
     print("\n--- 1. Initializing Datasets & Dataloaders ---")
-    train_dataset = PatchFolderDataset(train_clean_dir, train_noisy_dir)
-    val_dataset = PatchFolderDataset(val_clean_dir, val_noisy_dir)
+    train_dataset = PatchFolderDataset(
+        train_clean_dir, train_noisy_dir, cache_in_ram=True, augment=True
+    )
+    val_dataset = PatchFolderDataset(
+        val_clean_dir, val_noisy_dir, cache_in_ram=True, augment=False
+    )
 
     train_loader = DataLoader(
         train_dataset,
