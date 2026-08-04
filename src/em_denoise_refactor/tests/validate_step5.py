@@ -1,17 +1,11 @@
 # validate_step5.py
+
 import time
 import tempfile
-from collections.abc import Iterator
 from pathlib import Path
-
-import numpy as np
-import tifffile
 import torch
 from torch.utils.data import DataLoader
 
-# ==========================================
-# IMPORT YOUR CONCRETE IMPLEMENTATIONS HERE
-# ==========================================
 # Data & Storage
 from em_denoise_refactor.etl.lmdb_store import LMDBStoreWriter
 from em_denoise_refactor.data.dataset import LMDBPatchStore, SBFSEMDataset
@@ -29,63 +23,43 @@ def run_phase1_remote_extraction(db_path: Path, extr_cfg: ExtractionConfig):
     """
     print("\n--- 1. Testing Remote Metadata Fetch ---")
 
-    # Initialize the concrete remote client (e.g., S3 / HTTP)
-    client = SMBStorageClient(extr_cfg)
+    # Save SQLite DB locally next to the LMDB file
+    sqlite_db_path = db_path.parent / "dataset_metadata_g0000.db"
 
-    # Ensure it successfully connects to the server and parses the DatasetMetadata [cite: 107]
-    metadata = client.fetch_metadata(force_rescan=True)
+    # Initialize the concrete remote client with local SQLite metadata store
+    client = SMBStorageClient(extr_cfg, db_path=sqlite_db_path)
+
+    # Ensure it successfully connects to the server and parses the DatasetMetadata
+    metadata = client.fetch_metadata(force_rescan=False, split="train")
     print(f"SUCCESS: Metadata fetched. Total sections: {metadata.total_sections}")
 
     print("\n--- 2. Executing Mini-Extraction (5 ROIs) ---")
     sampler = VarianceAwareROISampler()
 
-    # Pull a tiny subset (e.g., 5 ROIs) [cite: 108]
+    # Pull a tiny subset (e.g., 5 ROIs)
     rois = sampler.generate_rois(metadata, num_regions=5)
     extractor = SMBHighFreqPatchExtractor()
 
-    # Initialize the LMDB writer (using the fixes from Step 1)
+    # Initialize the LMDB writer
     writer = LMDBStoreWriter(map_size=1024 * 1024 * 500)  # 500MB ceiling for dry run
     writer.initialize(db_path)
 
     extracted_count = 0
 
-    # Stream raw tiles and crop sub-volumes directly into the BinaryStoreWriter [cite: 314]
+    # Stream raw tiles and crop sub-volumes directly into the BinaryStoreWriter
     for roi in rois:
-        patch_generator: Iterator[np.ndarray] = extractor.extract_from_roi(
-            client, roi, patch_size=(512, 512)
-        )
+        patch_generator = extractor.extract_from_roi(client, roi, patch_size=(512, 512))
         for patch_data in patch_generator:
             patch_id = f"{extracted_count:08d}"
             writer.write_patch(patch_id, patch_data)
             extracted_count += 1
 
-    # Ensure the BinaryStoreWriter commits the transaction without throwing connection timeouts [cite: 109]
+    # Ensure the BinaryStoreWriter commits the transaction without throwing connection timeouts
     writer.commit_transaction()
     writer.close()
 
     print(f"SUCCESS: Extracted {extracted_count} patches and staged to local SSD.")
     return extracted_count
-
-
-def create_local_synthetic_dataset(
-    sbem_root: Path, sections: int = 3, tiles_per_section: int = 2
-) -> None:
-    """Create a tiny SMB-style local tile hierarchy with synthetic TIFFs for offline validation."""
-    tiles_root = sbem_root / "tiles" / "g0000"
-    tiles_root.mkdir(parents=True, exist_ok=True)
-
-    for section_idx in range(1, sections + 1):
-        for tile_idx in range(1, tiles_per_section + 1):
-            tile_dir = tiles_root / f"t{tile_idx:04d}"
-            tile_dir.mkdir(parents=True, exist_ok=True)
-
-            image = np.linspace(0, 255, 1024 * 1024, dtype=np.uint8).reshape(1024, 1024)
-            image = (
-                (image.astype(np.int16) + section_idx * 20 + tile_idx * 5) % 256
-            ).astype(np.uint8)
-
-            filename = f"{sbem_root.name}_g0000_t{tile_idx:04d}_s{section_idx:05d}.tif"
-            tifffile.imwrite(str(tile_dir / filename), image)
 
 
 def run_phase2_offline_training(db_path: Path):
@@ -104,24 +78,23 @@ def run_phase2_offline_training(db_path: Path):
     # Ensure num_workers=0 for this test to easily trace memory mapping
     dataloader = DataLoader(dataset, batch_size=4, shuffle=True, num_workers=0)
 
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    print(f"Using device: {device}")
+    mps_device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
     start_time = time.time()
     for batch_idx, (noisy_inputs, clean_targets) in enumerate(dataloader):
         # Cast from ByteTensor to FloatTensor and normalize to [0.0, 1.0]
         noisy_inputs = (
-            noisy_inputs.to(device, dtype=torch.float32, non_blocking=True) / 255.0
+            noisy_inputs.to(mps_device, dtype=torch.float32, non_blocking=True) / 255.0
         )
         clean_targets = (
-            clean_targets.to(device, dtype=torch.float32, non_blocking=True) / 255.0
+            clean_targets.to(mps_device, dtype=torch.float32, non_blocking=True) / 255.0
         )
 
         # Utilize clean_targets in a mock loss calculation
         loss_placeholder = torch.mean((noisy_inputs - clean_targets) ** 2)
 
         print(
-            f"Batch {batch_idx:02d} loaded to device | "
+            f"Batch {batch_idx:02d} loaded to {mps_device} | "
             f"Input Shape: {noisy_inputs.shape} | "
             f"Target Shape: {clean_targets.shape} | "
             f"Dummy Loss: {loss_placeholder.item():.4f} | "
@@ -137,15 +110,16 @@ def run_phase2_offline_training(db_path: Path):
 
 
 if __name__ == "__main__":
+    extr_cfg = ExtractionConfig(
+        sbem_root="/Volumes/tachyon/groups/scratch/gmicro_sem/gfriedri/_EM_acquisitions/20260201_RoLi_F1",
+        first_sec=1250,
+        last_sec=22814,
+        grid_num=0,
+    )
+
     # Use a temporary directory to keep the test environment clean
-    with tempfile.TemporaryDirectory() as temp_root:
-        temp_root_path = Path(temp_root)
-        local_sbem_root = temp_root_path / "local_sbem"
-        create_local_synthetic_dataset(local_sbem_root)
-
-        extr_cfg = ExtractionConfig(sbem_root=local_sbem_root, grid_num=0)
-
-        lmdb_path = temp_root_path / "patch_store.lmdb"
+    with tempfile.TemporaryDirectory() as temp_store_dir:
+        lmdb_path = Path(temp_store_dir) / "patch_store.lmdb"
 
         print("==================================================")
         print(" STARTING PIPELINE VALIDATION STEP 5")
@@ -153,6 +127,11 @@ if __name__ == "__main__":
         patches_staged = run_phase1_remote_extraction(lmdb_path, extr_cfg)
 
         if patches_staged > 0:
+            print("\n==================================================")
+            print(" ACTION REQUIRED: Disable your Wi-Fi now.")
+            print("==================================================")
+            input("Press Enter once your network connection is disabled...")
+
             # Step 5B: Test offline execution
             run_phase2_offline_training(lmdb_path)
         else:

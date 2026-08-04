@@ -20,12 +20,9 @@ dependencies = [
     "tqdm>=4.69.0",
     "tensorboard>=2.21.0",
     "torchvision>=0.28.0",
-    # Imported across the codebase but previously undeclared, so a fresh `uv sync`
-    # produced an environment that failed at import time.
     "tifffile>=2024.1.30",
     "pyyaml>=6.0",
     "pillow>=10.0",
-    # Used by the Noise2Void CLI (src/em_denoise/n2v/train_n2v.py).
     "cyclopts>=3.0",
     "loguru>=0.7",
     "natsort>=8.4",

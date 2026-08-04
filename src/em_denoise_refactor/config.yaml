@@ -1,0 +1,39 @@
+# Pipeline Configuration for SBF-SEM Connectomics Denoising
+
+experiment:
+  name: "N2V_run_33"
+  output_dir: "/Users/ganctoma/SW/sort/N2V/run_33"
+
+data:
+  sbem_root: "/Volumes/tachyon/groups/scratch/gmicro_sem/gfriedri/_EM_acquisitions/20260201_RoLi_F1"
+  grid_num: 0
+  first_sec: 1250
+  last_sec: 5000
+
+splitting:
+  strategy: "block"          # Options: "block" (Volumetric block + guard bands) or "mod10"
+  block_size: 100            # Size of contiguous Z-blocks
+  train_ratio: 0.8           # 80% train
+  val_ratio: 0.1             # 10% val
+  test_ratio: 0.1            # 10% test
+  guard_band_size: 5         # Number of buffer sections between splits to prevent 3D leakage
+
+extraction:
+  patch_size: 512            # Height and width of extracted 2D patches
+  patches_per_tile: 2        # Maximum patches cropped per source .tif tile
+  tiles_per_section: 4       # Number of tiles sampled per section in ROI
+  z_depth_per_roi: 1         # Z-depth span for ROI sampling (leave 1 for 2D-denoising methods)
+  target_train_patches: 100  # Number of patches for training set
+  target_val_patches: 20     # Number of patches for validation set
+  target_test_patches: 20    # Number of patches for testing set
+
+noise:
+  poisson_alpha: 20.0        # Shot noise scale
+  gaussian_sigma: 0.05       # Sensor read noise sigma
+  streak_probability: 0.15   # Beam charging raster anomaly probability
+
+training:
+  batch_size: 16
+  epochs: 10
+  learning_rate: 0.001
+  device: "mps"              # Hardware backend: "mps", "cuda", or "cpu"

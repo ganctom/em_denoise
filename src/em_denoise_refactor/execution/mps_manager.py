@@ -2,7 +2,7 @@ import torch
 import gc
 from typing import Dict
 
-from src.em_denoise_refactor.execution.interfaces import MPSDeviceManager
+from em_denoise_refactor.execution.interfaces import MPSDeviceManager
 
 
 class AppleSiliconManager(MPSDeviceManager):
