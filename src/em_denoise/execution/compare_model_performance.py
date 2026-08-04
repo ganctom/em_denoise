@@ -205,11 +205,11 @@ def run_benchmark(
             "down_samples" in k and "conv" in k for k in state_dict.keys()
         )
 
-        # Override the UNet config dynamically for this specific checkpoint
+        # Override the UNet config dynamically for this specific checkpoint. The encoder
+        # switched from max-pooling to strided convs, so the architecture is chosen from
+        # what the checkpoint actually contains rather than from the YAML.
         cfg_dict = cfg.unet.model_dump()
-        cfg_dict["use_conv_downsample"] = (
-            has_downsample_weights  # Map to your UNetConfig schema attribute
-        )
+        cfg_dict["use_conv_downsample"] = has_downsample_weights
         active_unet_cfg = UNetConfig(**cfg_dict)
 
         model = ResidualUNet(active_unet_cfg).to(device)
@@ -295,7 +295,7 @@ def run_benchmark(
                 "PSNR (dB)": f"{sub_df['PSNR'].mean():.2f} ± {sub_df['PSNR'].std():.2f}",
                 "SSIM": f"{sub_df['SSIM'].mean():.3f} ± {sub_df['SSIM'].std():.3f}",
                 "AUFRC": f"{sub_df['AUFRC'].mean():.3f} ± {sub_df['AUFRC'].std():.3f}",
-                "ESPI": f"{sub_df['ESPI'].mean():.1f} ± {sub_df['AUFRC'].std():.1f}",
+                "ESPI": f"{sub_df['ESPI'].mean():.3f} ± {sub_df['ESPI'].std():.3f}",
             }
         )
 

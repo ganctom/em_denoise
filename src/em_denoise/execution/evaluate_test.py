@@ -36,8 +36,20 @@ def evaluate_test_set(config_path: Path) -> None:
         raise FileNotFoundError(f"Checkpoint binary missing at {ckpt_path}")
 
     checkpoint = torch.load(ckpt_path, map_location=device, weights_only=True)
-    model.load_state_dict(checkpoint["model_state_dict"])
+
+    # Checkpoints may be a full training bundle or a bare state_dict. `predict_residual`
+    # records whether the network was trained to output noise instead of signal; ignoring
+    # it silently produces meaningless metrics.
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+        predict_residual = checkpoint.get("predict_residual", True)
+    else:
+        state_dict = checkpoint
+        predict_residual = True
+
+    model.load_state_dict(state_dict)
     model.eval()
+    print(f"[*] Loaded checkpoint (residual mode: {predict_residual})")
 
     out_vis_dir = cfg.paths.experiment_dir / "test_visualizations"
     out_vis_dir.mkdir(parents=True, exist_ok=True)
@@ -50,7 +62,9 @@ def evaluate_test_set(config_path: Path) -> None:
             noisy.to(device, non_blocking=True),
             clean.to(device, non_blocking=True),
         )
-        denoised = torch.clamp(model(noisy_dev), 0.0, 1.0)
+        model_output = model(noisy_dev)
+        denoised_signal = noisy_dev - model_output if predict_residual else model_output
+        denoised = torch.clamp(denoised_signal, 0.0, 1.0)
 
         # Explicit scalar extraction to prevent device-bound tensor aggregation in NumPy
         psnr_val = compute_psnr(denoised, clean_dev)

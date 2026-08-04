@@ -23,6 +23,7 @@ class SupervisedTrainer:
         device: torch.device,
         output_dir: Path,
         predict_residual: bool = True,
+        max_grad_norm: float = 1.0,
     ):
         self.model = model.to(device)
         self.train_loader = train_loader
@@ -32,6 +33,7 @@ class SupervisedTrainer:
         self.criterion = criterion.to(device)
         self.device = device
         self.predict_residual = predict_residual
+        self.max_grad_norm = max_grad_norm
 
         self.output_dir = Path(output_dir)
         self.checkpoint_dir = self.output_dir / "checkpoints"
@@ -71,7 +73,12 @@ class SupervisedTrainer:
             loss, batch_metrics = self.criterion(denoised, clean)
 
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            # Clip model and criterion parameters together: DynamicEMLoss carries
+            # trainable log-variances that are part of the same optimizer.
+            torch.nn.utils.clip_grad_norm_(
+                list(self.model.parameters()) + list(self.criterion.parameters()),
+                max_norm=self.max_grad_norm,
+            )
             self.optimizer.step()
 
             running_loss += loss.item() * batch_size

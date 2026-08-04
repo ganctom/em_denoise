@@ -9,8 +9,7 @@ from em_denoise.backend.architecture import ResidualUNet, UNetConfig
 from em_denoise.backend.trainer import SupervisedTrainer
 from em_denoise.backend.config_schema import PipelineConfig
 from em_denoise.backend.loss import DynamicEMLoss
-
-import run_inference
+from em_denoise.execution import run_inference
 
 
 def main(config_path: Path):
@@ -62,14 +61,17 @@ def main(config_path: Path):
     #     weight_decay=cfg.training.weight_decay,
     # )
 
-    criterion = DynamicEMLoss(channels=1)
+    criterion = DynamicEMLoss(channels=unet_config.in_channels)
 
-    # Critical: chain the parameters of the model and the loss module
-    optimizer = torch.optim.Adam(
-        list(model.parameters()) + list(criterion.parameters()), lr=1e-4
+    # Critical: chain the parameters of the model and the loss module, otherwise the
+    # learnable log-variances of DynamicEMLoss never receive updates.
+    optimizer = torch.optim.AdamW(
+        list(model.parameters()) + list(criterion.parameters()),
+        lr=cfg.training.lr,
+        weight_decay=cfg.training.weight_decay,
     )
 
-    warmup_epochs = getattr(cfg.training, "warmup_epochs", 5)
+    warmup_epochs = cfg.training.warmup_epochs
     warmup_scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs)
 
     cosine_epochs = cfg.training.epochs - warmup_epochs
@@ -99,14 +101,22 @@ def main(config_path: Path):
         device=device,
         output_dir=cfg.paths.experiment_dir,
         predict_residual=True,
+        max_grad_norm=cfg.training.max_grad_norm,
     )
 
     trainer.fit(num_epochs=cfg.training.epochs)
 
-    # INFERENCE
+    # INFERENCE on the untouched full-size tiles copied out by the ingestion pipeline.
     test_dir = Path(cfg.paths.sandbox_root).parent / "raw_patches/test_raw"
     checkpoint_path = Path(cfg.paths.experiment_dir) / "checkpoints/best_model.pt"
-    run_inference.main(str(test_dir), str(checkpoint_path))
+    if test_dir.exists():
+        run_inference.run_from_config(
+            config_path=config_path,
+            test_dir=test_dir,
+            ckpt_path=checkpoint_path,
+        )
+    else:
+        print(f"[!] Skipping post-training inference, no raw test tiles at {test_dir}")
 
 
 if __name__ == "__main__":
