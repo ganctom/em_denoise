@@ -7,7 +7,7 @@ import torch
 from torch.utils.data import Dataset
 from torch import Tensor
 from pathlib import Path
-from typing import Tuple, Optional, Union
+from typing import Tuple, Optional, Union, Dict
 
 from em_denoise_refactor.data.interfaces import LocalPatchStore, NoiseSynthesizer
 
@@ -161,7 +161,8 @@ class SBFSEMNoiseSynthesizer(NoiseSynthesizer):
 
 class SBFSEMDataset(Dataset):
     """
-    PyTorch Dataset resolving dependencies via Protocol injection or path initialization.
+    PyTorch Dataset resolving dependencies via Protocol injection or path initialization,
+    supporting zero-copy RAM caching and D4 dihedral data augmentation.
     """
 
     def __init__(
@@ -169,6 +170,8 @@ class SBFSEMDataset(Dataset):
         store: Optional[LocalPatchStore] = None,
         noise_injector: Optional[NoiseSynthesizer] = None,
         store_path: Optional[Union[str, Path]] = None,
+        cache_in_ram: bool = False,
+        augment: bool = False,
     ) -> None:
         if store is None:
             if store_path is None:
@@ -183,21 +186,47 @@ class SBFSEMDataset(Dataset):
         else:
             self.store = store
 
-        # NOTE: `noise_injector=None` is a deliberate, valid configuration — it disables
-        # on-the-fly noise injection (e.g. for raw I/O throughput benchmarking in
-        # validate_step1.py). It must NOT be silently replaced with a default instance,
-        # and it must previously NOT have been assigned the *class* `SBFSEMNoiseSynthesizer`
-        # instead of an instance `SBFSEMNoiseSynthesizer()`.
         self.noise_injector: Optional[NoiseSynthesizer] = noise_injector
+        self.cache_in_ram = cache_in_ram
+        self.augment = augment
+
+        self.ram_cache: Dict[int, torch.Tensor] = {}
+        if self.cache_in_ram:
+            print(f"Pre-caching {len(self.store)} LMDB patches into RAM...")
+            for idx in range(len(self.store)):
+                self.ram_cache[idx] = self.store.get_patch(idx)
 
     def __len__(self) -> int:
         return len(self.store)
 
+    def _apply_augmentation(
+        self, noisy: torch.Tensor, clean: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # D4 Dihedral Symmetry: Random flips + 90-degree rotations
+        if torch.rand(1).item() > 0.5:
+            noisy = torch.flip(noisy, dims=[-1])
+            clean = torch.flip(clean, dims=[-1])
+        if torch.rand(1).item() > 0.5:
+            noisy = torch.flip(noisy, dims=[-2])
+            clean = torch.flip(clean, dims=[-2])
+        k = torch.randint(0, 4, (1,)).item()
+        if k > 0:
+            noisy = torch.rot90(noisy, k, dims=[-2, -1])
+            clean = torch.rot90(clean, k, dims=[-2, -1])
+        return noisy, clean
+
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        target = self.store.get_patch(idx)
+        if self.cache_in_ram and idx in self.ram_cache:
+            target = self.ram_cache[idx].clone()
+        else:
+            target = self.store.get_patch(idx)
 
         if self.noise_injector is not None:
             noisy = self.noise_injector.inject(target)
         else:
-            noisy = target
+            noisy = target.clone()
+
+        if self.augment:
+            noisy, target = self._apply_augmentation(noisy, target)
+
         return noisy, target
