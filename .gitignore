@@ -16,3 +16,8 @@ wheels/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+
+# Cluster bootstrap (pixi is installed per-checkout, never committed)
+infrastructure/
+.pixi/
+logs/
