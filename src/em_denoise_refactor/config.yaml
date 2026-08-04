@@ -1,14 +1,14 @@
 # Pipeline Configuration for SBF-SEM Connectomics Denoising
 
 experiment:
-  name: "N2V_run_34"
-  output_dir: "/Users/ganctoma/SW/sort/N2V/run_34"
+  name: "N2V_run_35"
+  output_dir: "/Users/ganctoma/SW/sort/N2V/run_35"
 
 data:
   sbem_root: "/Volumes/tachyon/groups/scratch/gmicro_sem/gfriedri/_EM_acquisitions/20260201_RoLi_F1/"
   grid_num: 0
   first_sec: 1250
-  last_sec: 5000
+  last_sec: 22800
 
 splitting:
   strategy: "block"          # Options: "block" (Volumetric block + guard bands) or "mod10"
@@ -23,9 +23,9 @@ extraction:
   patches_per_tile: 2        # Maximum patches cropped per source .tif tile
   tiles_per_section: 4       # Number of tiles sampled per section in ROI
   z_depth_per_roi: 1         # Z-depth span for ROI sampling (leave 1 for 2D-denoising methods)
-  target_train_patches: 500  # Number of patches for training set
-  target_val_patches: 50     # Number of patches for validation set
-  target_test_patches: 50    # Number of patches for testing set
+  target_train_patches: 200  # Number of patches for training set
+  target_val_patches: 20     # Number of patches for validation set
+  target_test_patches: 20    # Number of patches for testing set
 
 noise:
   poisson_alpha: 20.0        # Shot noise scale

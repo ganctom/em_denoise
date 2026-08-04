@@ -1,7 +1,7 @@
 # src/em_denoise_refactor/tests/validate_step9_train_and_infer.py
 
 import sys
-from typing import Tuple
+from typing import Tuple, Optional
 
 import math
 import time
@@ -15,6 +15,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
 from em_denoise_refactor.config import PipelineConfig
+from em_denoise_refactor.data.dataset import SBFSEMNoiseSynthesizer
 from em_denoise_refactor.models.connectomics import ConnectomicsDenoisingNet
 
 
@@ -142,6 +143,118 @@ class PatchFolderDataset(Dataset):
 
 
 # -------------------------------------------------------------------------
+# PyTorch Dataset for LMDB Patch Store
+# -------------------------------------------------------------------------
+
+
+class LMDBPatchDataset(Dataset):
+    def __init__(
+        self,
+        lmdb_path: Path | str,
+        split: str = "train",
+        noise_injector: Optional[SBFSEMNoiseSynthesizer] = None,
+        cache_in_ram: bool = True,
+        augment: bool = False,
+    ):
+        import lmdb
+
+        self.lmdb_path = Path(lmdb_path)
+        self.split = split
+        self.noise_injector = noise_injector
+        self.cache_in_ram = cache_in_ram
+        self.augment = augment
+
+        if not self.lmdb_path.exists():
+            raise FileNotFoundError(f"LMDB store not found at {self.lmdb_path}")
+
+        env = lmdb.open(str(self.lmdb_path), readonly=True, lock=False)
+        self.keys = []
+        with env.begin(write=False) as txn:
+            cursor = txn.cursor()
+            prefix = f"{self.split}_".encode("utf-8")
+            for key, _ in cursor:
+                if key.startswith(prefix):
+                    self.keys.append(key)
+        env.close()
+
+        if not self.keys:
+            raise ValueError(
+                f"No patches found for split '{split}' in {self.lmdb_path}"
+            )
+
+        self.cached_samples = []
+        if self.cache_in_ram:
+            print(f"Caching {len(self.keys)} LMDB '{split}' patches into RAM...")
+            env = lmdb.open(str(self.lmdb_path), readonly=True, lock=False)
+            with env.begin(write=False) as txn:
+                for key in tqdm(self.keys, desc=f"RAM Caching ({split})"):
+                    buf = txn.get(key)
+                    arr = np.frombuffer(buf, dtype=np.uint8).reshape(512, 512)
+                    clean_tensor = torch.from_numpy(
+                        arr.astype(np.float32) / 255.0
+                    ).unsqueeze(0)
+
+                    if self.noise_injector is not None:
+                        noisy_tensor = self.noise_injector(
+                            clean_tensor.unsqueeze(0)
+                        ).squeeze(0)
+                    else:
+                        noisy_tensor = clean_tensor.clone()
+
+                    self.cached_samples.append(
+                        (noisy_tensor, clean_tensor, key.decode("utf-8"))
+                    )
+            env.close()
+
+    def __len__(self) -> int:
+        return len(self.keys)
+
+    def _apply_augmentation(
+        self, noisy: torch.Tensor, clean: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if torch.rand(1).item() > 0.5:
+            noisy = torch.flip(noisy, dims=[-1])
+            clean = torch.flip(clean, dims=[-1])
+        if torch.rand(1).item() > 0.5:
+            noisy = torch.flip(noisy, dims=[-2])
+            clean = torch.flip(clean, dims=[-2])
+        k = torch.randint(0, 4, (1,)).item()
+        if k > 0:
+            noisy = torch.rot90(noisy, k, dims=[-2, -1])
+            clean = torch.rot90(clean, k, dims=[-2, -1])
+        return noisy, clean
+
+    def __getitem__(self, idx: int):
+        if self.cache_in_ram:
+            noisy_tensor, clean_tensor, key_str = self.cached_samples[idx]
+            noisy_tensor = noisy_tensor.clone()
+            clean_tensor = clean_tensor.clone()
+        else:
+            import lmdb
+
+            key = self.keys[idx]
+            env = lmdb.open(str(self.lmdb_path), readonly=True, lock=False)
+            with env.begin(write=False) as txn:
+                buf = txn.get(key)
+                arr = np.frombuffer(buf, dtype=np.uint8).reshape(512, 512)
+            env.close()
+
+            clean_tensor = torch.from_numpy(arr.astype(np.float32) / 255.0).unsqueeze(0)
+            if self.noise_injector is not None:
+                noisy_tensor = self.noise_injector(clean_tensor.unsqueeze(0)).squeeze(0)
+            else:
+                noisy_tensor = clean_tensor.clone()
+            key_str = key.decode("utf-8")
+
+        if self.augment:
+            noisy_tensor, clean_tensor = self._apply_augmentation(
+                noisy_tensor, clean_tensor
+            )
+
+        return noisy_tensor, clean_tensor, key_str
+
+
+# -------------------------------------------------------------------------
 # Main Training & Inference Workflow
 # -------------------------------------------------------------------------
 
@@ -154,22 +267,46 @@ def main(config_path: Path | str = "config.yaml"):
     checkpoints_dir = output_dir / "checkpoints"
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
-    train_clean_dir = output_dir / "train" / "clean"
-    train_noisy_dir = output_dir / "train" / "noisy"
-    val_clean_dir = output_dir / "val" / "clean"
-    val_noisy_dir = output_dir / "val" / "noisy"
-    test_clean_dir = output_dir / "test" / "clean"
-    test_noisy_dir = output_dir / "test" / "noisy"
-    test_denoised_dir = output_dir / "test" / "denoised"
-    test_denoised_dir.mkdir(parents=True, exist_ok=True)
+    lmdb_store_path = output_dir / "patch_store.lmdb"
+
+    noise_injector = SBFSEMNoiseSynthesizer(
+        poisson_alpha=cfg.noise.poisson_alpha,
+        gaussian_sigma=cfg.noise.gaussian_sigma,
+        streak_probability=cfg.noise.streak_probability,
+    )
 
     print("\n--- 1. Initializing Datasets & Dataloaders ---")
-    train_dataset = PatchFolderDataset(
-        train_clean_dir, train_noisy_dir, cache_in_ram=True, augment=True
-    )
-    val_dataset = PatchFolderDataset(
-        val_clean_dir, val_noisy_dir, cache_in_ram=True, augment=False
-    )
+    if lmdb_store_path.exists():
+        print(f"Found LMDB Binary Store at: {lmdb_store_path}")
+        train_dataset = LMDBPatchDataset(
+            lmdb_store_path,
+            split="train",
+            noise_injector=noise_injector,
+            cache_in_ram=True,
+            augment=True,
+        )
+        val_dataset = LMDBPatchDataset(
+            lmdb_store_path,
+            split="val",
+            noise_injector=noise_injector,
+            cache_in_ram=True,
+            augment=False,
+        )
+    else:
+        print(
+            f"LMDB store not found. Falling back to .tif patch folders under: {output_dir}"
+        )
+        train_clean_dir = output_dir / "train" / "clean"
+        train_noisy_dir = output_dir / "train" / "noisy"
+        val_clean_dir = output_dir / "val" / "clean"
+        val_noisy_dir = output_dir / "val" / "noisy"
+
+        train_dataset = PatchFolderDataset(
+            train_clean_dir, train_noisy_dir, cache_in_ram=True, augment=True
+        )
+        val_dataset = PatchFolderDataset(
+            val_clean_dir, val_noisy_dir, cache_in_ram=True, augment=False
+        )
 
     train_loader = DataLoader(
         train_dataset,
@@ -380,7 +517,24 @@ def main(config_path: Path | str = "config.yaml"):
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
-    test_dataset = PatchFolderDataset(test_clean_dir, test_noisy_dir)
+    test_clean_dir = output_dir / "test" / "clean"
+    test_noisy_dir = output_dir / "test" / "noisy"
+    test_denoised_dir = output_dir / "test" / "denoised"
+    test_denoised_dir.mkdir(parents=True, exist_ok=True)
+
+    if lmdb_store_path.exists():
+        test_dataset = LMDBPatchDataset(
+            lmdb_store_path,
+            split="test",
+            noise_injector=noise_injector,
+            cache_in_ram=True,
+            augment=False,
+        )
+    else:
+        test_dataset = PatchFolderDataset(
+            test_clean_dir, test_noisy_dir, cache_in_ram=True, augment=False
+        )
+
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
 
     noisy_psnrs, denoised_psnrs = [], []
