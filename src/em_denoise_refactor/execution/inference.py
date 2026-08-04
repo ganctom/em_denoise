@@ -6,7 +6,10 @@ import itertools
 from pathlib import Path
 from typing import Dict, Any, Callable, List
 from torch.utils.data import DataLoader
-from src.em_denoise_refactor.execution.interfaces import MPSDeviceManager, ModelTrainer
+from em_denoise_refactor.execution.interfaces import MPSDeviceManager, ModelTrainer
+
+
+from tqdm import tqdm
 
 
 class DenoisingModelTrainer:
@@ -24,12 +27,21 @@ class DenoisingModelTrainer:
         self.criterion = criterion
         self.device_manager = device_manager
 
-    def train_epoch(self, dataloader: DataLoader, device: torch.device) -> float:
+    def train_epoch(
+        self, dataloader: DataLoader, device: torch.device, epoch: int = 1
+    ) -> float:
         self.model.train()
         self.model.to(device)
         total_loss = 0.0
 
-        for batch_idx, (inputs, targets) in enumerate(dataloader):
+        pbar = tqdm(
+            enumerate(dataloader),
+            total=len(dataloader),
+            desc=f"Epoch {epoch:03d} [Train]",
+            leave=False,
+        )
+
+        for batch_idx, (inputs, targets) in pbar:
             inputs, targets = inputs.to(device), targets.to(device)
 
             self.optimizer.zero_grad()
@@ -38,23 +50,32 @@ class DenoisingModelTrainer:
             loss.backward()
             self.optimizer.step()
 
-            total_loss += loss.item()
+            batch_loss = loss.item()
+            total_loss += batch_loss
 
             # Prevent cache bloat during large batch processing
             if batch_idx % 10 == 0:
                 self.device_manager.optimize_memory()
 
+            postfix = {"loss": f"{batch_loss:.5f}"}
+            if device.type == "mps":
+                allocated_mb = torch.mps.current_allocated_memory() / (1024**2)
+                postfix["mps_mem"] = f"{allocated_mb:.0f}MB"
+            pbar.set_postfix(postfix)
+
         return total_loss / len(dataloader)
 
     def validate(
-        self, dataloader: DataLoader, device: torch.device
+        self, dataloader: DataLoader, device: torch.device, epoch: int = 1
     ) -> Dict[str, float]:
         self.model.eval()
         self.model.to(device)
         val_loss = 0.0
 
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch:03d} [Val]", leave=False)
+
         with torch.no_grad():
-            for inputs, targets in dataloader:
+            for inputs, targets in pbar:
                 inputs, targets = inputs.to(device), targets.to(device)
                 outputs = self.model(inputs)
                 loss = self.criterion(outputs, targets)
@@ -64,7 +85,7 @@ class DenoisingModelTrainer:
         return {"val_loss": val_loss / len(dataloader)}
 
     def save_checkpoint(self, path: Path) -> None:
-        torch.save(self.model.state_dict(), path)
+        torch.save({k: v.cpu() for k, v in self.model.state_dict().items()}, path)
 
 
 class MPSGridSearchEngine:

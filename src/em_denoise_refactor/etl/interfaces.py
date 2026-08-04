@@ -1,5 +1,5 @@
 import numpy as np
-from typing import Protocol, List, Tuple, Dict, Iterator, runtime_checkable
+from typing import Protocol, List, Tuple, Dict, Iterator, runtime_checkable, Optional
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,21 +11,11 @@ class DatasetMetadata:
 
     Attributes:
         total_sections: Global slice count in the z-stack.
-        z_resolutions_nm: Maps section index to physical cutting thickness (nm).
-            Physical z-drift caused by microtome thermal variations alters feature
-            proportions. Downstream models (especially 3D or pseudo-3D) use this to
-            scale anisotropic spatial loss weights or kernel dilation steps.
         tiles_per_section: Maps section index to raw tile yield.
-        snr_estimates: Empirical signal-to-noise ratio per section.
-            Captures beam current degradation, detector noise, and specimen charging.
-            Used directly by the on-the-fly NoiseSynthesizer to bound synthetic noise
-            injection parameters, matching real degradation profiles during training.
     """
 
     total_sections: int
-    z_resolutions_nm: Dict[int, float]
     tiles_per_section: Dict[int, list[int]]
-    snr_estimates: Dict[int, float]
 
 
 @dataclass
@@ -43,10 +33,46 @@ class RegionOfInterest:
 
 
 @runtime_checkable
+class FileMetadataStore(Protocol):
+    """
+    Interface for querying file metadata (section_id, tile_id, filepath, split)
+    from an indexed database (e.g., SQLite).
+    """
+
+    def update_db(
+        self,
+        meta_logs_dir: Path,
+        first_sec: int,
+        last_sec: int,
+        nr_of_files: int | None,
+    ) -> None: ...
+
+    def assign_splits(
+        self,
+        strategy: str = "block",
+        block_size: int = 100,
+        train_ratio: float = 0.8,
+        val_ratio: float = 0.1,
+        guard_band_size: int = 5,
+    ) -> None: ...
+
+    def get_filepath(self, section_id: int, tile_id: int) -> str: ...
+
+    def get_dataset_metadata(
+        self,
+        split: Optional[str] = None,
+        first_sec: Optional[int] = None,
+        last_sec: Optional[int] = None,
+    ) -> DatasetMetadata: ...
+
+
+@runtime_checkable
 class RemoteStorageClient(Protocol):
     """Interface for streaming unstitched raw .tif tiles from the remote acquisition host."""
 
-    def fetch_metadata(self) -> DatasetMetadata: ...
+    def fetch_metadata(
+        self, force_rescan: bool = False, split: Optional[str] = None
+    ) -> DatasetMetadata: ...
 
     def download_tile(self, section_id: int, tile_id: str) -> np.ndarray: ...
 
