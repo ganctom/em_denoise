@@ -1,14 +1,14 @@
 # Pipeline Configuration for SBF-SEM Connectomics Denoising
 
 experiment:
-  name: "N2V_run_35"
-  output_dir: "/Users/ganctoma/SW/sort/N2V/run_35"
+  name: "N2V_run_37"
+  output_dir: "/Users/ganctoma/SW/sort/N2V/run_37"
 
 data:
   sbem_root: "/Volumes/tachyon/groups/scratch/gmicro_sem/gfriedri/_EM_acquisitions/20260201_RoLi_F1/"
   grid_num: 0
   first_sec: 1250
-  last_sec: 22800
+  last_sec: 10000
 
 splitting:
   strategy: "block"          # Options: "block" (Volumetric block + guard bands) or "mod10"
@@ -28,8 +28,8 @@ extraction:
   target_test_patches: 20    # Number of patches for testing set
 
 noise:
-  poisson_alpha: 20.0        # Shot noise scale
-  gaussian_sigma: 0.05       # Sensor read noise sigma
+  poisson_alpha: 40.0        # Shot noise scale
+  gaussian_sigma: 0.1       # Sensor read noise sigma
   streak_probability: 0.15   # Beam charging raster anomaly probability
 
 training:

@@ -92,7 +92,8 @@ class PipelineConfig:
 
     @classmethod
     def from_yaml(cls, yaml_path: Path | str = "config.yaml") -> "PipelineConfig":
-        path = Path(yaml_path)
+        path_str = str(yaml_path).lstrip("=")
+        path = Path(path_str)
         if not path.exists():
             candidates = [
                 Path("src/em_denoise_refactor/config.yaml"),
@@ -107,7 +108,10 @@ class PipelineConfig:
                     f"Configuration file not found at {path.resolve()}"
                 )
 
-        with open(path, "r", encoding="utf-8") as f:
+        resolved_path = path.resolve()
+        with open(resolved_path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
 
-        return cls.from_dict(data or {})
+        config = cls.from_dict(data or {})
+        config._loaded_from = resolved_path
+        return config
