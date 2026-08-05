@@ -189,7 +189,8 @@ class LMDBPatchDataset(Dataset):
             with env.begin(write=False) as txn:
                 for key in tqdm(self.keys, desc=f"RAM Caching ({split})"):
                     buf = txn.get(key)
-                    arr = np.frombuffer(buf, dtype=np.uint8).reshape(512, 512)
+                    side_len = int(np.sqrt(len(buf)))
+                    arr = np.frombuffer(buf, dtype=np.uint8).reshape(side_len, side_len)
                     clean_tensor = torch.from_numpy(
                         arr.astype(np.float32) / 255.0
                     ).unsqueeze(0)
@@ -236,7 +237,8 @@ class LMDBPatchDataset(Dataset):
             env = lmdb.open(str(self.lmdb_path), readonly=True, lock=False)
             with env.begin(write=False) as txn:
                 buf = txn.get(key)
-                arr = np.frombuffer(buf, dtype=np.uint8).reshape(512, 512)
+                side_len = int(np.sqrt(len(buf)))
+                arr = np.frombuffer(buf, dtype=np.uint8).reshape(side_len, side_len)
             env.close()
 
             clean_tensor = torch.from_numpy(arr.astype(np.float32) / 255.0).unsqueeze(0)
@@ -270,8 +272,9 @@ def main(config_path: Path | str = "config.yaml"):
     lmdb_store_path = output_dir / "patch_store.lmdb"
 
     noise_injector = SBFSEMNoiseSynthesizer(
-        poisson_alpha=cfg.noise.poisson_alpha,
-        gaussian_sigma=cfg.noise.gaussian_sigma,
+        photon_scale=cfg.noise.photon_scale,
+        read_std=cfg.noise.read_std,
+        gain_variance=cfg.noise.gain_variance,
         streak_probability=cfg.noise.streak_probability,
     )
 

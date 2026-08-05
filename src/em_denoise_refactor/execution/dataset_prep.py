@@ -109,8 +109,9 @@ class DatasetPreparer:
         )
 
         noise_injector = SBFSEMNoiseSynthesizer(
-            poisson_alpha=self.cfg.noise.poisson_alpha,
-            gaussian_sigma=self.cfg.noise.gaussian_sigma,
+            photon_scale=self.cfg.noise.photon_scale,
+            read_std=self.cfg.noise.read_std,
+            gain_variance=self.cfg.noise.gain_variance,
             streak_probability=self.cfg.noise.streak_probability,
         )
 
@@ -266,7 +267,7 @@ def parse_args() -> argparse.Namespace:
         "-c",
         "--config",
         type=str,
-        default="src/em_denoise_refactor/config.yaml",
+        default="../config.yaml",
         help="Path to pipeline configuration YAML file (default: src/em_denoise_refactor/config.yaml).",
     )
     parser.add_argument(

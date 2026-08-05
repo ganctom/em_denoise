@@ -78,10 +78,11 @@ class LMDBPatchStore:
 
         # Zero-copy uint8 view directly from memory-mapped buffer
         arr = np.frombuffer(buf, dtype=np.uint8)
+        side_len = int(np.sqrt(len(arr)))
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
-            return torch.from_numpy(arr).view(1, 512, 512)
+            return torch.from_numpy(arr).view(1, side_len, side_len)
 
     def close(self) -> None:
         """Safely aborts active transactions and closes the LMDB environment handle."""
@@ -112,47 +113,79 @@ class LMDBPatchStore:
 class SBFSEMNoiseSynthesizer(NoiseSynthesizer):
     """
     Vectorized procedural degradation generator simulating SBF-SEM acquisition physics.
-    Strictly implements the NoiseSynthesizer protocol.
+
+    Noise model ported from add_em_noise (em_denoise), adapted for online PyTorch
+    synthesis. All Poisson and readout noise operations are performed in uint8-equivalent
+    scale [0, 255] for physically correct shot-noise statistics, then normalized back
+    to [0, 1] for network consumption.
+
+    Parameters
+    ----------
+    photon_scale : float
+        Simulated photon count per unit pixel intensity.  Lower values produce
+        stronger shot noise.  Equivalent to add_em_noise's ``photon_scale``.
+        Typical range: 0.02 – 0.10.
+    read_std : float
+        Additive Gaussian read-out noise standard deviation in uint8 [0, 255] space.
+        Equivalent to add_em_noise's ``read_std``.
+    gain_variance : float
+        Standard deviation of the per-pixel detector gain map (mean = 1.0).
+        Models fixed-pattern sensitivity variation across the detector.
+    streak_probability : float
+        Per-image probability of injecting horizontal raster charging streaks.
     """
 
     def __init__(
         self,
-        poisson_alpha: float = 20.0,
-        gaussian_sigma: float = 0.05,
+        photon_scale: float = 0.04,
+        read_std: float = 8.0,
+        gain_variance: float = 0.02,
         streak_probability: float = 0.15,
     ) -> None:
-        self.alpha = poisson_alpha
-        self.sigma = gaussian_sigma
+        self.photon_scale = photon_scale
+        self.read_std = read_std
+        self.gain_variance = gain_variance
         self.streak_p = streak_probability
 
     def inject(self, clean_tensor: Tensor) -> Tensor:
-        # 1. Shot noise (Poisson process)
-        # Allocate once out-of-place to maintain immutability of the input tensor
-        noisy = torch.poisson(clean_tensor * self.alpha)
+        # Lift to uint8-equivalent scale for correct Poisson statistics.
+        # In 8-bit EM images, pixel intensity directly encodes photon counts
+        # (after gain and ADC), so working in [0, 255] gives σ_shot ∝ √photons.
+        img_255 = clean_tensor * 255.0
 
-        # In-place division to avoid allocating a new tensor
-        noisy.div_(self.alpha)
+        # 1. Shot noise (Poisson process in photon space)
+        # λ = pixel_value * photon_scale  →  lower photon_scale = higher relative noise
+        photons = torch.clamp(img_255 * self.photon_scale, min=1e-5)
+        noisy = torch.poisson(photons) / self.photon_scale
 
-        # 2. Gaussian sensor noise
-        # add_ computes the scaled random tensor and accumulates in-place
-        noisy.add_(torch.randn_like(noisy), alpha=self.sigma)
+        # 2. Per-pixel detector gain variation (fixed-pattern noise)
+        # Models pixel-to-pixel sensitivity variation of the BSE detector.
+        if self.gain_variance > 0:
+            gain = torch.normal(
+                mean=torch.ones_like(noisy),
+                std=torch.full_like(noisy, self.gain_variance),
+            )
+            noisy = noisy * gain
 
-        # 3. Vectorized raster anomalies (charging/streaks)
+        # 3. Additive Gaussian read-out noise (in uint8 scale)
+        noisy = noisy + torch.randn_like(noisy) * self.read_std
+
+        # 4. Vectorized raster streak anomalies (beam charging / curtaining)
         if torch.rand(1).item() < self.streak_p:
             h = clean_tensor.shape[-2]
             w = clean_tensor.shape[-1]
-            num_streaks = torch.randint(1, 4, (1,)).item()
+            num_streaks = int(torch.randint(1, 4, (1,)).item())
 
-            # Vectorized index and intensity generation on the target device
             row_indices = torch.randint(0, h, (num_streaks,), device=noisy.device)
-            intensities = torch.randn(num_streaks, 1, device=noisy.device) * 0.3
-
-            # Broadcast intensities across the width dimension and add in-place
-            # Note: rare index collisions will apply only the last computed intensity
+            # Streak intensity in uint8 scale: 0.3 * 255 ≈ 76 → same perceptual magnitude
+            # as the original 0.3 std in [0, 1] space.
+            intensities = torch.randn(num_streaks, 1, device=noisy.device) * (
+                0.3 * 255.0
+            )
             noisy[..., row_indices, :] += intensities.expand(-1, w)
 
-        # In-place clamp
-        return noisy.clamp_(0.0, 1.0)
+        # Normalize back to [0, 1] and clamp to valid range
+        return (noisy / 255.0).clamp_(0.0, 1.0)
 
     def __call__(self, clean_tensor: Tensor) -> Tensor:
         """Forwarding interface to satisfy Callable semantics."""

@@ -79,8 +79,9 @@ def main(config_path: Path | str = "config.yaml"):
     )
 
     noise_injector = SBFSEMNoiseSynthesizer(
-        poisson_alpha=cfg.noise.poisson_alpha,
-        gaussian_sigma=cfg.noise.gaussian_sigma,
+        photon_scale=cfg.noise.photon_scale,
+        read_std=cfg.noise.read_std,
+        gain_variance=cfg.noise.gain_variance,
         streak_probability=cfg.noise.streak_probability,
     )
 

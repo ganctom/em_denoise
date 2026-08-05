@@ -26,6 +26,7 @@ from tqdm import tqdm
 from em_denoise_refactor.config import PipelineConfig
 from em_denoise_refactor.data.dataset import SBFSEMNoiseSynthesizer
 from em_denoise_refactor.models.connectomics import ConnectomicsDenoisingNet
+from em_denoise_refactor.models.loss import CompositeDenoisingLoss
 
 logger = logging.getLogger("train_and_infer")
 
@@ -159,6 +160,58 @@ class PatchFolderDataset(Dataset):
         return noisy_tensor, clean_tensor, fname
 
 
+class CustomTIFFDataset(Dataset):
+    """Dataset for running inference on arbitrary .tif / .tiff images from a custom folder."""
+
+    def __init__(
+        self,
+        image_dir: Path | str,
+        cache_in_ram: bool = True,
+    ) -> None:
+        self.image_dir = Path(image_dir)
+        if not self.image_dir.exists():
+            raise FileNotFoundError(
+                f"Custom image directory not found: {self.image_dir}"
+            )
+
+        self.filenames = sorted(
+            [f.name for f in self.image_dir.glob("*.tif")]
+            + [f.name for f in self.image_dir.glob("*.tiff")]
+        )
+        if not self.filenames:
+            raise FileNotFoundError(
+                f"No .tif or .tiff images found in custom directory: {self.image_dir}"
+            )
+
+        self.cache_in_ram = cache_in_ram
+        self.cached_samples: List[Tuple[torch.Tensor, str]] = []
+        if self.cache_in_ram:
+            logger.info(
+                f"Caching {len(self.filenames)} custom TIFF images from {self.image_dir.name} into RAM..."
+            )
+            for fname in tqdm(self.filenames, desc="RAM Caching (custom)"):
+                img_path = self.image_dir / fname
+                img = tifffile.imread(str(img_path)).astype(np.float32) / 255.0
+                tensor = torch.from_numpy(img).unsqueeze(0)
+                self.cached_samples.append((tensor, fname))
+
+    def __len__(self) -> int:
+        return len(self.filenames)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, str]:
+        if self.cache_in_ram:
+            img_tensor, fname = self.cached_samples[idx]
+            img_tensor = img_tensor.clone()
+        else:
+            fname = self.filenames[idx]
+            img = (
+                tifffile.imread(str(self.image_dir / fname)).astype(np.float32) / 255.0
+            )
+            img_tensor = torch.from_numpy(img).unsqueeze(0)
+
+        return img_tensor, img_tensor, fname
+
+
 class LMDBPatchDataset(Dataset):
     """Dataset reading memory-mapped clean patches from LMDB store with on-the-fly noise synthesis."""
 
@@ -212,7 +265,8 @@ class LMDBPatchDataset(Dataset):
             with env.begin(write=False) as txn:
                 for key in tqdm(self.keys, desc=f"RAM Caching ({split})"):
                     buf = txn.get(key)
-                    arr = np.frombuffer(buf, dtype=np.uint8).reshape(512, 512)
+                    side_len = int(np.sqrt(len(buf)))
+                    arr = np.frombuffer(buf, dtype=np.uint8).reshape(side_len, side_len)
                     clean_tensor = torch.from_numpy(
                         arr.astype(np.float32) / 255.0
                     ).unsqueeze(0)
@@ -259,7 +313,8 @@ class LMDBPatchDataset(Dataset):
             env = lmdb.open(str(self.lmdb_path), readonly=True, lock=False)
             with env.begin(write=False) as txn:
                 buf = txn.get(key)
-                arr = np.frombuffer(buf, dtype=np.uint8).reshape(512, 512)
+                side_len = int(np.sqrt(len(buf)))
+                arr = np.frombuffer(buf, dtype=np.uint8).reshape(side_len, side_len)
             env.close()
 
             clean_tensor = torch.from_numpy(arr.astype(np.float32) / 255.0).unsqueeze(0)
@@ -322,9 +377,10 @@ class DenoisingTrainer:
 
     def train_epoch(
         self, dataloader: DataLoader, epoch: int, total_epochs: int
-    ) -> float:
+    ) -> Tuple[float, float]:
         self.model.train()
         total_loss = 0.0
+        total_edge_loss = 0.0
 
         pbar = tqdm(
             enumerate(dataloader),
@@ -340,27 +396,36 @@ class DenoisingTrainer:
             if self.use_amp:
                 with torch.autocast(device_type="cuda", dtype=torch.float16):
                     pred_b = self.model(noisy_b)
-                    loss = self.criterion(pred_b, clean_b)
+                    loss_out = self.criterion(pred_b, clean_b)
             else:
                 pred_b = self.model(noisy_b)
-                loss = self.criterion(pred_b, clean_b)
+                loss_out = self.criterion(pred_b, clean_b)
+
+            if isinstance(loss_out, tuple):
+                loss, metrics = loss_out
+            else:
+                loss = loss_out
+                metrics = {"loss_total": loss.item()}
 
             loss.backward()
             self.optimizer.step()
 
             batch_loss = loss.item()
+            batch_edge = metrics.get("loss_edge", 0.0)
+
             total_loss += batch_loss * noisy_b.size(0)
+            total_edge_loss += batch_edge * noisy_b.size(0)
 
             if batch_idx % 10 == 0:
                 self._purge_memory()
 
             postfix = {"loss": f"{batch_loss:.5f}"}
-            if self.device.type == "mps":
-                allocated_mb = torch.mps.current_allocated_memory() / (1024**2)
-                postfix["mps_mem"] = f"{allocated_mb:.0f}MB"
+            if batch_edge > 0:
+                postfix["edge"] = f"{batch_edge:.4f}"
             pbar.set_postfix(postfix)
 
-        return total_loss / len(dataloader.dataset)
+        num_samples = len(dataloader.dataset)
+        return total_loss / num_samples, total_edge_loss / num_samples
 
     def validate(
         self, dataloader: DataLoader, epoch: int, total_epochs: int
@@ -381,10 +446,15 @@ class DenoisingTrainer:
                 if self.use_amp:
                     with torch.autocast(device_type="cuda", dtype=torch.float16):
                         pred_b = self.model(noisy_b)
-                        loss = self.criterion(pred_b, clean_b)
+                        loss_out = self.criterion(pred_b, clean_b)
                 else:
                     pred_b = self.model(noisy_b)
-                    loss = self.criterion(pred_b, clean_b)
+                    loss_out = self.criterion(pred_b, clean_b)
+
+                if isinstance(loss_out, tuple):
+                    loss = loss_out[0]
+                else:
+                    loss = loss_out
 
                 total_val_loss += loss.item() * noisy_b.size(0)
                 pred_clamp = torch.clamp(pred_b, 0.0, 1.0)
@@ -574,6 +644,20 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Path to specific checkpoint file for evaluation (default: checkpoint_best.pt in checkpoints_dir).",
     )
+    parser.add_argument(
+        "-i",
+        "--input-dir",
+        type=str,
+        default=None,
+        help="Path to custom directory of .tif images to run inference on.",
+    )
+    parser.add_argument(
+        "-n",
+        "--name",
+        type=str,
+        default=None,
+        help="Override experiment run name (results subdirectory inside output_dir).",
+    )
     return parser.parse_args()
 
 
@@ -594,6 +678,12 @@ def main() -> None:
     output_dir = (
         Path(args.output_dir) if args.output_dir else Path(cfg.experiment.output_dir)
     )
+    exp_name = (
+        args.name
+        if args.name is not None
+        else (cfg.experiment.name if cfg.experiment and cfg.experiment.name else None)
+    )
+
     epochs = args.epochs if args.epochs is not None else cfg.training.epochs
     batch_size = (
         args.batch_size if args.batch_size is not None else cfg.training.batch_size
@@ -601,60 +691,65 @@ def main() -> None:
     learning_rate = args.lr if args.lr is not None else cfg.training.learning_rate
     device_str = args.device if args.device is not None else cfg.training.device
 
-    checkpoints_dir = output_dir / "checkpoints"
+    run_dir = output_dir / exp_name if exp_name else output_dir
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    checkpoints_dir = run_dir / "checkpoints"
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
     lmdb_store_path = output_dir / "patch_store.lmdb"
     noise_injector = SBFSEMNoiseSynthesizer(
-        poisson_alpha=cfg.noise.poisson_alpha,
-        gaussian_sigma=cfg.noise.gaussian_sigma,
+        photon_scale=cfg.noise.photon_scale,
+        read_std=cfg.noise.read_std,
+        gain_variance=cfg.noise.gain_variance,
         streak_probability=cfg.noise.streak_probability,
     )
 
-    logger.info("Initializing Train & Validation Datasets...")
-    if lmdb_store_path.exists():
-        logger.info(f"Found LMDB store at: {lmdb_store_path}")
-        train_dataset = LMDBPatchDataset(
-            lmdb_store_path,
-            split="train",
-            noise_injector=noise_injector,
-            cache_in_ram=True,
-            augment=True,
+    if not args.eval_only:
+        logger.info("Initializing Train & Validation Datasets...")
+        if lmdb_store_path.exists():
+            logger.info(f"Found LMDB store at: {lmdb_store_path}")
+            train_dataset = LMDBPatchDataset(
+                lmdb_store_path,
+                split="train",
+                noise_injector=noise_injector,
+                cache_in_ram=True,
+                augment=True,
+            )
+            val_dataset = LMDBPatchDataset(
+                lmdb_store_path,
+                split="val",
+                noise_injector=noise_injector,
+                cache_in_ram=True,
+                augment=False,
+            )
+        else:
+            logger.info(
+                f"LMDB store not found. Reading TIFF patch directories under: {output_dir}"
+            )
+            train_dataset = PatchFolderDataset(
+                output_dir / "train" / "clean",
+                output_dir / "train" / "noisy",
+                cache_in_ram=True,
+                augment=True,
+            )
+            val_dataset = PatchFolderDataset(
+                output_dir / "val" / "clean",
+                output_dir / "val" / "noisy",
+                cache_in_ram=True,
+                augment=False,
+            )
+
+        train_loader = DataLoader(
+            train_dataset, batch_size=min(batch_size, len(train_dataset)), shuffle=True
         )
-        val_dataset = LMDBPatchDataset(
-            lmdb_store_path,
-            split="val",
-            noise_injector=noise_injector,
-            cache_in_ram=True,
-            augment=False,
+        val_loader = DataLoader(
+            val_dataset, batch_size=min(batch_size, len(val_dataset)), shuffle=False
         )
-    else:
+
         logger.info(
-            f"LMDB store not found. Reading TIFF patch directories under: {output_dir}"
+            f"Dataset Size: {len(train_dataset)} Train patches | {len(val_dataset)} Val patches"
         )
-        train_dataset = PatchFolderDataset(
-            output_dir / "train" / "clean",
-            output_dir / "train" / "noisy",
-            cache_in_ram=True,
-            augment=True,
-        )
-        val_dataset = PatchFolderDataset(
-            output_dir / "val" / "clean",
-            output_dir / "val" / "noisy",
-            cache_in_ram=True,
-            augment=False,
-        )
-
-    train_loader = DataLoader(
-        train_dataset, batch_size=min(batch_size, len(train_dataset)), shuffle=True
-    )
-    val_loader = DataLoader(
-        val_dataset, batch_size=min(batch_size, len(val_dataset)), shuffle=False
-    )
-
-    logger.info(
-        f"Dataset Size: {len(train_dataset)} Train patches | {len(val_dataset)} Val patches"
-    )
 
     if device_str == "mps" and torch.backends.mps.is_available():
         device = torch.device("mps")
@@ -670,9 +765,13 @@ def main() -> None:
         device
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-    criterion = nn.MSELoss()
+    criterion = CompositeDenoisingLoss(
+        mse_weight=cfg.loss.mse_weight if cfg.loss else 1.0,
+        edge_weight=cfg.loss.edge_weight if cfg.loss else 0.2,
+        ssim_weight=cfg.loss.ssim_weight if cfg.loss else 0.1,
+    ).to(device)
 
-    log_dir = output_dir / "logs"
+    log_dir = run_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     writer = None
     try:
@@ -705,7 +804,9 @@ def main() -> None:
         best_val_loss = float("inf")
 
         for epoch in range(1, epochs + 1):
-            train_loss = trainer.train_epoch(train_loader, epoch, epochs)
+            train_loss, train_edge_loss = trainer.train_epoch(
+                train_loader, epoch, epochs
+            )
             val_loss, val_psnr, val_ssim = trainer.validate(val_loader, epoch, epochs)
 
             is_best = val_loss < best_val_loss
@@ -720,20 +821,16 @@ def main() -> None:
 
             if writer is not None:
                 writer.add_scalar("Loss/Train", train_loss, epoch)
+                writer.add_scalar("Loss/Train_Edge", train_edge_loss, epoch)
                 writer.add_scalar("Loss/Validation", val_loss, epoch)
                 writer.add_scalar("Metrics/Val_PSNR", val_psnr, epoch)
                 writer.add_scalar("Metrics/Val_SSIM", val_ssim, epoch)
 
-            best_str = " [BEST MODEL SAVED]" if is_best else ""
-            mem_str = (
-                f" | MPS Mem: {torch.mps.current_allocated_memory() / (1024**2):.0f}MB"
-                if device.type == "mps"
-                else ""
-            )
+            best_str = " [BEST]" if is_best else ""
             logger.info(
-                f"Ep [{epoch:02d}/{epochs:02d}] | Train Loss: {train_loss:.6f} | "
-                f"Val Loss: {val_loss:.6f} | Val PSNR: {val_psnr:.2f} dB | "
-                f"Val SSIM: {val_ssim:.4f}{mem_str}{best_str}"
+                f"Ep [{epoch:02d}/{epochs:02d}] | Tr: {train_loss:.5f} | "
+                f"Val: {val_loss:.5f} | Edge: {train_edge_loss:.4f} | "
+                f"PSNR: {val_psnr:.2f}dB | SSIM: {val_ssim:.4f}{best_str}"
             )
 
         logger.info(
@@ -751,17 +848,34 @@ def main() -> None:
     checkpoint = torch.load(best_checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
 
-    test_denoised_dir = output_dir / "test" / "denoised"
+    custom_input_dir = (
+        Path(args.input_dir)
+        if args.input_dir
+        else (
+            cfg.inference.custom_input_dir
+            if cfg.inference and cfg.inference.custom_input_dir
+            else None
+        )
+    )
+
     test_clean_dir = output_dir / "test" / "clean"
     test_noisy_dir = output_dir / "test" / "noisy"
 
-    if test_clean_dir.exists() and len(list(test_clean_dir.glob("*.tif"))) > 0:
+    if custom_input_dir is not None:
+        logger.info(
+            f"Loading custom inference images from directory: {custom_input_dir}"
+        )
+        test_dataset = CustomTIFFDataset(custom_input_dir, cache_in_ram=True)
+        test_denoised_dir = run_dir / "custom_inference" / "denoised"
+    elif test_clean_dir.exists() and len(list(test_clean_dir.glob("*.tif"))) > 0:
         logger.info(f"Loading test set from TIFF directory: {test_clean_dir}")
+        test_denoised_dir = run_dir / "test" / "denoised"
         test_dataset = PatchFolderDataset(
             test_clean_dir, test_noisy_dir, cache_in_ram=True, augment=False
         )
     elif lmdb_store_path.exists():
         logger.info(f"Loading test set from LMDB store: {lmdb_store_path}")
+        test_denoised_dir = run_dir / "test" / "denoised"
         test_dataset = LMDBPatchDataset(
             lmdb_store_path,
             split="test",

@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import yaml
 
 
@@ -55,8 +55,11 @@ class ExtractionSettingsConfig:
 
 @dataclass
 class NoiseConfig:
-    poisson_alpha: float = 20.0
-    gaussian_sigma: float = 0.05
+    photon_scale: float = 0.04  # Simulated photon count scale (lower = more shot noise)
+    read_std: float = 8.0  # Detector readout noise std in uint8 [0, 255] space
+    gain_variance: float = (
+        0.02  # Per-pixel detector gain variation (fixed-pattern noise)
+    )
     streak_probability: float = 0.15
 
 
@@ -69,6 +72,24 @@ class TrainingConfig:
 
 
 @dataclass
+class InferenceConfig:
+    custom_input_dir: Optional[Path] = None
+
+    def __post_init__(self):
+        if self.custom_input_dir is not None and self.custom_input_dir != "":
+            self.custom_input_dir = Path(self.custom_input_dir)
+        else:
+            self.custom_input_dir = None
+
+
+@dataclass
+class LossConfig:
+    mse_weight: float = 1.0
+    edge_weight: float = 0.2
+    ssim_weight: float = 0.1
+
+
+@dataclass
 class PipelineConfig:
     experiment: ExperimentConfig = field(default_factory=ExperimentConfig)
     data: DataConfig = field(default_factory=DataConfig)
@@ -78,6 +99,8 @@ class PipelineConfig:
     )
     noise: NoiseConfig = field(default_factory=NoiseConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
+    loss: LossConfig = field(default_factory=LossConfig)
+    inference: InferenceConfig = field(default_factory=InferenceConfig)
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "PipelineConfig":
@@ -88,6 +111,8 @@ class PipelineConfig:
             extraction=ExtractionSettingsConfig(**d.get("extraction", {})),
             noise=NoiseConfig(**d.get("noise", {})),
             training=TrainingConfig(**d.get("training", {})),
+            loss=LossConfig(**d.get("loss", {})),
+            inference=InferenceConfig(**d.get("inference", {})),
         )
 
     @classmethod
