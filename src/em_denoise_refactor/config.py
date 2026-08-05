@@ -55,12 +55,15 @@ class ExtractionSettingsConfig:
 
 @dataclass
 class NoiseConfig:
-    photon_scale: float = 0.04  # Simulated photon count scale (lower = more shot noise)
-    read_std: float = 8.0  # Detector readout noise std in uint8 [0, 255] space
-    gain_variance: float = (
-        0.02  # Per-pixel detector gain variation (fixed-pattern noise)
+    synthesizer_type: str = "parametric"  # "parametric" or "empirical"
+    empirical_model_path: str = "noise_model.npy"
+    calibrate_on_the_fly: bool = False
+    photon_scale: float | list[float] = field(default_factory=lambda: [0.02, 0.08])
+    read_std: float | list[float] = field(default_factory=lambda: [5.0, 15.0])
+    gain_variance: float | list[float] = field(default_factory=lambda: [0.01, 0.05])
+    streak_probability: float | list[float] = field(
+        default_factory=lambda: [0.05, 0.20]
     )
-    streak_probability: float = 0.15
 
 
 @dataclass

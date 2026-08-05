@@ -25,7 +25,11 @@ from em_denoise_refactor.etl.lmdb_store import (
     VarianceAwareROISampler,
     LMDBStoreWriter,
 )
-from em_denoise_refactor.data.dataset import SBFSEMNoiseSynthesizer
+from em_denoise_refactor.data.dataset import (
+    SBFSEMNoiseSynthesizer,
+    EmpiricalNoiseSynthesizer,
+)
+from em_denoise_refactor.execution.calibration import run_calibration
 
 logger = logging.getLogger("dataset_prep")
 
@@ -108,12 +112,30 @@ class DatasetPreparer:
             tiles_per_section=self.cfg.extraction.tiles_per_section,
         )
 
-        noise_injector = SBFSEMNoiseSynthesizer(
-            photon_scale=self.cfg.noise.photon_scale,
-            read_std=self.cfg.noise.read_std,
-            gain_variance=self.cfg.noise.gain_variance,
-            streak_probability=self.cfg.noise.streak_probability,
-        )
+        if getattr(self.cfg.noise, "synthesizer_type", "parametric") == "empirical":
+            model_path = Path(
+                getattr(self.cfg.noise, "empirical_model_path", "noise_model.npy")
+            )
+            if not model_path.is_absolute():
+                model_path = self.cfg.experiment.output_dir / model_path
+
+            if (
+                getattr(self.cfg.noise, "calibrate_on_the_fly", False)
+                and not model_path.exists()
+            ):
+                logger.info(
+                    "Empirical noise model not found. Running calibration on-the-fly..."
+                )
+                run_calibration(self.cfg)
+
+            noise_injector = EmpiricalNoiseSynthesizer(model_path=model_path)
+        else:
+            noise_injector = SBFSEMNoiseSynthesizer(
+                photon_scale=self.cfg.noise.photon_scale,
+                read_std=self.cfg.noise.read_std,
+                gain_variance=self.cfg.noise.gain_variance,
+                streak_probability=self.cfg.noise.streak_probability,
+            )
 
         lmdb_path = self.base_output_dir / "patch_store.lmdb"
         lmdb_writer = LMDBStoreWriter(map_size=100 * 1024 * 1024 * 1024)

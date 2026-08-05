@@ -24,7 +24,11 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from em_denoise_refactor.config import PipelineConfig
-from em_denoise_refactor.data.dataset import SBFSEMNoiseSynthesizer
+from em_denoise_refactor.data.dataset import (
+    SBFSEMNoiseSynthesizer,
+    EmpiricalNoiseSynthesizer,
+)
+from em_denoise_refactor.execution.calibration import run_calibration
 from em_denoise_refactor.models.connectomics import ConnectomicsDenoisingNet
 from em_denoise_refactor.models.loss import CompositeDenoisingLoss
 
@@ -698,12 +702,28 @@ def main() -> None:
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
     lmdb_store_path = output_dir / "patch_store.lmdb"
-    noise_injector = SBFSEMNoiseSynthesizer(
-        photon_scale=cfg.noise.photon_scale,
-        read_std=cfg.noise.read_std,
-        gain_variance=cfg.noise.gain_variance,
-        streak_probability=cfg.noise.streak_probability,
-    )
+    if getattr(cfg.noise, "synthesizer_type", "parametric") == "empirical":
+        model_path = Path(getattr(cfg.noise, "empirical_model_path", "noise_model.npy"))
+        if not model_path.is_absolute():
+            model_path = output_dir / model_path
+
+        if (
+            getattr(cfg.noise, "calibrate_on_the_fly", False)
+            and not model_path.exists()
+        ):
+            logger.info(
+                "Empirical noise model not found. Running calibration on-the-fly..."
+            )
+            run_calibration(cfg)
+
+        noise_injector = EmpiricalNoiseSynthesizer(model_path=model_path)
+    else:
+        noise_injector = SBFSEMNoiseSynthesizer(
+            photon_scale=cfg.noise.photon_scale,
+            read_std=cfg.noise.read_std,
+            gain_variance=cfg.noise.gain_variance,
+            streak_probability=cfg.noise.streak_probability,
+        )
 
     if not args.eval_only:
         logger.info("Initializing Train & Validation Datasets...")

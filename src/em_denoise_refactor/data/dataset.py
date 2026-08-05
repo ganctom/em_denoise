@@ -7,7 +7,7 @@ import torch
 from torch.utils.data import Dataset
 from torch import Tensor
 from pathlib import Path
-from typing import Tuple, Optional, Union, Dict
+from typing import Tuple, Optional, Union, Dict, List
 
 from em_denoise_refactor.data.interfaces import LocalPatchStore, NoiseSynthesizer
 
@@ -137,48 +137,72 @@ class SBFSEMNoiseSynthesizer(NoiseSynthesizer):
 
     def __init__(
         self,
-        photon_scale: float = 0.04,
-        read_std: float = 8.0,
-        gain_variance: float = 0.02,
-        streak_probability: float = 0.15,
+        photon_scale: Union[float, Tuple[float, float], List[float]] = 0.04,
+        read_std: Union[float, Tuple[float, float], List[float]] = 8.0,
+        gain_variance: Union[float, Tuple[float, float], List[float]] = 0.02,
+        streak_probability: Union[float, Tuple[float, float], List[float]] = 0.15,
     ) -> None:
         self.photon_scale = photon_scale
         self.read_std = read_std
         self.gain_variance = gain_variance
         self.streak_p = streak_probability
 
+    def _sample_param(
+        self,
+        param: Union[float, Tuple[float, float], List[float]],
+        clean_tensor: Tensor,
+    ) -> Union[float, Tensor]:
+        if isinstance(param, (list, tuple)):
+            # Support batched inputs [B, C, H, W] or unbatched [C, H, W]
+            shape = (
+                (clean_tensor.shape[0], 1, 1, 1)
+                if clean_tensor.ndim == 4
+                else (1, 1, 1)
+            )
+            return torch.empty(shape, device=clean_tensor.device).uniform_(
+                param[0], param[1]
+            )
+        return float(param)
+
+    def _sample_prob(
+        self, param: Union[float, Tuple[float, float], List[float]]
+    ) -> float:
+        if isinstance(param, (list, tuple)):
+            return torch.empty(1).uniform_(param[0], param[1]).item()
+        return float(param)
+
     def inject(self, clean_tensor: Tensor) -> Tensor:
         # Lift to uint8-equivalent scale for correct Poisson statistics.
-        # In 8-bit EM images, pixel intensity directly encodes photon counts
-        # (after gain and ADC), so working in [0, 255] gives σ_shot ∝ √photons.
         img_255 = clean_tensor * 255.0
 
+        # Sample randomized parameters for this patch/batch
+        photon_scale = self._sample_param(self.photon_scale, clean_tensor)
+        read_std = self._sample_param(self.read_std, clean_tensor)
+        gain_variance = self._sample_param(self.gain_variance, clean_tensor)
+        streak_p = self._sample_prob(self.streak_p)
+
         # 1. Shot noise (Poisson process in photon space)
-        # λ = pixel_value * photon_scale  →  lower photon_scale = higher relative noise
-        photons = torch.clamp(img_255 * self.photon_scale, min=1e-5)
-        noisy = torch.poisson(photons) / self.photon_scale
+        photons = torch.clamp(img_255 * photon_scale, min=1e-5)
+        noisy = torch.poisson(photons) / photon_scale
 
         # 2. Per-pixel detector gain variation (fixed-pattern noise)
-        # Models pixel-to-pixel sensitivity variation of the BSE detector.
-        if self.gain_variance > 0:
-            gain = torch.normal(
-                mean=torch.ones_like(noisy),
-                std=torch.full_like(noisy, self.gain_variance),
-            )
-            noisy = noisy * gain
+        if isinstance(gain_variance, Tensor) or gain_variance > 0:
+            # We can't just check > 0 easily if it's a tensor, so we broadcast
+            if isinstance(gain_variance, float) and gain_variance <= 0:
+                pass
+            else:
+                # torch.normal doesn't broadcast well with tensor std, so we do it manually:
+                gain = 1.0 + torch.randn_like(noisy) * gain_variance
+                noisy = noisy * gain
 
         # 3. Additive Gaussian read-out noise (in uint8 scale)
-        noisy = noisy + torch.randn_like(noisy) * self.read_std
+        noisy = noisy + torch.randn_like(noisy) * read_std
 
-        # 4. Vectorized raster streak anomalies (beam charging / curtaining)
-        if torch.rand(1).item() < self.streak_p:
-            h = clean_tensor.shape[-2]
-            w = clean_tensor.shape[-1]
+        # 4. Vectorized raster streak anomalies
+        if torch.rand(1).item() < streak_p:
+            h, w = clean_tensor.shape[-2:]
             num_streaks = int(torch.randint(1, 4, (1,)).item())
-
             row_indices = torch.randint(0, h, (num_streaks,), device=noisy.device)
-            # Streak intensity in uint8 scale: 0.3 * 255 ≈ 76 → same perceptual magnitude
-            # as the original 0.3 std in [0, 1] space.
             intensities = torch.randn(num_streaks, 1, device=noisy.device) * (
                 0.3 * 255.0
             )
@@ -186,6 +210,54 @@ class SBFSEMNoiseSynthesizer(NoiseSynthesizer):
 
         # Normalize back to [0, 1] and clamp to valid range
         return (noisy / 255.0).clamp_(0.0, 1.0)
+
+    def __call__(self, clean_tensor: Tensor) -> Tensor:
+        """Forwarding interface to satisfy Callable semantics."""
+        return self.inject(clean_tensor)
+
+
+class EmpiricalNoiseSynthesizer(NoiseSynthesizer):
+    """
+    Synthesizes noise by sampling from a calibrated 2D empirical histogram
+    P(noisy | clean) using inverse transform sampling.
+    """
+
+    def __init__(self, model_path: Union[str, Path]) -> None:
+        model_path = Path(model_path)
+        if not model_path.exists():
+            raise FileNotFoundError(f"Empirical noise model not found at {model_path}")
+
+        # Load P(x | s) shape (256, 256)
+        p_x_given_s = np.load(model_path)
+        # Compute CDF for inverse transform sampling
+        cdf = np.cumsum(p_x_given_s, axis=1)
+        # Ensure it ends exactly at 1.0 to avoid sampling out of bounds
+        cdf[:, -1] = 1.0
+
+        self.cdf = torch.tensor(cdf, dtype=torch.float32)
+        self.device = None
+
+    def inject(self, clean_tensor: Tensor) -> Tensor:
+        if self.device is None or self.device != clean_tensor.device:
+            self.cdf = self.cdf.to(clean_tensor.device)
+            self.device = clean_tensor.device
+
+        # Map clean to [0, 255] index
+        clean_idx = torch.clamp(torch.round(clean_tensor * 255), 0, 255).long()
+
+        # Fetch the 256-bin CDF for each pixel based on its clean intensity
+        # shape: [..., H, W, 256]
+        pixel_cdfs = self.cdf[clean_idx]
+
+        # Sample uniform random values [0, 1)
+        u = torch.rand_like(clean_tensor).unsqueeze(-1)
+
+        # Find the index where u falls in the CDF
+        noisy_idx = torch.searchsorted(pixel_cdfs, u).squeeze(-1)
+
+        # Noisy idx is in [0, 255]. Convert back to [0, 1] float
+        noisy = noisy_idx.float() / 255.0
+        return noisy
 
     def __call__(self, clean_tensor: Tensor) -> Tensor:
         """Forwarding interface to satisfy Callable semantics."""

@@ -28,10 +28,13 @@ extraction:
   target_test_patches: 200    # Number of patches for testing set
 
 noise:
-  photon_scale: 0.04       # Simulated photon count scale — lower = stronger shot noise (add_em_noise default: 0.04)
-  read_std: 8.0            # Detector readout noise std in uint8 space (add_em_noise default: 8.0)
-  gain_variance: 0.02      # Per-pixel detector gain variation / fixed-pattern noise (add_em_noise default: 0.02)
-  streak_probability: 0.15 # Beam charging raster anomaly probability
+  synthesizer_type: "parametric"  # "parametric" or "empirical"
+  empirical_model_path: "noise_model.npy" # Path to 2D histogram CDF for empirical noise
+  calibrate_on_the_fly: false  # If true, runs calibration over sbem_root if empirical model doesn't exist
+  photon_scale: [0.02, 0.08]       # Simulated photon count scale (can be float or [min, max] list)
+  read_std: [5.0, 15.0]            # Detector readout noise std in uint8 space (can be float or [min, max] list)
+  gain_variance: [0.01, 0.05]      # Per-pixel detector gain variation (can be float or [min, max] list)
+  streak_probability: [0.05, 0.2]  # Beam charging raster anomaly probability (can be float or [min, max] list)
 
 training:
   batch_size: 16
