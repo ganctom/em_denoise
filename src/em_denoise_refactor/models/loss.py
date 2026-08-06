@@ -364,7 +364,11 @@ class EnhancedCompositeLoss(nn.Module):
     def forward(
         self, pred: torch.Tensor, target: torch.Tensor
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        l_charb = self.charbonnier(pred, target)
+        l_charb = (
+            self.charbonnier(pred, target)
+            if self.charbonnier_weight > 0
+            else torch.tensor(0.0, device=pred.device)
+        )
         l_ssim = (
             self.ssim_loss(pred, target)
             if self.ssim_weight > 0
