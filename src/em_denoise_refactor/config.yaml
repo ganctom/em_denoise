@@ -1,14 +1,14 @@
 # Pipeline Configuration for SBF-SEM Connectomics Denoising
 
 experiment:
-  name: "04_ep10_mse_ssim_edge_020305_parametric_noise"
-  output_dir: "/Users/ganctoma/SW/sort/N2V/run_40"
+  name: "00_ep10_mse_ssim_edge_020305_parametric_noise"
+  output_dir: "/Users/ganctoma/SW/sort/N2V/run_41"
 
 data:
   sbem_root: "/Volumes/tachyon/groups/scratch/gmicro_sem/gfriedri/_EM_acquisitions/20260201_RoLi_F1/"
   grid_num: 0
   first_sec: 1250
-  last_sec: 22800
+  last_sec: 8000
 
 splitting:
   strategy: "block"          # Options: "block" (Volumetric block + guard bands) or "mod10"
@@ -23,12 +23,12 @@ extraction:
   patches_per_tile: 2        # Maximum patches cropped per source .tif tile
   tiles_per_section: 4       # Number of tiles sampled per section in ROI
   z_depth_per_roi: 1         # Z-depth span for ROI sampling (leave 1 for 2D-denoising methods)
-  target_train_patches: 150  # Number of patches for training set
-  target_val_patches: 20     # Number of patches for validation set
+  target_train_patches: 500  # Number of patches for training set
+  target_val_patches: 50     # Number of patches for validation set
   target_test_patches: 20    # Number of patches for testing set
 
 noise:
-  synthesizer_type: "parametric"   # "parametric" or "empirical"
+  synthesizer_type: "empirical"   # "parametric" or "empirical"
   empirical_model_path: "noise_model.npy" # Path to 2D histogram CDF for empirical noise
   calibrate_on_the_fly: true       # If true, runs calibration over sbem_root if empirical model doesn't exist
   photon_scale: [0.02, 0.08]       # Simulated photon count scale (can be float or [min, max] list)

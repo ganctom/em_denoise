@@ -17,20 +17,62 @@ def run_calibration(
 ) -> Path:
     sbem_root = config.data.sbem_root
     all_tiffs = []
-    if sbem_root.exists():
-        all_tiffs = list(sbem_root.rglob("*.tif"))
+
+    # 1. Try querying tile filepaths directly from SQLite metadata store if available
+    grid_str = f"g{config.data.grid_num:04d}"
+    sqlite_candidates = [
+        config.experiment.output_dir / f"dataset_metadata_{grid_str}.db",
+        sbem_root / f"dataset_metadata_{grid_str}.db",
+    ]
+    db_file = next((p for p in sqlite_candidates if p.exists()), None)
+    if db_file:
+        try:
+            import sqlite3
+
+            conn = sqlite3.connect(str(db_file))
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT filepath FROM tiles 
+                WHERE section_id >= ? AND section_id <= ? 
+                ORDER BY RANDOM() 
+                LIMIT ?
+                """,
+                (config.data.first_sec, config.data.last_sec, num_samples * 3),
+            )
+            rows = cur.fetchall()
+            conn.close()
+            for r in rows:
+                p = sbem_root / r[0]
+                if p.exists():
+                    all_tiffs.append(p)
+        except Exception:
+            all_tiffs = []
+
+    # 2. Fallback to lazy filesystem search with early termination (avoids stalling SMB mounts)
+    if not all_tiffs and sbem_root.exists():
+        target_limit = num_samples * 3
+        for p in sbem_root.rglob("*.tif"):
+            all_tiffs.append(p)
+            if len(all_tiffs) >= target_limit:
+                break
         if not all_tiffs:
-            all_tiffs = list(sbem_root.rglob("*.tiff"))
+            for p in sbem_root.rglob("*.tiff"):
+                all_tiffs.append(p)
+                if len(all_tiffs) >= target_limit:
+                    break
 
     hist_2d = np.zeros((256, 256), dtype=np.float64)
 
     lmdb_store_path = config.experiment.output_dir / "patch_store.lmdb"
 
+    sources_used = []
     if all_tiffs:
         print(
-            f"Found {len(all_tiffs)} .tif files in {sbem_root}. Sampling {min(num_samples, len(all_tiffs))}..."
+            f"Found {len(all_tiffs)} candidate .tif tiles in sections {config.data.first_sec}–{config.data.last_sec}. Randomly sampling {min(num_samples, len(all_tiffs))}..."
         )
         sampled_tiffs = random.sample(all_tiffs, min(num_samples, len(all_tiffs)))
+        sources_used = [str(p) for p in sampled_tiffs]
         for path in tqdm(sampled_tiffs, desc="Calibrating Noise Model from TIFFs"):
             try:
                 noisy_img = tifffile.imread(path).astype(np.float32)
@@ -47,7 +89,7 @@ def run_calibration(
         import lmdb
 
         print(
-            f"No .tif files in sbem_root. Found LMDB store at {lmdb_store_path}. Sampling from LMDB..."
+            f"No .tif files accessible. Found LMDB store at {lmdb_store_path}. Sampling from LMDB..."
         )
         env = lmdb.open(str(lmdb_store_path), readonly=True, lock=False)
         with env.begin(write=False) as txn:
@@ -58,6 +100,7 @@ def run_calibration(
             raise ValueError(f"LMDB store at {lmdb_store_path} is empty.")
 
         sampled_keys = random.sample(all_keys, min(num_samples, len(all_keys)))
+        sources_used = [f"lmdb://{k.decode('utf-8')}" for k in sampled_keys]
         with env.begin(write=False) as txn:
             for key in tqdm(sampled_keys, desc="Calibrating Noise Model from LMDB"):
                 buf = txn.get(key)
@@ -89,6 +132,12 @@ def run_calibration(
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     np.save(out_path, p_x_given_s.astype(np.float32))
+
+    sources_path = out_path.parent / f"{out_path.stem}_sources.txt"
+    with open(sources_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(sources_used))
+    print(f"Recorded {len(sources_used)} source items to {sources_path}")
+
     return out_path
 
 

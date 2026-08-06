@@ -127,6 +127,9 @@ class DatasetPreparer:
                     "Empirical noise model not found. Running calibration on-the-fly..."
                 )
                 run_calibration(self.cfg)
+                logger.info(
+                    f"Empirical noise model calibrated and saved to: {model_path}"
+                )
 
             noise_injector = EmpiricalNoiseSynthesizer(model_path=model_path)
         else:
