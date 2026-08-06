@@ -34,6 +34,11 @@ from em_denoise_refactor.models.loss import (
     CompositeDenoisingLoss,
     EnhancedCompositeLoss,
     DynamicEMLoss,
+    CharbonnierLoss,
+    LaplacianLoss,
+    FocalFrequencyLoss,
+    ESPILoss,
+    SobelEdgeLoss,
 )
 from em_denoise_refactor.data.interfaces import NoiseSynthesizer
 
@@ -404,10 +409,10 @@ class DenoisingTrainer:
 
     def train_epoch(
         self, dataloader: DataLoader, epoch: int, total_epochs: int
-    ) -> Tuple[float, float]:
+    ) -> Tuple[float, Dict[str, float]]:
         self.model.train()
         total_loss = 0.0
-        total_edge_loss = 0.0
+        total_metrics: Dict[str, float] = {}
 
         pbar = tqdm(
             enumerate(dataloader),
@@ -432,35 +437,40 @@ class DenoisingTrainer:
                 loss, metrics = loss_out
             else:
                 loss = loss_out
-                metrics = {"loss_total": loss.item()}
+                metrics = {"loss_total": float(loss.item())}
 
             loss.backward()
             self.optimizer.step()
 
-            batch_loss = loss.item()
-            batch_edge = metrics.get("loss_edge", 0.0)
+            batch_size = noisy_b.size(0)
+            batch_loss = float(loss.item())
+            total_loss += batch_loss * batch_size
 
-            total_loss += batch_loss * noisy_b.size(0)
-            total_edge_loss += batch_edge * noisy_b.size(0)
+            for k, v in metrics.items():
+                total_metrics[k] = total_metrics.get(k, 0.0) + float(v) * batch_size
 
             if batch_idx % 10 == 0:
                 self._purge_memory()
 
             postfix = {"loss": f"{batch_loss:.5f}"}
-            if batch_edge > 0:
-                postfix["edge"] = f"{batch_edge:.4f}"
+            if "loss_charbonnier" in metrics:
+                postfix["chrb"] = f"{metrics['loss_charbonnier']:.4f}"
+            elif "loss_edge" in metrics and metrics["loss_edge"] > 0:
+                postfix["edge"] = f"{metrics['loss_edge']:.4f}"
             pbar.set_postfix(postfix)
 
         num_samples = len(dataloader.dataset)
-        return total_loss / num_samples, total_edge_loss / num_samples
+        avg_metrics = {k: v / num_samples for k, v in total_metrics.items()}
+        return total_loss / num_samples, avg_metrics
 
     def validate(
         self, dataloader: DataLoader, epoch: int, total_epochs: int
-    ) -> Tuple[float, float, float]:
+    ) -> Tuple[float, float, float, Dict[str, float]]:
         self.model.eval()
         total_val_loss = 0.0
         val_psnrs: List[float] = []
         val_ssims: List[float] = []
+        total_val_metrics: Dict[str, float] = {}
 
         pbar = tqdm(
             dataloader, desc=f"Epoch [{epoch:02d}/{total_epochs:02d}] Val", leave=False
@@ -479,11 +489,19 @@ class DenoisingTrainer:
                     loss_out = self.criterion(pred_b, clean_b)
 
                 if isinstance(loss_out, tuple):
-                    loss = loss_out[0]
+                    loss, metrics = loss_out
                 else:
                     loss = loss_out
+                    metrics = {"loss_total": float(loss.item())}
 
-                total_val_loss += loss.item() * noisy_b.size(0)
+                batch_size = noisy_b.size(0)
+                total_val_loss += float(loss.item()) * batch_size
+
+                for k, v in metrics.items():
+                    total_val_metrics[k] = (
+                        total_val_metrics.get(k, 0.0) + float(v) * batch_size
+                    )
+
                 pred_clamp = torch.clamp(pred_b, 0.0, 1.0)
 
                 for i in range(pred_b.size(0)):
@@ -493,11 +511,13 @@ class DenoisingTrainer:
                     val_ssims.append(EvaluationMetrics.compute_ssim(p_np, c_np))
 
         self._purge_memory()
-        mean_val_loss = total_val_loss / len(dataloader.dataset)
+        num_samples = len(dataloader.dataset)
+        mean_val_loss = total_val_loss / num_samples
         mean_val_psnr = float(np.mean(val_psnrs)) if val_psnrs else 0.0
         mean_val_ssim = float(np.mean(val_ssims)) if val_ssims else 0.0
+        avg_val_metrics = {k: v / num_samples for k, v in total_val_metrics.items()}
 
-        return mean_val_loss, mean_val_psnr, mean_val_ssim
+        return mean_val_loss, mean_val_psnr, mean_val_ssim, avg_val_metrics
 
     def save_checkpoint(
         self,
@@ -541,6 +561,13 @@ class DenoisingEvaluator:
         self.device = device
         self.use_amp = use_amp
 
+        # Loss metric calculators for detailed test set evaluation
+        self.charbonnier_fn = CharbonnierLoss().to(device)
+        self.laplacian_fn = LaplacianLoss(channels=1).to(device)
+        self.ffl_fn = FocalFrequencyLoss().to(device)
+        self.espi_fn = ESPILoss(channels=1).to(device)
+        self.sobel_fn = SobelEdgeLoss().to(device)
+
     def evaluate_test_set(
         self, test_loader: DataLoader, output_denoised_dir: Path
     ) -> Dict[str, float]:
@@ -550,6 +577,11 @@ class DenoisingEvaluator:
         noisy_mses, denoised_mses = [], []
         noisy_psnrs, denoised_psnrs = [], []
         noisy_ssims, denoised_ssims = [], []
+        noisy_charbs, denoised_charbs = [], []
+        noisy_laps, denoised_laps = [], []
+        noisy_ffls, denoised_ffls = [], []
+        noisy_espis, denoised_espis = [], []
+        noisy_edges, denoised_edges = [], []
 
         logger.info(
             f"Running inference over {len(test_loader.dataset)} test samples..."
@@ -572,6 +604,7 @@ class DenoisingEvaluator:
                 denoised_np = pred_b.squeeze().cpu().numpy()
                 denoised_uint8 = np.clip(denoised_np * 255.0, 0, 255).astype(np.uint8)
 
+                # Standard spatial metrics
                 noisy_mses.append(EvaluationMetrics.compute_mse(noisy_np, clean_np))
                 denoised_mses.append(
                     EvaluationMetrics.compute_mse(denoised_np, clean_np)
@@ -587,6 +620,24 @@ class DenoisingEvaluator:
                     EvaluationMetrics.compute_ssim(denoised_np, clean_np)
                 )
 
+                # Specialized loss metrics
+                noisy_charbs.append(float(self.charbonnier_fn(noisy_b, clean_b).item()))
+                denoised_charbs.append(
+                    float(self.charbonnier_fn(pred_b, clean_b).item())
+                )
+
+                noisy_laps.append(float(self.laplacian_fn(noisy_b, clean_b).item()))
+                denoised_laps.append(float(self.laplacian_fn(pred_b, clean_b).item()))
+
+                noisy_ffls.append(float(self.ffl_fn(noisy_b, clean_b).item()))
+                denoised_ffls.append(float(self.ffl_fn(pred_b, clean_b).item()))
+
+                noisy_espis.append(float(self.espi_fn(noisy_b, clean_b).item()))
+                denoised_espis.append(float(self.espi_fn(pred_b, clean_b).item()))
+
+                noisy_edges.append(float(self.sobel_fn(noisy_b, clean_b).item()))
+                denoised_edges.append(float(self.sobel_fn(pred_b, clean_b).item()))
+
                 out_fname = (
                     fname
                     if (fname.endswith(".tif") or fname.endswith(".tiff"))
@@ -601,6 +652,16 @@ class DenoisingEvaluator:
             "denoised_psnr": float(np.mean(denoised_psnrs)),
             "noisy_ssim": float(np.mean(noisy_ssims)),
             "denoised_ssim": float(np.mean(denoised_ssims)),
+            "noisy_charbonnier": float(np.mean(noisy_charbs)),
+            "denoised_charbonnier": float(np.mean(denoised_charbs)),
+            "noisy_laplacian": float(np.mean(noisy_laps)),
+            "denoised_laplacian": float(np.mean(denoised_laps)),
+            "noisy_ffl": float(np.mean(noisy_ffls)),
+            "denoised_ffl": float(np.mean(denoised_ffls)),
+            "noisy_espi": float(np.mean(noisy_espis)),
+            "denoised_espi": float(np.mean(denoised_espis)),
+            "noisy_edge": float(np.mean(noisy_edges)),
+            "denoised_edge": float(np.mean(denoised_edges)),
         }
         return results
 
@@ -937,10 +998,10 @@ def main() -> None:
         best_val_loss = float("inf")
 
         for epoch in range(1, epochs + 1):
-            train_loss, train_edge_loss = trainer.train_epoch(
-                train_loader, epoch, epochs
+            train_loss, train_metrics = trainer.train_epoch(train_loader, epoch, epochs)
+            val_loss, val_psnr, val_ssim, val_metrics = trainer.validate(
+                val_loader, epoch, epochs
             )
-            val_loss, val_psnr, val_ssim = trainer.validate(val_loader, epoch, epochs)
 
             is_best = val_loss < best_val_loss
             if is_best:
@@ -954,17 +1015,41 @@ def main() -> None:
 
             if writer is not None:
                 writer.add_scalar("Loss/Train", train_loss, epoch)
-                writer.add_scalar("Loss/Train_Edge", train_edge_loss, epoch)
                 writer.add_scalar("Loss/Validation", val_loss, epoch)
                 writer.add_scalar("Metrics/Val_PSNR", val_psnr, epoch)
                 writer.add_scalar("Metrics/Val_SSIM", val_ssim, epoch)
+                for k, v in train_metrics.items():
+                    writer.add_scalar(f"Train_Metrics/{k}", v, epoch)
+                for k, v in val_metrics.items():
+                    writer.add_scalar(f"Val_Metrics/{k}", v, epoch)
 
             best_str = " [BEST]" if is_best else ""
-            logger.info(
-                f"Ep [{epoch:02d}/{epochs:02d}] | Tr: {train_loss:.5f} | "
-                f"Val: {val_loss:.5f} | Edge: {train_edge_loss:.4f} | "
-                f"PSNR: {val_psnr:.2f}dB | SSIM: {val_ssim:.4f}{best_str}"
-            )
+            if loss_type == "enhanced":
+                chrb = train_metrics.get("loss_charbonnier", 0.0)
+                lap = train_metrics.get("loss_laplacian", 0.0)
+                ffl = train_metrics.get("loss_ffl", 0.0)
+                espi = train_metrics.get("loss_espi", 0.0)
+                logger.info(
+                    f"Ep [{epoch:02d}/{epochs:02d}] | Tr: {train_loss:.5f} | Val: {val_loss:.5f} | "
+                    f"Chrb: {chrb:.4f} | Lap: {lap:.4f} | FFL: {ffl:.4f} | ESPI: {espi:.4f} | "
+                    f"PSNR: {val_psnr:.2f}dB | SSIM: {val_ssim:.4f}{best_str}"
+                )
+            elif loss_type == "dynamic":
+                chrb = train_metrics.get("loss_charbonnier", 0.0)
+                ffl = train_metrics.get("loss_ffl", 0.0)
+                vst = train_metrics.get("loss_vst", 0.0)
+                lap = train_metrics.get("loss_laplacian", 0.0)
+                logger.info(
+                    f"Ep [{epoch:02d}/{epochs:02d}] | Tr: {train_loss:.5f} | Val: {val_loss:.5f} | "
+                    f"Chrb: {chrb:.4f} | FFL: {ffl:.4f} | VST: {vst:.4f} | Lap: {lap:.4f} | "
+                    f"PSNR: {val_psnr:.2f}dB | SSIM: {val_ssim:.4f}{best_str}"
+                )
+            else:
+                edge = train_metrics.get("loss_edge", 0.0)
+                logger.info(
+                    f"Ep [{epoch:02d}/{epochs:02d}] | Tr: {train_loss:.5f} | Val: {val_loss:.5f} | "
+                    f"Edge: {edge:.4f} | PSNR: {val_psnr:.2f}dB | SSIM: {val_ssim:.4f}{best_str}"
+                )
 
         logger.info(
             f"✓ Training completed in {time.time() - start_time:.2f}s. Best Val Loss: {best_val_loss:.6f}"
@@ -1026,17 +1111,39 @@ def main() -> None:
     results = evaluator.evaluate_test_set(test_loader, test_denoised_dir)
 
     logger.info("==================================================")
-    logger.info(" INFERENCE & DENOISING PERFORMANCE SUMMARY")
+    logger.info(
+        f" INFERENCE & DENOISING PERFORMANCE SUMMARY (Loss Mode: {loss_type.upper()})"
+    )
     logger.info("==================================================")
     logger.info(
-        f" Mean MSE  : Noisy = {results['noisy_mse']:.6f}  ==>  Denoised = {results['denoised_mse']:.6f} (Lower is better)"
+        f" Mean MSE         : Noisy = {results['noisy_mse']:.6f}  ==>  Denoised = {results['denoised_mse']:.6f} (Lower is better)"
     )
     logger.info(
-        f" Mean PSNR : Noisy = {results['noisy_psnr']:.2f} dB ==>  Denoised = {results['denoised_psnr']:.2f} dB (Higher is better)"
+        f" Mean PSNR        : Noisy = {results['noisy_psnr']:.2f} dB ==>  Denoised = {results['denoised_psnr']:.2f} dB (Higher is better)"
     )
     logger.info(
-        f" Mean SSIM : Noisy = {results['noisy_ssim']:.4f}    ==>  Denoised = {results['denoised_ssim']:.4f}    (Higher is better)"
+        f" Mean SSIM        : Noisy = {results['noisy_ssim']:.4f}    ==>  Denoised = {results['denoised_ssim']:.4f}    (Higher is better)"
     )
+    if "noisy_charbonnier" in results:
+        logger.info(
+            f" Mean Charbonnier : Noisy = {results['noisy_charbonnier']:.6f}  ==>  Denoised = {results['denoised_charbonnier']:.6f} (Lower is better)"
+        )
+    if "noisy_laplacian" in results:
+        logger.info(
+            f" Mean Laplacian   : Noisy = {results['noisy_laplacian']:.6f}  ==>  Denoised = {results['denoised_laplacian']:.6f} (Lower is better)"
+        )
+    if "noisy_ffl" in results:
+        logger.info(
+            f" Mean FFL         : Noisy = {results['noisy_ffl']:.6f}  ==>  Denoised = {results['denoised_ffl']:.6f} (Lower is better)"
+        )
+    if "noisy_espi" in results:
+        logger.info(
+            f" Mean ESPI        : Noisy = {results['noisy_espi']:.6f}  ==>  Denoised = {results['denoised_espi']:.6f} (Lower is better)"
+        )
+    if "noisy_edge" in results and loss_type == "composite":
+        logger.info(
+            f" Mean Sobel Edge  : Noisy = {results['noisy_edge']:.6f}  ==>  Denoised = {results['denoised_edge']:.6f} (Lower is better)"
+        )
     logger.info("==================================================")
     logger.info(f"✓ Denoised test images saved to: {test_denoised_dir}")
 
