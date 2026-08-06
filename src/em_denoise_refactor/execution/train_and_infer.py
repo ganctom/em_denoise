@@ -88,17 +88,19 @@ class EvaluationMetrics:
 
 
 class PatchFolderDataset(Dataset):
-    """Dataset reading clean/noisy patch pairs directly from TIFF directories."""
+    """Dataset reading clean patch pairs from TIFF directories with optional on-the-fly noise synthesis."""
 
     def __init__(
         self,
         clean_dir: Path | str,
-        noisy_dir: Path | str,
+        noisy_dir: Optional[Path | str] = None,
+        noise_injector: Optional[NoiseSynthesizer] = None,
         cache_in_ram: bool = True,
         augment: bool = False,
     ) -> None:
         self.clean_dir = Path(clean_dir)
-        self.noisy_dir = Path(noisy_dir)
+        self.noisy_dir = Path(noisy_dir) if noisy_dir else None
+        self.noise_injector = noise_injector
         self.cache_in_ram = cache_in_ram
         self.augment = augment
 
@@ -115,13 +117,22 @@ class PatchFolderDataset(Dataset):
                 self.filenames, desc=f"RAM Caching ({self.clean_dir.parent.name})"
             ):
                 clean_path = self.clean_dir / fname
-                noisy_path = self.noisy_dir / fname
-
                 clean_img = tifffile.imread(str(clean_path)).astype(np.float32) / 255.0
-                noisy_img = tifffile.imread(str(noisy_path)).astype(np.float32) / 255.0
-
                 clean_tensor = torch.from_numpy(clean_img).unsqueeze(0)
-                noisy_tensor = torch.from_numpy(noisy_img).unsqueeze(0)
+
+                if self.noise_injector is not None:
+                    noisy_tensor = self.noise_injector(
+                        clean_tensor.unsqueeze(0)
+                    ).squeeze(0)
+                elif self.noisy_dir is not None:
+                    noisy_path = self.noisy_dir / fname
+                    noisy_img = (
+                        tifffile.imread(str(noisy_path)).astype(np.float32) / 255.0
+                    )
+                    noisy_tensor = torch.from_numpy(noisy_img).unsqueeze(0)
+                else:
+                    noisy_tensor = clean_tensor.clone()
+
                 self.cached_samples.append((noisy_tensor, clean_tensor, fname))
 
     def __len__(self) -> int:
@@ -152,11 +163,18 @@ class PatchFolderDataset(Dataset):
             clean_img = (
                 tifffile.imread(str(self.clean_dir / fname)).astype(np.float32) / 255.0
             )
-            noisy_img = (
-                tifffile.imread(str(self.noisy_dir / fname)).astype(np.float32) / 255.0
-            )
             clean_tensor = torch.from_numpy(clean_img).unsqueeze(0)
-            noisy_tensor = torch.from_numpy(noisy_img).unsqueeze(0)
+
+            if self.noise_injector is not None:
+                noisy_tensor = self.noise_injector(clean_tensor.unsqueeze(0)).squeeze(0)
+            elif self.noisy_dir is not None:
+                noisy_img = (
+                    tifffile.imread(str(self.noisy_dir / fname)).astype(np.float32)
+                    / 255.0
+                )
+                noisy_tensor = torch.from_numpy(noisy_img).unsqueeze(0)
+            else:
+                noisy_tensor = clean_tensor.clone()
 
         if self.augment:
             noisy_tensor, clean_tensor = self._apply_augmentation(
@@ -657,6 +675,13 @@ def parse_args() -> argparse.Namespace:
         help="Path to custom directory of .tif images to run inference on.",
     )
     parser.add_argument(
+        "-d",
+        "--data-dir",
+        type=str,
+        default=None,
+        help="Path to legacy/custom dataset directory containing train/val/test folders with clean patches.",
+    )
+    parser.add_argument(
         "-n",
         "--name",
         type=str,
@@ -726,9 +751,56 @@ def main() -> None:
             streak_probability=cfg.noise.streak_probability,
         )
 
+    data_dir = Path(args.data_dir) if args.data_dir else None
+
     if not args.eval_only:
         logger.info("Initializing Train & Validation Datasets...")
-        if lmdb_store_path.exists():
+        if data_dir is not None:
+            logger.info(f"Loading custom dataset from directory: {data_dir}")
+            root_dir = (
+                data_dir.parent
+                if data_dir.name in ["train", "val", "test", "clean"]
+                else data_dir
+            )
+            if root_dir.name in ["clean", "noisy"]:
+                root_dir = root_dir.parent.parent
+
+            train_clean = (
+                root_dir / "train" / "clean"
+                if (root_dir / "train" / "clean").exists()
+                else (root_dir / "clean" if (root_dir / "clean").exists() else root_dir)
+            )
+            val_clean = (
+                root_dir / "val" / "clean"
+                if (root_dir / "val" / "clean").exists()
+                else (root_dir / "clean" if (root_dir / "clean").exists() else root_dir)
+            )
+            train_noisy = (
+                root_dir / "train" / "noisy"
+                if (root_dir / "train" / "noisy").exists()
+                else None
+            )
+            val_noisy = (
+                root_dir / "val" / "noisy"
+                if (root_dir / "val" / "noisy").exists()
+                else None
+            )
+
+            train_dataset = PatchFolderDataset(
+                train_clean,
+                noisy_dir=train_noisy if noise_injector is None else None,
+                noise_injector=noise_injector,
+                cache_in_ram=cfg.training.cache_in_ram,
+                augment=True,
+            )
+            val_dataset = PatchFolderDataset(
+                val_clean,
+                noisy_dir=val_noisy if noise_injector is None else None,
+                noise_injector=noise_injector,
+                cache_in_ram=cfg.training.cache_in_ram,
+                augment=False,
+            )
+        elif lmdb_store_path.exists():
             logger.info(f"Found LMDB store at: {lmdb_store_path}")
             train_dataset = LMDBPatchDataset(
                 lmdb_store_path,
@@ -750,14 +822,20 @@ def main() -> None:
             )
             train_dataset = PatchFolderDataset(
                 output_dir / "train" / "clean",
-                output_dir / "train" / "noisy",
-                cache_in_ram=True,
+                noisy_dir=output_dir / "train" / "noisy"
+                if noise_injector is None
+                else None,
+                noise_injector=noise_injector,
+                cache_in_ram=cfg.training.cache_in_ram,
                 augment=True,
             )
             val_dataset = PatchFolderDataset(
                 output_dir / "val" / "clean",
-                output_dir / "val" / "noisy",
-                cache_in_ram=True,
+                noisy_dir=output_dir / "val" / "noisy"
+                if noise_injector is None
+                else None,
+                noise_injector=noise_injector,
+                cache_in_ram=cfg.training.cache_in_ram,
                 augment=False,
             )
 
