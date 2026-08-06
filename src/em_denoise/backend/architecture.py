@@ -22,6 +22,14 @@ class UNetConfig(BaseModel):
         False, description="Enable spatial attention at the bottleneck"
     )
     dropout_rate: float = Field(0.1, ge=0.0, le=1.0)
+    use_conv_downsample: bool = Field(
+        True,
+        description=(
+            "Learned strided-conv downsampling. Set False to use parameter-free "
+            "max-pooling, which is required to load checkpoints trained before "
+            "the strided-conv encoder was introduced."
+        ),
+    )
 
 
 class ResBlock(nn.Module):
@@ -108,7 +116,10 @@ class ResidualUNet(nn.Module):
                 ]
             )
             self.down_blocks.append(blocks)
-            self.down_samples.append(Downsample(out_ch))
+            # Only register parameters when learned downsampling is requested, so the
+            # state_dict shape matches what older max-pool checkpoints expect.
+            if config.use_conv_downsample:
+                self.down_samples.append(Downsample(out_ch))
             in_ch = out_ch
 
         # --- Bottleneck ---
@@ -148,11 +159,14 @@ class ResidualUNet(nn.Module):
         x = self.init_conv(x)
 
         skips = []
-        # Encoder pass with learned strided downsampling
-        for block, downsample in zip(self.down_blocks, self.down_samples):
+        # Encoder pass: learned strided conv, or max-pool for legacy checkpoints.
+        for level, block in enumerate(self.down_blocks):
             x = block(x)
             skips.append(x)
-            x = downsample(x)
+            if self.config.use_conv_downsample:
+                x = self.down_samples[level](x)
+            else:
+                x = F.max_pool2d(x, kernel_size=2, stride=2)
 
         # Bottleneck
         x = self.bottleneck(x)

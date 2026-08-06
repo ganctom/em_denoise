@@ -212,18 +212,18 @@ def run_directory_inference(
     logging.info("Inference complete. Exported artifacts to: %s", out_path.resolve())
 
 
-def main(test_dir: str | None = None, ckpt_path: str | None = None) -> None:
-    parser = argparse.ArgumentParser(
-        description="Supervised Denoising Inference Engine"
-    )
-    parser.add_argument(
-        "--config",
-        type=Path,
-        default=Path("config.yaml"),
-        help="Path to YAML configuration file",
-    )
-    args = parser.parse_args()
-    cfg = PipelineConfig.from_yaml(args.config)
+def run_from_config(
+    config_path: str | Path,
+    test_dir: str | Path | None = None,
+    ckpt_path: str | Path | None = None,
+) -> None:
+    """
+    Resolve model, checkpoint and I/O paths from a YAML config and run inference.
+
+    Kept free of argument parsing so it is safe to call from run_experiment.py; the
+    previous version re-parsed sys.argv and inherited the caller's flags.
+    """
+    cfg = PipelineConfig.from_yaml(config_path)
 
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -260,9 +260,33 @@ def main(test_dir: str | None = None, ckpt_path: str | None = None) -> None:
     )
 
 
-if __name__ == "__main__":
-    # test_dir = "/Users/ganctoma/SW/sort/N2V/run_30/raw_patches/test_raw"
-    test_dir = "/Users/ganctoma/SW/sort/N2V/run_30/raw_patches/test_raw"
-    checkpoint_path = "/Users/ganctoma/SW/sort/N2V/run_30/experiments/07_lr_0004_EM_011_078_010_001/checkpoints/best_model.pt"
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Supervised Denoising Inference Engine"
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("config.yaml"),
+        help="Path to YAML configuration file",
+    )
+    parser.add_argument(
+        "--test-dir",
+        type=Path,
+        default=None,
+        help="Override input directory (default: <sandbox_root>/test/noisy)",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=None,
+        help="Override checkpoint (default: <experiment_dir>/checkpoints/best_model.pt)",
+    )
+    args = parser.parse_args()
+    run_from_config(
+        config_path=args.config, test_dir=args.test_dir, ckpt_path=args.checkpoint
+    )
 
-    main(test_dir, checkpoint_path)
+
+if __name__ == "__main__":
+    main()

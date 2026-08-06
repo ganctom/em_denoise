@@ -1,0 +1,50 @@
+# Cluster environment for em_denoise.
+#
+# Local development still uses uv (pyproject.toml + uv.lock). This file exists because
+# the FMI compute nodes have no outbound network access, so dependencies must come from
+# a pre-solved conda environment staged on shared storage rather than from an in-job
+# `uv sync`. It mirrors the pixi bootstrap used in napari_sam and vlad_segmentation.
+#
+# Only linux-64 is declared: pytorch-gpu has no Windows build, and listing win-64 would
+# make the solve fail. Use uv for local work on Windows.
+
+[workspace]
+authors = ["Niklas Khoss <niklas.khoss@fmi.ch>"]
+channels = ["conda-forge"]
+name = "em_denoise"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[dependencies]
+python = ">=3.12"
+pytorch-gpu = ">=2.4"
+torchvision = "*"
+tensorboard = "*"
+numpy = ">=2.0"
+scipy = "*"
+scikit-image = "*"
+tifffile = "*"
+pillow = "*"
+pyyaml = "*"
+pandas = "*"
+matplotlib = "*"
+seaborn = "*"
+pydantic = ">=2"
+tqdm = "*"
+tabulate = "*"
+cyclopts = "*"
+loguru = "*"
+natsort = "*"
+
+# Put the src/ layout on the import path instead of installing the project as a pypi
+# dependency. An editable pypi install would re-resolve pyproject.toml against PyPI and
+# risk pulling a second, CPU-only torch on top of the conda pytorch-gpu build. If you
+# would rather have a real install, drop this section and add:
+#   [pypi-dependencies]
+#   em-denoise = { path = ".", editable = true }
+[activation.env]
+PYTHONPATH = "$PIXI_PROJECT_ROOT/src"
+
+[tasks]
+train-n2v = "python -m em_denoise.n2v.train_n2v train"
+denoise-n2v = "python -m em_denoise.n2v.train_n2v denoise"
