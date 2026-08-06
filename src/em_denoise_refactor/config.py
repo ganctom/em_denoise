@@ -108,6 +108,14 @@ class LossConfig:
 
 
 @dataclass
+class ModelConfig:
+    model_type: str = (
+        "connectomics"  # Options: "connectomics", "residual_unet", "modern_unet"
+    )
+    base_dim: int = 32
+
+
+@dataclass
 class PipelineConfig:
     experiment: ExperimentConfig = field(default_factory=ExperimentConfig)
     data: DataConfig = field(default_factory=DataConfig)
@@ -116,6 +124,7 @@ class PipelineConfig:
         default_factory=ExtractionSettingsConfig
     )
     noise: NoiseConfig = field(default_factory=NoiseConfig)
+    model: ModelConfig = field(default_factory=ModelConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     loss: LossConfig = field(default_factory=LossConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
@@ -128,6 +137,7 @@ class PipelineConfig:
             splitting=SplittingConfig(**d.get("splitting", {})),
             extraction=ExtractionSettingsConfig(**d.get("extraction", {})),
             noise=NoiseConfig(**d.get("noise", {})),
+            model=ModelConfig(**d.get("model", {})),
             training=TrainingConfig(**d.get("training", {})),
             loss=LossConfig(**d.get("loss", {})),
             inference=InferenceConfig(**d.get("inference", {})),

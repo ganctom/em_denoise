@@ -29,7 +29,7 @@ from em_denoise_refactor.data.dataset import (
     EmpiricalNoiseSynthesizer,
 )
 from em_denoise_refactor.execution.calibration import run_calibration
-from em_denoise_refactor.models.connectomics import ConnectomicsDenoisingNet
+from em_denoise_refactor.models.factory import build_model
 from em_denoise_refactor.models.loss import (
     CompositeDenoisingLoss,
     EnhancedCompositeLoss,
@@ -708,6 +708,15 @@ def parse_args() -> argparse.Namespace:
         help="Override learning rate.",
     )
     parser.add_argument(
+        "-m",
+        "--model",
+        "--model-type",
+        type=str,
+        default=None,
+        choices=["connectomics", "residual_unet", "modern_unet"],
+        help="Override neural network model architecture (connectomics, residual_unet, or modern_unet).",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default=None,
@@ -928,8 +937,21 @@ def main() -> None:
     logger.info(f"Using target device: {device}")
     use_amp = device.type == "cuda"
 
-    model = ConnectomicsDenoisingNet(in_channels=1, out_channels=1, base_dim=32).to(
-        device
+    model_type = (
+        args.model
+        if args.model
+        else (
+            cfg.model.model_type
+            if hasattr(cfg, "model") and cfg.model
+            else "connectomics"
+        )
+    )
+    base_dim = cfg.model.base_dim if hasattr(cfg, "model") and cfg.model else 32
+    model = build_model(
+        model_type=model_type, in_channels=1, out_channels=1, base_dim=base_dim
+    ).to(device)
+    logger.info(
+        f"Initialized neural network architecture: '{model_type}' (base_dim={base_dim})"
     )
     loss_type = getattr(cfg.loss, "loss_type", "composite").lower()
     if loss_type == "dynamic":

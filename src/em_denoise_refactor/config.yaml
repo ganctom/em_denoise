@@ -39,7 +39,13 @@ noise:
   photon_scale: [0.02, 0.04]       # Simulated photon count scale (can be float or [min, max] list)
   read_std: [5.0, 15.0]            # Detector readout noise std in uint8 space (can be float or [min, max] list)
   gain_variance: [0.01, 0.25]      # Per-pixel detector gain variation (can be float or [min, max] list)
-  streak_probability: [0.0, 0.0]   # Beam charging raster anomaly probability (can be float or [min, max] list)
+model:
+  # Model Architecture Selection:
+  #   - "connectomics": NAFBlock + LaplacianEdgeAttention global residual architecture (default)
+  #   - "residual_unet": Pre-activation ResBlock UNet with GroupNorm, GELU & strided downsampling
+  #   - "modern_unet"  : Modern ResConvBlock UNet with bilinear upsampling
+  model_type: "connectomics"
+  base_dim: 32
 
 training:
   batch_size: 32
