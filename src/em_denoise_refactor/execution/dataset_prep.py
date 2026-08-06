@@ -131,7 +131,10 @@ class DatasetPreparer:
                     f"Empirical noise model calibrated and saved to: {model_path}"
                 )
 
-            noise_injector = EmpiricalNoiseSynthesizer(model_path=model_path)
+            noise_injector = EmpiricalNoiseSynthesizer(
+                model_path=model_path,
+                noise_amplification=getattr(self.cfg.noise, "noise_amplification", 1.0),
+            )
         else:
             noise_injector = SBFSEMNoiseSynthesizer(
                 photon_scale=self.cfg.noise.photon_scale,

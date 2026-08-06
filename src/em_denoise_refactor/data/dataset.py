@@ -222,7 +222,9 @@ class EmpiricalNoiseSynthesizer(NoiseSynthesizer):
     P(noisy | clean) using inverse transform sampling.
     """
 
-    def __init__(self, model_path: Union[str, Path]) -> None:
+    def __init__(
+        self, model_path: Union[str, Path], noise_amplification: float = 1.0
+    ) -> None:
         model_path = Path(model_path)
         if not model_path.exists():
             raise FileNotFoundError(f"Empirical noise model not found at {model_path}")
@@ -235,6 +237,7 @@ class EmpiricalNoiseSynthesizer(NoiseSynthesizer):
         cdf[:, -1] = 1.0
 
         self.cdf = torch.tensor(cdf, dtype=torch.float32)
+        self.noise_amplification = noise_amplification
         self.device = None
 
     def inject(self, clean_tensor: Tensor) -> Tensor:
@@ -252,11 +255,20 @@ class EmpiricalNoiseSynthesizer(NoiseSynthesizer):
         # Sample uniform random values [0, 1)
         u = torch.rand_like(clean_tensor).unsqueeze(-1)
 
-        # Find the index where u falls in the CDF
-        noisy_idx = torch.searchsorted(pixel_cdfs, u).squeeze(-1)
+        # Find the index where u falls in the CDF (empirical noisy intensity in [0, 255])
+        noisy_idx = torch.searchsorted(pixel_cdfs, u).squeeze(-1).float()
 
-        # Noisy idx is in [0, 255]. Convert back to [0, 1] float
-        noisy = noisy_idx.float() / 255.0
+        # Amplify noise deviation: push noisy further from clean by factor alpha.
+        # alpha=1.0: exact empirical noise; alpha=2.0: doubled deviation; alpha=0.5: halved.
+        if self.noise_amplification != 1.0:
+            clean_float = clean_idx.float()
+            deviation = noisy_idx - clean_float
+            noisy_idx = torch.clamp(
+                clean_float + self.noise_amplification * deviation, 0.0, 255.0
+            )
+
+        # Convert back to [0, 1] float
+        noisy = noisy_idx / 255.0
         return noisy
 
     def __call__(self, clean_tensor: Tensor) -> Tensor:

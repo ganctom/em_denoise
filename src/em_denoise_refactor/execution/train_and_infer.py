@@ -108,10 +108,11 @@ class PatchFolderDataset(Dataset):
         if not self.filenames:
             raise FileNotFoundError(f"No .tif patches found in {self.clean_dir}")
 
-        self.cached_samples: List[Tuple[torch.Tensor, torch.Tensor, str]] = []
+        self.cached_clean_samples: List[Tuple[torch.Tensor, str]] = []
+        self.cached_noisy_samples: List[torch.Tensor] = []
         if self.cache_in_ram:
             logger.info(
-                f"Caching {len(self.filenames)} TIFF patches from {self.clean_dir.parent.name} into RAM..."
+                f"Caching {len(self.filenames)} clean TIFF patches from {self.clean_dir.parent.name} into RAM..."
             )
             for fname in tqdm(
                 self.filenames, desc=f"RAM Caching ({self.clean_dir.parent.name})"
@@ -119,21 +120,15 @@ class PatchFolderDataset(Dataset):
                 clean_path = self.clean_dir / fname
                 clean_img = tifffile.imread(str(clean_path)).astype(np.float32) / 255.0
                 clean_tensor = torch.from_numpy(clean_img).unsqueeze(0)
+                self.cached_clean_samples.append((clean_tensor, fname))
 
-                if self.noise_injector is not None:
-                    noisy_tensor = self.noise_injector(
-                        clean_tensor.unsqueeze(0)
-                    ).squeeze(0)
-                elif self.noisy_dir is not None:
+                if self.noise_injector is None and self.noisy_dir is not None:
                     noisy_path = self.noisy_dir / fname
                     noisy_img = (
                         tifffile.imread(str(noisy_path)).astype(np.float32) / 255.0
                     )
                     noisy_tensor = torch.from_numpy(noisy_img).unsqueeze(0)
-                else:
-                    noisy_tensor = clean_tensor.clone()
-
-                self.cached_samples.append((noisy_tensor, clean_tensor, fname))
+                    self.cached_noisy_samples.append(noisy_tensor)
 
     def __len__(self) -> int:
         return len(self.filenames)
@@ -155,9 +150,14 @@ class PatchFolderDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, str]:
         if self.cache_in_ram:
-            noisy_tensor, clean_tensor, fname = self.cached_samples[idx]
-            noisy_tensor = noisy_tensor.clone()
+            clean_tensor, fname = self.cached_clean_samples[idx]
             clean_tensor = clean_tensor.clone()
+            if self.noise_injector is not None:
+                noisy_tensor = self.noise_injector(clean_tensor.unsqueeze(0)).squeeze(0)
+            elif self.cached_noisy_samples:
+                noisy_tensor = self.cached_noisy_samples[idx].clone()
+            else:
+                noisy_tensor = clean_tensor.clone()
         else:
             fname = self.filenames[idx]
             clean_img = (
@@ -742,7 +742,10 @@ def main() -> None:
             )
             run_calibration(cfg)
 
-        noise_injector = EmpiricalNoiseSynthesizer(model_path=model_path)
+        noise_injector = EmpiricalNoiseSynthesizer(
+            model_path=model_path,
+            noise_amplification=getattr(cfg.noise, "noise_amplification", 1.0),
+        )
     else:
         noise_injector = SBFSEMNoiseSynthesizer(
             photon_scale=cfg.noise.photon_scale,
