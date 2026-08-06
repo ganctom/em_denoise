@@ -414,14 +414,7 @@ class DenoisingTrainer:
         total_loss = 0.0
         total_metrics: Dict[str, float] = {}
 
-        pbar = tqdm(
-            enumerate(dataloader),
-            total=len(dataloader),
-            desc=f"Epoch [{epoch:02d}/{total_epochs:02d}] Train",
-            leave=False,
-        )
-
-        for batch_idx, (noisy_b, clean_b, _) in pbar:
+        for batch_idx, (noisy_b, clean_b, _) in enumerate(dataloader):
             noisy_b, clean_b = noisy_b.to(self.device), clean_b.to(self.device)
 
             self.optimizer.zero_grad()
@@ -452,13 +445,6 @@ class DenoisingTrainer:
             if batch_idx % 10 == 0:
                 self._purge_memory()
 
-            postfix = {"loss": f"{batch_loss:.5f}"}
-            if "loss_charbonnier" in metrics:
-                postfix["chrb"] = f"{metrics['loss_charbonnier']:.4f}"
-            elif "loss_edge" in metrics and metrics["loss_edge"] > 0:
-                postfix["edge"] = f"{metrics['loss_edge']:.4f}"
-            pbar.set_postfix(postfix)
-
         num_samples = len(dataloader.dataset)
         avg_metrics = {k: v / num_samples for k, v in total_metrics.items()}
         return total_loss / num_samples, avg_metrics
@@ -472,12 +458,8 @@ class DenoisingTrainer:
         val_ssims: List[float] = []
         total_val_metrics: Dict[str, float] = {}
 
-        pbar = tqdm(
-            dataloader, desc=f"Epoch [{epoch:02d}/{total_epochs:02d}] Val", leave=False
-        )
-
         with torch.no_grad():
-            for noisy_b, clean_b, _ in pbar:
+            for noisy_b, clean_b, _ in dataloader:
                 noisy_b, clean_b = noisy_b.to(self.device), clean_b.to(self.device)
 
                 if self.use_amp:
@@ -587,7 +569,7 @@ class DenoisingEvaluator:
             f"Running inference over {len(test_loader.dataset)} test samples..."
         )
         with torch.no_grad():
-            for noisy_b, clean_b, fname_tuple in tqdm(test_loader, desc="Testing"):
+            for noisy_b, clean_b, fname_tuple in test_loader:
                 fname = fname_tuple[0]
                 noisy_b, clean_b = noisy_b.to(self.device), clean_b.to(self.device)
 
