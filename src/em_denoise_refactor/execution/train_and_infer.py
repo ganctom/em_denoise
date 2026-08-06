@@ -413,8 +413,11 @@ class DenoisingTrainer:
         self.model.train()
         total_loss = 0.0
         total_metrics: Dict[str, float] = {}
+        total_batches = len(dataloader)
+        log_interval = max(1, total_batches // 5)
 
         for batch_idx, (noisy_b, clean_b, _) in enumerate(dataloader):
+            step = batch_idx + 1
             noisy_b, clean_b = noisy_b.to(self.device), clean_b.to(self.device)
 
             self.optimizer.zero_grad()
@@ -444,6 +447,14 @@ class DenoisingTrainer:
 
             if batch_idx % 10 == 0:
                 self._purge_memory()
+
+            if step % log_interval == 0 or step == total_batches:
+                msg = f"  Epoch [{epoch:02d}/{total_epochs:02d}] Step [{step:04d}/{total_batches:04d}] - Loss: {batch_loss:.5f}"
+                if "loss_charbonnier" in metrics:
+                    msg += f" | Chrb: {metrics['loss_charbonnier']:.4f}"
+                elif "loss_edge" in metrics and metrics["loss_edge"] > 0:
+                    msg += f" | Edge: {metrics['loss_edge']:.4f}"
+                logger.info(msg)
 
         num_samples = len(dataloader.dataset)
         avg_metrics = {k: v / num_samples for k, v in total_metrics.items()}
@@ -565,13 +576,20 @@ class DenoisingEvaluator:
         noisy_espis, denoised_espis = [], []
         noisy_edges, denoised_edges = [], []
 
-        logger.info(
-            f"Running inference over {len(test_loader.dataset)} test samples..."
-        )
+        total_test_samples = len(test_loader.dataset)
+        log_interval = max(1, total_test_samples // 5)
+
+        logger.info(f"Running inference over {total_test_samples} test samples...")
         with torch.no_grad():
-            for noisy_b, clean_b, fname_tuple in test_loader:
+            for idx, (noisy_b, clean_b, fname_tuple) in enumerate(test_loader):
+                step = idx + 1
                 fname = fname_tuple[0]
                 noisy_b, clean_b = noisy_b.to(self.device), clean_b.to(self.device)
+
+                if step % log_interval == 0 or step == total_test_samples:
+                    logger.info(
+                        f"  [Inference {step:04d}/{total_test_samples:04d}] Processed {fname}"
+                    )
 
                 if self.use_amp:
                     with torch.autocast(device_type="cuda", dtype=torch.float16):
