@@ -1,7 +1,7 @@
 # Pipeline Configuration for SBF-SEM Connectomics Denoising
 
 experiment:
-  name: "01_noise_parametric"
+  name: "02_loss_enhanced"
   output_dir: "/Users/ganctoma/SW/sort/N2V/run_42"
 
 data:
