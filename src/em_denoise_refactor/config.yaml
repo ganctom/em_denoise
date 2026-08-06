@@ -49,13 +49,17 @@ training:
   device: "mps"              # Hardware backend: "mps", "cuda", or "cpu"
 
 loss:
-  loss_type: "enhanced"            # Options: "enhanced", "dynamic", or "composite"
+  # Loss Function Selection:
+  #   - "enhanced" : Charbonnier + SSIM + Laplacian (vesicle curvature) + FFL (high frequencies) + ESPI (top 10% edges)
+  #   - "dynamic"  : Auto-balanced loss (Charbonnier + FFL + Anscombe VST + Laplacian) with learnable uncertainty weights
+  #   - "composite": Legacy MSE + Sobel edge + SSIM
+  loss_type: "enhanced"
   # Weights for "enhanced" loss mode:
-  charbonnier_weight: 0.3
-  ssim_weight: 0.3
-  laplacian_weight: 0.15
-  ffl_weight: 0.15
-  espi_weight: 0.1
+  charbonnier_weight: 0.3          # Sharpness-preserving pseudo-Huber loss
+  ssim_weight: 0.3                 # Structural similarity index
+  laplacian_weight: 0.15           # 2nd-order derivative for vesicle/organelle curvature
+  ffl_weight: 0.15                 # Focal Frequency Loss for fine spatial textures
+  espi_weight: 0.1                 # Edge Preservation Index targeting strong membranes (top 10%)
   # Weights for legacy "composite" loss mode:
   mse_weight: 0.2
   edge_weight: 0.3
