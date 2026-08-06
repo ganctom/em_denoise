@@ -5,3 +5,7 @@ tensorboard --logdir=/Users/ganctoma/SW/sort/N2V/run_22/experiments/03_ep_10_lr_
 python run_inference.py --config config.yaml
 
 uv run src/em_denoise/execution/run_experiment.py --config src/em_denoise/execution/config.yaml
+
+uv run execution/convert_folder_to_lmdb.py \
+  -i /Users/ganctoma/SW/sort/N2V/run_26/supervised_sandbox \
+  -o /Users/ganctoma/SW/sort/N2V/run_41/patch_store.lmdb

@@ -1,8 +1,8 @@
 # Pipeline Configuration for SBF-SEM Connectomics Denoising
 
 experiment:
-  name: "07_sigma_0.5"
-  output_dir: "/Users/ganctoma/SW/sort/N2V/run_41"
+  name: "00_noise_lvl_2.0"
+  output_dir: "/Users/ganctoma/SW/sort/N2V/run_42"
 
 data:
   sbem_root: "/Volumes/tachyon/groups/scratch/gmicro_sem/gfriedri/_EM_acquisitions/20260201_RoLi_F1/"
@@ -23,8 +23,8 @@ extraction:
   patches_per_tile: 2        # Maximum patches cropped per source .tif tile
   tiles_per_section: 4       # Number of tiles sampled per section in ROI
   z_depth_per_roi: 1         # Z-depth span for ROI sampling (leave 1 for 2D-denoising methods)
-  target_train_patches: 5000  # Number of patches for training set
-  target_val_patches: 500     # Number of patches for validation set
+  target_train_patches: 500  # Number of patches for training set
+  target_val_patches: 50     # Number of patches for validation set
   target_test_patches: 20    # Number of patches for testing set
 
 noise:
@@ -34,8 +34,8 @@ noise:
   calibration_samples: 1000         # Number of tiles to sample for noise calibration
   calibration_workers: 16           # Number of parallel worker threads for calibration I/O
   filter_type: "gaussian"          # "gaussian" or "median" for pseudo-clean estimation
-  gaussian_sigma: 0.5              # Sigma for gaussian filter (default: 0.7)
-  noise_amplification: 1.5         # Scale empirical noise deviation: 1.0=exact, 2.0=2x stronger, 0.5=weaker
+  gaussian_sigma: 2.0              # Sigma for gaussian filter (default: 0.7)
+  noise_amplification: 2.0         # Scale empirical noise deviation: 1.0=exact, 2.0=2x stronger, 0.5=weaker
   photon_scale: [0.02, 0.08]       # Simulated photon count scale (can be float or [min, max] list)
   read_std: [5.0, 15.0]            # Detector readout noise std in uint8 space (can be float or [min, max] list)
   gain_variance: [0.01, 0.05]      # Per-pixel detector gain variation (can be float or [min, max] list)
