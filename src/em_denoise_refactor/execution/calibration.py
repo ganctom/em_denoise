@@ -12,17 +12,27 @@ from em_denoise_refactor.config import PipelineConfig
 
 def run_calibration(
     config: PipelineConfig,
-    num_samples: int = 100,
+    num_samples: Optional[int] = None,
     patch_size: int = 3,
     filter_type: Optional[str] = None,
     gaussian_sigma: Optional[float] = None,
-    num_workers: int = 8,
+    num_workers: Optional[int] = None,
     epsilon: float = 1e-6,
 ) -> Path:
     sbem_root = config.data.sbem_root
     all_tiffs = []
 
-    # Determine filter settings (CLI overrides config)
+    # Determine settings (arguments override config)
+    n_samples = (
+        num_samples
+        if num_samples is not None
+        else getattr(config.noise, "calibration_samples", 100)
+    )
+    n_workers = (
+        num_workers
+        if num_workers is not None
+        else getattr(config.noise, "calibration_workers", 8)
+    )
     f_type = filter_type or getattr(config.noise, "filter_type", "gaussian")
     g_sigma = (
         gaussian_sigma
@@ -56,7 +66,7 @@ def run_calibration(
                 ORDER BY RANDOM() 
                 LIMIT ?
                 """,
-                (config.data.first_sec, config.data.last_sec, num_samples * 3),
+                (config.data.first_sec, config.data.last_sec, n_samples * 3),
             )
             rows = cur.fetchall()
             conn.close()
@@ -69,7 +79,7 @@ def run_calibration(
 
     # 2. Fallback to lazy filesystem search with early termination (avoids stalling SMB mounts)
     if not all_tiffs and sbem_root.exists():
-        target_limit = num_samples * 3
+        target_limit = n_samples * 3
         for p in sbem_root.rglob("*.tif"):
             all_tiffs.append(p)
             if len(all_tiffs) >= target_limit:
@@ -90,7 +100,9 @@ def run_calibration(
         if f_type == "gaussian"
         else f"filter={f_type} (size={patch_size})"
     )
-    print(f"Calibrating noise model using {filter_info} (workers={num_workers})...")
+    print(
+        f"Calibrating noise model using {filter_info} (samples={n_samples}, workers={n_workers})..."
+    )
 
     def _process_tiff_file(path: Path) -> Optional[np.ndarray]:
         try:
@@ -109,14 +121,14 @@ def run_calibration(
 
     if all_tiffs:
         print(
-            f"Found {len(all_tiffs)} candidate .tif tiles in sections {config.data.first_sec}–{config.data.last_sec}. Randomly sampling {min(num_samples, len(all_tiffs))}..."
+            f"Found {len(all_tiffs)} candidate .tif tiles in sections {config.data.first_sec}–{config.data.last_sec}. Randomly sampling {min(n_samples, len(all_tiffs))}..."
         )
-        sampled_tiffs = random.sample(all_tiffs, min(num_samples, len(all_tiffs)))
+        sampled_tiffs = random.sample(all_tiffs, min(n_samples, len(all_tiffs)))
         sources_used = [str(p) for p in sampled_tiffs]
 
         from concurrent.futures import ThreadPoolExecutor
 
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
             results = list(
                 tqdm(
                     executor.map(_process_tiff_file, sampled_tiffs),
@@ -142,7 +154,7 @@ def run_calibration(
         if not all_keys:
             raise ValueError(f"LMDB store at {lmdb_store_path} is empty.")
 
-        sampled_keys = random.sample(all_keys, min(num_samples, len(all_keys)))
+        sampled_keys = random.sample(all_keys, min(n_samples, len(all_keys)))
         sources_used = [f"lmdb://{k.decode('utf-8')}" for k in sampled_keys]
         with env.begin(write=False) as txn:
             for key in tqdm(sampled_keys, desc="Calibrating Noise Model from LMDB"):
@@ -195,21 +207,21 @@ if __name__ == "__main__":
     parser.add_argument(
         "--samples",
         type=int,
-        default=100,
-        help="Number of files to sample for calibration",
+        default=None,
+        help="Number of files to sample for calibration (default: from config)",
     )
     parser.add_argument(
         "--filter",
         type=str,
         default=None,
         choices=["gaussian", "median"],
-        help="Filter type for pseudo-clean reference (default: from config or gaussian)",
+        help="Filter type for pseudo-clean reference (default: from config)",
     )
     parser.add_argument(
         "--sigma",
         type=float,
         default=None,
-        help="Gaussian sigma for pseudo-clean reference (default: 0.7)",
+        help="Gaussian sigma for pseudo-clean reference (default: from config)",
     )
     parser.add_argument(
         "--patch_size",
@@ -220,8 +232,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--workers",
         type=int,
-        default=8,
-        help="Number of parallel worker threads for I/O and filtering (default: 8)",
+        default=None,
+        help="Number of parallel worker threads for I/O and filtering (default: from config)",
     )
     args = parser.parse_args()
 

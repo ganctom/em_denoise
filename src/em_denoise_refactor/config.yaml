@@ -1,7 +1,7 @@
 # Pipeline Configuration for SBF-SEM Connectomics Denoising
 
 experiment:
-  name: "00_ep10_mse_ssim_edge_020305_parametric_noise"
+  name: "01_ep10_mse_ssim_edge_020305_gauss_2.0"
   output_dir: "/Users/ganctoma/SW/sort/N2V/run_41"
 
 data:
@@ -31,8 +31,10 @@ noise:
   synthesizer_type: "empirical"   # "parametric" or "empirical"
   empirical_model_path: "noise_model.npy" # Path to 2D histogram CDF for empirical noise
   calibrate_on_the_fly: true       # If true, runs calibration over sbem_root if empirical model doesn't exist
+  calibration_samples: 100         # Number of tiles to sample for noise calibration
+  calibration_workers: 8           # Number of parallel worker threads for calibration I/O
   filter_type: "gaussian"          # "gaussian" or "median" for pseudo-clean estimation
-  gaussian_sigma: 0.7              # Sigma for gaussian filter (default: 0.7)
+  gaussian_sigma: 2.0              # Sigma for gaussian filter (default: 0.7)
   photon_scale: [0.02, 0.08]       # Simulated photon count scale (can be float or [min, max] list)
   read_std: [5.0, 15.0]            # Detector readout noise std in uint8 space (can be float or [min, max] list)
   gain_variance: [0.01, 0.05]      # Per-pixel detector gain variation (can be float or [min, max] list)
