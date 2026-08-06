@@ -10,6 +10,7 @@ and evaluates performance metrics (MSE, PSNR, SSIM) on test sets.
 
 import argparse
 import gc
+import json
 import logging
 import math
 import time
@@ -1142,42 +1143,64 @@ def main() -> None:
     evaluator = DenoisingEvaluator(model=model, device=device, use_amp=use_amp)
     results = evaluator.evaluate_test_set(test_loader, test_denoised_dir)
 
-    logger.info("==================================================")
-    logger.info(
-        f" INFERENCE & DENOISING PERFORMANCE SUMMARY (Loss Mode: {loss_type.upper()})"
-    )
-    logger.info("==================================================")
-    logger.info(
-        f" Mean MSE         : Noisy = {results['noisy_mse']:.6f}  ==>  Denoised = {results['denoised_mse']:.6f} (Lower is better)"
-    )
-    logger.info(
-        f" Mean PSNR        : Noisy = {results['noisy_psnr']:.2f} dB ==>  Denoised = {results['denoised_psnr']:.2f} dB (Higher is better)"
-    )
-    logger.info(
-        f" Mean SSIM        : Noisy = {results['noisy_ssim']:.4f}    ==>  Denoised = {results['denoised_ssim']:.4f}    (Higher is better)"
-    )
+    summary_lines = [
+        "==================================================",
+        f" INFERENCE & DENOISING PERFORMANCE SUMMARY (Loss Mode: {loss_type.upper()})",
+        "==================================================",
+        f" Model Architecture : {model_type}",
+        f" Run Name           : {exp_name}",
+        "--------------------------------------------------",
+        f" Mean MSE         : Noisy = {results['noisy_mse']:.6f}  ==>  Denoised = {results['denoised_mse']:.6f} (Lower is better)",
+        f" Mean PSNR        : Noisy = {results['noisy_psnr']:.2f} dB ==>  Denoised = {results['denoised_psnr']:.2f} dB (Higher is better)",
+        f" Mean SSIM        : Noisy = {results['noisy_ssim']:.4f}    ==>  Denoised = {results['denoised_ssim']:.4f}    (Higher is better)",
+    ]
     if "noisy_charbonnier" in results:
-        logger.info(
+        summary_lines.append(
             f" Mean Charbonnier : Noisy = {results['noisy_charbonnier']:.6f}  ==>  Denoised = {results['denoised_charbonnier']:.6f} (Lower is better)"
         )
     if "noisy_laplacian" in results:
-        logger.info(
+        summary_lines.append(
             f" Mean Laplacian   : Noisy = {results['noisy_laplacian']:.6f}  ==>  Denoised = {results['denoised_laplacian']:.6f} (Lower is better)"
         )
     if "noisy_ffl" in results:
-        logger.info(
+        summary_lines.append(
             f" Mean FFL         : Noisy = {results['noisy_ffl']:.6f}  ==>  Denoised = {results['denoised_ffl']:.6f} (Lower is better)"
         )
     if "noisy_espi" in results:
-        logger.info(
+        summary_lines.append(
             f" Mean ESPI        : Noisy = {results['noisy_espi']:.6f}  ==>  Denoised = {results['denoised_espi']:.6f} (Lower is better)"
         )
     if "noisy_edge" in results and loss_type == "composite":
-        logger.info(
+        summary_lines.append(
             f" Mean Sobel Edge  : Noisy = {results['noisy_edge']:.6f}  ==>  Denoised = {results['denoised_edge']:.6f} (Lower is better)"
         )
-    logger.info("==================================================")
+    summary_lines.append("==================================================")
+
+    for line in summary_lines:
+        logger.info(line)
+
+    summary_txt = "\n".join(summary_lines) + "\n"
+
+    # Save evaluation_summary.txt to run_dir and test_denoised_dir
+    (run_dir / "evaluation_summary.txt").write_text(summary_txt, encoding="utf-8")
+    (test_denoised_dir / "evaluation_summary.txt").write_text(
+        summary_txt, encoding="utf-8"
+    )
+
+    # Save summary.json to run_dir
+    summary_dict = {
+        "experiment_name": exp_name,
+        "model_type": model_type,
+        "loss_type": loss_type,
+        "metrics": results,
+    }
+    with open(run_dir / "summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary_dict, f, indent=2)
+
     logger.info(f"✓ Denoised test images saved to: {test_denoised_dir}")
+    logger.info(
+        f"✓ Performance summary saved to: {run_dir / 'evaluation_summary.txt'} and {run_dir / 'summary.json'}"
+    )
 
 
 if __name__ == "__main__":
