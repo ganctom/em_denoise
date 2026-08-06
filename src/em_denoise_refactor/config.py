@@ -58,6 +58,8 @@ class NoiseConfig:
     synthesizer_type: str = "parametric"  # "parametric" or "empirical"
     empirical_model_path: str = "noise_model.npy"
     calibrate_on_the_fly: bool = False
+    filter_type: str = "gaussian"  # "gaussian" or "median" for pseudo-clean estimation
+    gaussian_sigma: float = 0.7  # Sigma for gaussian filter
     photon_scale: float | list[float] = field(default_factory=lambda: [0.02, 0.08])
     read_std: float | list[float] = field(default_factory=lambda: [5.0, 15.0])
     gain_variance: float | list[float] = field(default_factory=lambda: [0.01, 0.05])

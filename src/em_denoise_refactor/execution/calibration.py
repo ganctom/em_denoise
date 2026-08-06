@@ -1,10 +1,11 @@
 import argparse
 from pathlib import Path
 import random
+from typing import Optional
 import numpy as np
 import tifffile
 from tqdm import tqdm
-from scipy.ndimage import median_filter
+from scipy.ndimage import gaussian_filter, median_filter
 
 from em_denoise_refactor.config import PipelineConfig
 
@@ -13,10 +14,26 @@ def run_calibration(
     config: PipelineConfig,
     num_samples: int = 100,
     patch_size: int = 3,
+    filter_type: Optional[str] = None,
+    gaussian_sigma: Optional[float] = None,
     epsilon: float = 1e-6,
 ) -> Path:
     sbem_root = config.data.sbem_root
     all_tiffs = []
+
+    # Determine filter settings (CLI overrides config)
+    f_type = filter_type or getattr(config.noise, "filter_type", "gaussian")
+    g_sigma = (
+        gaussian_sigma
+        if gaussian_sigma is not None
+        else getattr(config.noise, "gaussian_sigma", 0.7)
+    )
+
+    def apply_filter(img: np.ndarray) -> np.ndarray:
+        if f_type == "gaussian":
+            return gaussian_filter(img, sigma=g_sigma)
+        else:
+            return median_filter(img, size=patch_size)
 
     # 1. Try querying tile filepaths directly from SQLite metadata store if available
     grid_str = f"g{config.data.grid_num:04d}"
@@ -67,6 +84,13 @@ def run_calibration(
     lmdb_store_path = config.experiment.output_dir / "patch_store.lmdb"
 
     sources_used = []
+    filter_info = (
+        f"filter={f_type} (sigma={g_sigma})"
+        if f_type == "gaussian"
+        else f"filter={f_type} (size={patch_size})"
+    )
+    print(f"Calibrating noise model using {filter_info}...")
+
     if all_tiffs:
         print(
             f"Found {len(all_tiffs)} candidate .tif tiles in sections {config.data.first_sec}–{config.data.last_sec}. Randomly sampling {min(num_samples, len(all_tiffs))}..."
@@ -76,7 +100,7 @@ def run_calibration(
         for path in tqdm(sampled_tiffs, desc="Calibrating Noise Model from TIFFs"):
             try:
                 noisy_img = tifffile.imread(path).astype(np.float32)
-                pseudo_clean = median_filter(noisy_img, size=patch_size)
+                pseudo_clean = apply_filter(noisy_img)
 
                 pseudo_clean = np.clip(np.round(pseudo_clean), 0, 255).astype(np.int32)
                 noisy_img = np.clip(np.round(noisy_img), 0, 255).astype(np.int32)
@@ -110,7 +134,7 @@ def run_calibration(
                     .reshape(side_len, side_len)
                     .astype(np.float32)
                 )
-                pseudo_clean = median_filter(noisy_img, size=patch_size)
+                pseudo_clean = apply_filter(noisy_img)
 
                 pseudo_clean = np.clip(np.round(pseudo_clean), 0, 255).astype(np.int32)
                 noisy_img = np.clip(np.round(noisy_img), 0, 255).astype(np.int32)
@@ -135,6 +159,7 @@ def run_calibration(
 
     sources_path = out_path.parent / f"{out_path.stem}_sources.txt"
     with open(sources_path, "w", encoding="utf-8") as f:
+        f.write(f"# Filter: {filter_info}\n")
         f.write("\n".join(sources_used))
     print(f"Recorded {len(sources_used)} source items to {sources_path}")
 
@@ -155,12 +180,34 @@ if __name__ == "__main__":
         help="Number of files to sample for calibration",
     )
     parser.add_argument(
-        "--patch_size", type=int, default=3, help="Median filter patch size"
+        "--filter",
+        type=str,
+        default=None,
+        choices=["gaussian", "median"],
+        help="Filter type for pseudo-clean reference (default: from config or gaussian)",
+    )
+    parser.add_argument(
+        "--sigma",
+        type=float,
+        default=None,
+        help="Gaussian sigma for pseudo-clean reference (default: 0.7)",
+    )
+    parser.add_argument(
+        "--patch_size",
+        type=int,
+        default=3,
+        help="Median filter patch size (if filter=median)",
     )
     args = parser.parse_args()
 
     print(f"Loading config from {args.config}...")
     cfg = PipelineConfig.from_yaml(args.config)
 
-    out = run_calibration(cfg, num_samples=args.samples, patch_size=args.patch_size)
+    out = run_calibration(
+        cfg,
+        num_samples=args.samples,
+        patch_size=args.patch_size,
+        filter_type=args.filter,
+        gaussian_sigma=args.sigma,
+    )
     print(f"Calibration complete. Empirical model saved to {out}")
