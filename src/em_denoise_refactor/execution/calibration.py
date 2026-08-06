@@ -16,6 +16,7 @@ def run_calibration(
     patch_size: int = 3,
     filter_type: Optional[str] = None,
     gaussian_sigma: Optional[float] = None,
+    num_workers: int = 8,
     epsilon: float = 1e-6,
 ) -> Path:
     sbem_root = config.data.sbem_root
@@ -89,7 +90,22 @@ def run_calibration(
         if f_type == "gaussian"
         else f"filter={f_type} (size={patch_size})"
     )
-    print(f"Calibrating noise model using {filter_info}...")
+    print(f"Calibrating noise model using {filter_info} (workers={num_workers})...")
+
+    def _process_tiff_file(path: Path) -> Optional[np.ndarray]:
+        try:
+            noisy_img = tifffile.imread(path).astype(np.float32)
+            pseudo_clean = apply_filter(noisy_img)
+
+            pseudo_clean = np.clip(np.round(pseudo_clean), 0, 255).astype(np.int32)
+            noisy_img = np.clip(np.round(noisy_img), 0, 255).astype(np.int32)
+
+            sub_hist = np.zeros((256, 256), dtype=np.float64)
+            np.add.at(sub_hist, (pseudo_clean, noisy_img), 1)
+            return sub_hist
+        except Exception as e:
+            print(f"Error processing {path}: {e}")
+            return None
 
     if all_tiffs:
         print(
@@ -97,18 +113,21 @@ def run_calibration(
         )
         sampled_tiffs = random.sample(all_tiffs, min(num_samples, len(all_tiffs)))
         sources_used = [str(p) for p in sampled_tiffs]
-        for path in tqdm(sampled_tiffs, desc="Calibrating Noise Model from TIFFs"):
-            try:
-                noisy_img = tifffile.imread(path).astype(np.float32)
-                pseudo_clean = apply_filter(noisy_img)
 
-                pseudo_clean = np.clip(np.round(pseudo_clean), 0, 255).astype(np.int32)
-                noisy_img = np.clip(np.round(noisy_img), 0, 255).astype(np.int32)
+        from concurrent.futures import ThreadPoolExecutor
 
-                np.add.at(hist_2d, (pseudo_clean, noisy_img), 1)
-            except Exception as e:
-                print(f"Error processing {path}: {e}")
-                continue
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            results = list(
+                tqdm(
+                    executor.map(_process_tiff_file, sampled_tiffs),
+                    total=len(sampled_tiffs),
+                    desc="Calibrating Noise Model from TIFFs",
+                )
+            )
+
+        for res in results:
+            if res is not None:
+                hist_2d += res
     elif lmdb_store_path.exists():
         import lmdb
 
@@ -198,6 +217,12 @@ if __name__ == "__main__":
         default=3,
         help="Median filter patch size (if filter=median)",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        help="Number of parallel worker threads for I/O and filtering (default: 8)",
+    )
     args = parser.parse_args()
 
     print(f"Loading config from {args.config}...")
@@ -209,5 +234,6 @@ if __name__ == "__main__":
         patch_size=args.patch_size,
         filter_type=args.filter,
         gaussian_sigma=args.sigma,
+        num_workers=args.workers,
     )
     print(f"Calibration complete. Empirical model saved to {out}")
