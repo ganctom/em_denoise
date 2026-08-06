@@ -1,8 +1,8 @@
 # Pipeline Configuration for SBF-SEM Connectomics Denoising
 
 experiment:
-  name: "ep10_mse_ssim_edge_030303"
-  output_dir: "/Users/ganctoma/SW/sort/N2V/run_39"
+  name: "04_ep10_mse_ssim_edge_020305_parametric_noise"
+  output_dir: "/Users/ganctoma/SW/sort/N2V/run_40"
 
 data:
   sbem_root: "/Volumes/tachyon/groups/scratch/gmicro_sem/gfriedri/_EM_acquisitions/20260201_RoLi_F1/"
@@ -23,31 +23,33 @@ extraction:
   patches_per_tile: 2        # Maximum patches cropped per source .tif tile
   tiles_per_section: 4       # Number of tiles sampled per section in ROI
   z_depth_per_roi: 1         # Z-depth span for ROI sampling (leave 1 for 2D-denoising methods)
-  target_train_patches: 15000  # Number of patches for training set
-  target_val_patches: 2000     # Number of patches for validation set
-  target_test_patches: 200    # Number of patches for testing set
+  target_train_patches: 150  # Number of patches for training set
+  target_val_patches: 20     # Number of patches for validation set
+  target_test_patches: 20    # Number of patches for testing set
 
 noise:
-  synthesizer_type: "parametric"  # "parametric" or "empirical"
+  synthesizer_type: "parametric"   # "parametric" or "empirical"
   empirical_model_path: "noise_model.npy" # Path to 2D histogram CDF for empirical noise
-  calibrate_on_the_fly: false  # If true, runs calibration over sbem_root if empirical model doesn't exist
+  calibrate_on_the_fly: true       # If true, runs calibration over sbem_root if empirical model doesn't exist
   photon_scale: [0.02, 0.08]       # Simulated photon count scale (can be float or [min, max] list)
   read_std: [5.0, 15.0]            # Detector readout noise std in uint8 space (can be float or [min, max] list)
   gain_variance: [0.01, 0.05]      # Per-pixel detector gain variation (can be float or [min, max] list)
-  streak_probability: [0.05, 0.2]  # Beam charging raster anomaly probability (can be float or [min, max] list)
+  streak_probability: [0.0, 0.0]   # Beam charging raster anomaly probability (can be float or [min, max] list)
 
 training:
   batch_size: 16
   epochs: 10
   learning_rate: 0.0002
+  cache_in_ram: false         # If false, dynamic noise synthesis is sampled fresh on every epoch
   device: "mps"              # Hardware backend: "mps", "cuda", or "cpu"
 
 loss:
-  mse_weight: 0.3
+  mse_weight: 0.2
   edge_weight: 0.3
-  ssim_weight: 0.3
+  ssim_weight: 0.5
 
 inference:
-  custom_input_dir: "/Users/ganctoma/SW/sort/N2V/run_30/raw_patches/test_raw"     # Path to a custom directory of .tif images to run inference on (or null)
+  # custom_input_dir: "/Users/ganctoma/SW/sort/N2V/run_30/raw_patches/test_raw"     # Path to a custom directory of .tif images to run inference on (or null)
+  custom_input_dir: "/Users/ganctoma/SW/sort/N2V/run_39/test_raw"     # Path to a custom directory of .tif images to run inference on (or null)
   # custom_input_dir: null     # Path to a custom directory of .tif images to run inference on (or null)
 

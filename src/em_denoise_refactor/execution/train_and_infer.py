@@ -31,6 +31,7 @@ from em_denoise_refactor.data.dataset import (
 from em_denoise_refactor.execution.calibration import run_calibration
 from em_denoise_refactor.models.connectomics import ConnectomicsDenoisingNet
 from em_denoise_refactor.models.loss import CompositeDenoisingLoss
+from em_denoise_refactor.data.interfaces import NoiseSynthesizer
 
 logger = logging.getLogger("train_and_infer")
 
@@ -223,7 +224,7 @@ class LMDBPatchDataset(Dataset):
         self,
         lmdb_path: Path | str,
         split: str = "train",
-        noise_injector: Optional[SBFSEMNoiseSynthesizer] = None,
+        noise_injector: Optional[NoiseSynthesizer] = None,
         cache_in_ram: bool = True,
         augment: bool = False,
     ) -> None:
@@ -733,14 +734,14 @@ def main() -> None:
                 lmdb_store_path,
                 split="train",
                 noise_injector=noise_injector,
-                cache_in_ram=True,
+                cache_in_ram=cfg.training.cache_in_ram,
                 augment=True,
             )
             val_dataset = LMDBPatchDataset(
                 lmdb_store_path,
                 split="val",
                 noise_injector=noise_injector,
-                cache_in_ram=True,
+                cache_in_ram=cfg.training.cache_in_ram,
                 augment=False,
             )
         else:
@@ -900,7 +901,7 @@ def main() -> None:
             lmdb_store_path,
             split="test",
             noise_injector=noise_injector,
-            cache_in_ram=True,
+            cache_in_ram=cfg.training.cache_in_ram,
             augment=False,
         )
     else:

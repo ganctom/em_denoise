@@ -71,6 +71,7 @@ class TrainingConfig:
     batch_size: int = 64
     epochs: int = 100
     learning_rate: float = 0.0001
+    cache_in_ram: bool = False
     device: str = "mps"
 
 

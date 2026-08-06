@@ -16,32 +16,68 @@ def run_calibration(
     epsilon: float = 1e-6,
 ) -> Path:
     sbem_root = config.data.sbem_root
-
-    # print(f"Searching for .tif files in {sbem_root}...")
-    all_tiffs = list(sbem_root.rglob("*.tif"))
-    if not all_tiffs:
-        all_tiffs = list(sbem_root.rglob("*.tiff"))
-
-    if not all_tiffs:
-        raise ValueError(f"No .tif files found in {sbem_root}")
-
-    # print(f"Found {len(all_tiffs)} files. Sampling {min(num_samples, len(all_tiffs))}...")
-    sampled_tiffs = random.sample(all_tiffs, min(num_samples, len(all_tiffs)))
+    all_tiffs = []
+    if sbem_root.exists():
+        all_tiffs = list(sbem_root.rglob("*.tif"))
+        if not all_tiffs:
+            all_tiffs = list(sbem_root.rglob("*.tiff"))
 
     hist_2d = np.zeros((256, 256), dtype=np.float64)
 
-    for path in tqdm(sampled_tiffs, desc="Calibrating Noise Model"):
-        try:
-            noisy_img = tifffile.imread(path).astype(np.float32)
-            pseudo_clean = median_filter(noisy_img, size=patch_size)
+    lmdb_store_path = config.experiment.output_dir / "patch_store.lmdb"
 
-            pseudo_clean = np.clip(np.round(pseudo_clean), 0, 255).astype(np.int32)
-            noisy_img = np.clip(np.round(noisy_img), 0, 255).astype(np.int32)
+    if all_tiffs:
+        print(
+            f"Found {len(all_tiffs)} .tif files in {sbem_root}. Sampling {min(num_samples, len(all_tiffs))}..."
+        )
+        sampled_tiffs = random.sample(all_tiffs, min(num_samples, len(all_tiffs)))
+        for path in tqdm(sampled_tiffs, desc="Calibrating Noise Model from TIFFs"):
+            try:
+                noisy_img = tifffile.imread(path).astype(np.float32)
+                pseudo_clean = median_filter(noisy_img, size=patch_size)
 
-            np.add.at(hist_2d, (pseudo_clean, noisy_img), 1)
-        except Exception as e:
-            print(f"Error processing {path}: {e}")
-            continue
+                pseudo_clean = np.clip(np.round(pseudo_clean), 0, 255).astype(np.int32)
+                noisy_img = np.clip(np.round(noisy_img), 0, 255).astype(np.int32)
+
+                np.add.at(hist_2d, (pseudo_clean, noisy_img), 1)
+            except Exception as e:
+                print(f"Error processing {path}: {e}")
+                continue
+    elif lmdb_store_path.exists():
+        import lmdb
+
+        print(
+            f"No .tif files in sbem_root. Found LMDB store at {lmdb_store_path}. Sampling from LMDB..."
+        )
+        env = lmdb.open(str(lmdb_store_path), readonly=True, lock=False)
+        with env.begin(write=False) as txn:
+            cursor = txn.cursor()
+            all_keys = [k for k, _ in cursor if k != b"len"]
+
+        if not all_keys:
+            raise ValueError(f"LMDB store at {lmdb_store_path} is empty.")
+
+        sampled_keys = random.sample(all_keys, min(num_samples, len(all_keys)))
+        with env.begin(write=False) as txn:
+            for key in tqdm(sampled_keys, desc="Calibrating Noise Model from LMDB"):
+                buf = txn.get(key)
+                side_len = int(np.sqrt(len(buf)))
+                noisy_img = (
+                    np.frombuffer(buf, dtype=np.uint8)
+                    .reshape(side_len, side_len)
+                    .astype(np.float32)
+                )
+                pseudo_clean = median_filter(noisy_img, size=patch_size)
+
+                pseudo_clean = np.clip(np.round(pseudo_clean), 0, 255).astype(np.int32)
+                noisy_img = np.clip(np.round(noisy_img), 0, 255).astype(np.int32)
+
+                np.add.at(hist_2d, (pseudo_clean, noisy_img), 1)
+        env.close()
+    else:
+        raise ValueError(
+            f"No .tif files found in {sbem_root} and no LMDB patch store found at {lmdb_store_path}."
+        )
 
     hist_2d += epsilon
     row_sums = hist_2d.sum(axis=1, keepdims=True)
