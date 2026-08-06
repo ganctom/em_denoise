@@ -30,7 +30,11 @@ from em_denoise_refactor.data.dataset import (
 )
 from em_denoise_refactor.execution.calibration import run_calibration
 from em_denoise_refactor.models.connectomics import ConnectomicsDenoisingNet
-from em_denoise_refactor.models.loss import CompositeDenoisingLoss
+from em_denoise_refactor.models.loss import (
+    CompositeDenoisingLoss,
+    EnhancedCompositeLoss,
+    DynamicEMLoss,
+)
 from em_denoise_refactor.data.interfaces import NoiseSynthesizer
 
 logger = logging.getLogger("train_and_infer")
@@ -866,12 +870,39 @@ def main() -> None:
     model = ConnectomicsDenoisingNet(in_channels=1, out_channels=1, base_dim=32).to(
         device
     )
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-    criterion = CompositeDenoisingLoss(
-        mse_weight=cfg.loss.mse_weight if cfg.loss else 1.0,
-        edge_weight=cfg.loss.edge_weight if cfg.loss else 0.2,
-        ssim_weight=cfg.loss.ssim_weight if cfg.loss else 0.1,
-    ).to(device)
+    loss_type = getattr(cfg.loss, "loss_type", "composite").lower()
+    if loss_type == "dynamic":
+        criterion = DynamicEMLoss(channels=1).to(device)
+        logger.info(
+            "Initialized DynamicEMLoss (learnable homoscedastic uncertainty weighting)"
+        )
+    elif loss_type == "enhanced":
+        criterion = EnhancedCompositeLoss(
+            charbonnier_weight=getattr(cfg.loss, "charbonnier_weight", 0.3),
+            ssim_weight=getattr(cfg.loss, "ssim_weight", 0.3),
+            laplacian_weight=getattr(cfg.loss, "laplacian_weight", 0.15),
+            ffl_weight=getattr(cfg.loss, "ffl_weight", 0.15),
+            espi_weight=getattr(cfg.loss, "espi_weight", 0.1),
+            edge_weight=getattr(cfg.loss, "edge_weight", 0.0),
+        ).to(device)
+        logger.info(
+            "Initialized EnhancedCompositeLoss (Charbonnier + SSIM + Laplacian + FFL + ESPI)"
+        )
+    else:
+        criterion = CompositeDenoisingLoss(
+            mse_weight=cfg.loss.mse_weight if cfg.loss else 1.0,
+            edge_weight=cfg.loss.edge_weight if cfg.loss else 0.2,
+            ssim_weight=cfg.loss.ssim_weight if cfg.loss else 0.1,
+        ).to(device)
+        logger.info("Initialized CompositeDenoisingLoss (MSE + Sobel + SSIM)")
+
+    trainable_params = list(model.parameters())
+    if hasattr(criterion, "parameters"):
+        crit_params = list(criterion.parameters())
+        if crit_params:
+            trainable_params += crit_params
+
+    optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate)
 
     log_dir = run_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)

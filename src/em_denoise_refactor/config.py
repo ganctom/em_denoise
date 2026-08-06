@@ -95,9 +95,16 @@ class InferenceConfig:
 
 @dataclass
 class LossConfig:
+    loss_type: str = "composite"  # "composite" (legacy), "enhanced", or "dynamic"
+    # Legacy composite weights (used when loss_type="composite")
     mse_weight: float = 1.0
     edge_weight: float = 0.2
     ssim_weight: float = 0.1
+    # Enhanced composite weights (used when loss_type="enhanced")
+    charbonnier_weight: float = 0.3
+    laplacian_weight: float = 0.15
+    ffl_weight: float = 0.15
+    espi_weight: float = 0.1
 
 
 @dataclass
