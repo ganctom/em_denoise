@@ -1,7 +1,7 @@
 # Pipeline Configuration for SBF-SEM Connectomics Denoising
 
 experiment:
-  name: "00_noise_lvl_2.0"
+  name: "01_noise_parametric"
   output_dir: "/Users/ganctoma/SW/sort/N2V/run_42"
 
 data:
@@ -28,7 +28,7 @@ extraction:
   target_test_patches: 20    # Number of patches for testing set
 
 noise:
-  synthesizer_type: "empirical"   # "parametric" or "empirical"
+  synthesizer_type: "parametric"   # "parametric" or "empirical"
   empirical_model_path: "noise_model.npy" # Path to 2D histogram CDF for empirical noise
   calibrate_on_the_fly: true       # If true, runs calibration over sbem_root if empirical model doesn't exist
   calibration_samples: 1000         # Number of tiles to sample for noise calibration
@@ -36,9 +36,9 @@ noise:
   filter_type: "gaussian"          # "gaussian" or "median" for pseudo-clean estimation
   gaussian_sigma: 2.0              # Sigma for gaussian filter (default: 0.7)
   noise_amplification: 2.0         # Scale empirical noise deviation: 1.0=exact, 2.0=2x stronger, 0.5=weaker
-  photon_scale: [0.02, 0.08]       # Simulated photon count scale (can be float or [min, max] list)
+  photon_scale: [0.02, 0.04]       # Simulated photon count scale (can be float or [min, max] list)
   read_std: [5.0, 15.0]            # Detector readout noise std in uint8 space (can be float or [min, max] list)
-  gain_variance: [0.01, 0.05]      # Per-pixel detector gain variation (can be float or [min, max] list)
+  gain_variance: [0.01, 0.25]      # Per-pixel detector gain variation (can be float or [min, max] list)
   streak_probability: [0.0, 0.0]   # Beam charging raster anomaly probability (can be float or [min, max] list)
 
 training:
@@ -49,9 +49,16 @@ training:
   device: "mps"              # Hardware backend: "mps", "cuda", or "cpu"
 
 loss:
+  loss_type: "enhanced"            # Options: "enhanced", "dynamic", or "composite"
+  # Weights for "enhanced" loss mode:
+  charbonnier_weight: 0.3
+  ssim_weight: 0.3
+  laplacian_weight: 0.15
+  ffl_weight: 0.15
+  espi_weight: 0.1
+  # Weights for legacy "composite" loss mode:
   mse_weight: 0.2
   edge_weight: 0.3
-  ssim_weight: 0.5
 
 inference:
   # custom_input_dir: "/Users/ganctoma/SW/sort/N2V/run_30/raw_patches/test_raw"     # Path to a custom directory of .tif images to run inference on (or null)
