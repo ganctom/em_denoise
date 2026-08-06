@@ -809,6 +809,16 @@ def main() -> None:
     run_dir = output_dir / exp_name if exp_name else output_dir
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    log_file_path = run_dir / "train_and_infer.log"
+    file_formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    file_handler = logging.FileHandler(log_file_path, mode="a", encoding="utf-8")
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
+    logger.info(f"Logging training and validation outputs to file: {log_file_path}")
+
     checkpoints_dir = run_dir / "checkpoints"
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1083,6 +1093,8 @@ def main() -> None:
                     f"Ep [{epoch:02d}/{epochs:02d}] | Tr: {train_loss:.5f} | Val: {val_loss:.5f} | "
                     f"Edge: {edge:.4f} | PSNR: {val_psnr:.2f}dB | SSIM: {val_ssim:.4f}{best_str}"
                 )
+
+            file_handler.flush()
 
         logger.info(
             f"✓ Training completed in {time.time() - start_time:.2f}s. Best Val Loss: {best_val_loss:.6f}"
