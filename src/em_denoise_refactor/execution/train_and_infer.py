@@ -413,11 +413,16 @@ class DenoisingTrainer:
         self.model.train()
         total_loss = 0.0
         total_metrics: Dict[str, float] = {}
-        total_batches = len(dataloader)
-        log_interval = max(1, total_batches // 5)
 
-        for batch_idx, (noisy_b, clean_b, _) in enumerate(dataloader):
-            step = batch_idx + 1
+        pbar = tqdm(
+            enumerate(dataloader),
+            total=len(dataloader),
+            desc=f"Epoch [{epoch:02d}/{total_epochs:02d}] Train",
+            leave=False,
+            bar_format="{desc}: {percentage:3.0f}%| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}",
+        )
+
+        for batch_idx, (noisy_b, clean_b, _) in pbar:
             noisy_b, clean_b = noisy_b.to(self.device), clean_b.to(self.device)
 
             self.optimizer.zero_grad()
@@ -448,13 +453,12 @@ class DenoisingTrainer:
             if batch_idx % 10 == 0:
                 self._purge_memory()
 
-            if step % log_interval == 0 or step == total_batches:
-                msg = f"  Epoch [{epoch:02d}/{total_epochs:02d}] Step [{step:04d}/{total_batches:04d}] - Loss: {batch_loss:.5f}"
-                if "loss_charbonnier" in metrics:
-                    msg += f" | Chrb: {metrics['loss_charbonnier']:.4f}"
-                elif "loss_edge" in metrics and metrics["loss_edge"] > 0:
-                    msg += f" | Edge: {metrics['loss_edge']:.4f}"
-                logger.info(msg)
+            postfix = {"loss": f"{batch_loss:.5f}"}
+            if "loss_charbonnier" in metrics:
+                postfix["chrb"] = f"{metrics['loss_charbonnier']:.4f}"
+            elif "loss_edge" in metrics and metrics["loss_edge"] > 0:
+                postfix["edge"] = f"{metrics['loss_edge']:.4f}"
+            pbar.set_postfix(postfix)
 
         num_samples = len(dataloader.dataset)
         avg_metrics = {k: v / num_samples for k, v in total_metrics.items()}
@@ -469,8 +473,15 @@ class DenoisingTrainer:
         val_ssims: List[float] = []
         total_val_metrics: Dict[str, float] = {}
 
+        pbar = tqdm(
+            dataloader,
+            desc=f"Epoch [{epoch:02d}/{total_epochs:02d}] Val",
+            leave=False,
+            bar_format="{desc}: {percentage:3.0f}%| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+        )
+
         with torch.no_grad():
-            for noisy_b, clean_b, _ in dataloader:
+            for noisy_b, clean_b, _ in pbar:
                 noisy_b, clean_b = noisy_b.to(self.device), clean_b.to(self.device)
 
                 if self.use_amp:
@@ -577,19 +588,18 @@ class DenoisingEvaluator:
         noisy_edges, denoised_edges = [], []
 
         total_test_samples = len(test_loader.dataset)
-        log_interval = max(1, total_test_samples // 5)
-
         logger.info(f"Running inference over {total_test_samples} test samples...")
+
+        pbar = tqdm(
+            test_loader,
+            desc="Testing",
+            bar_format="{desc}: {percentage:3.0f}%| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+        )
+
         with torch.no_grad():
-            for idx, (noisy_b, clean_b, fname_tuple) in enumerate(test_loader):
-                step = idx + 1
+            for noisy_b, clean_b, fname_tuple in pbar:
                 fname = fname_tuple[0]
                 noisy_b, clean_b = noisy_b.to(self.device), clean_b.to(self.device)
-
-                if step % log_interval == 0 or step == total_test_samples:
-                    logger.info(
-                        f"  [Inference {step:04d}/{total_test_samples:04d}] Processed {fname}"
-                    )
 
                 if self.use_amp:
                     with torch.autocast(device_type="cuda", dtype=torch.float16):
