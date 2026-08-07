@@ -39,6 +39,7 @@ noise:
   photon_scale:   [0.04, 0.06]      #  Simulated photon count scale (can be float or [min, max] list)
   read_std: 8.0 #[5.0, 15.0]             Detector readout noise std in uint8 space (can be float or [min, max] list)
   gain_variance: 0.02 # [0.01, 0.25]       Per-pixel detector gain variation (can be float or [min, max] list)
+  streak_probability: 0.0          # Set to 0.0 to disable horizontal raster charging streak injection
   inverted_bse: true              # True if membranes appear dark (un-inverts to physical BSE space for Poisson sampling)
 model:
   # Model Architecture Selection:

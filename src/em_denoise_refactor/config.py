@@ -68,9 +68,7 @@ class NoiseConfig:
     photon_scale: float | list[float] = field(default_factory=lambda: [0.02, 0.08])
     read_std: float | list[float] = field(default_factory=lambda: [5.0, 15.0])
     gain_variance: float | list[float] = field(default_factory=lambda: [0.01, 0.05])
-    streak_probability: float | list[float] = field(
-        default_factory=lambda: [0.05, 0.20]
-    )
+    streak_probability: float | list[float] = 0.0
     inverted_bse: bool = True  # True if membranes are dark (inverted BSE mode)
 
 

@@ -140,7 +140,7 @@ class SBFSEMNoiseSynthesizer(NoiseSynthesizer):
         photon_scale: Union[float, Tuple[float, float], List[float]] = 0.04,
         read_std: Union[float, Tuple[float, float], List[float]] = 8.0,
         gain_variance: Union[float, Tuple[float, float], List[float]] = 0.02,
-        streak_probability: Union[float, Tuple[float, float], List[float]] = 0.15,
+        streak_probability: Union[float, Tuple[float, float], List[float]] = 0.0,
         inverted_bse: bool = True,
     ) -> None:
         self.photon_scale = photon_scale
@@ -206,8 +206,8 @@ class SBFSEMNoiseSynthesizer(NoiseSynthesizer):
         # 3. Additive Gaussian read-out noise (in uint8 scale)
         noisy_raw = noisy_raw + torch.randn_like(noisy_raw) * read_std
 
-        # 4. Vectorized raster streak anomalies
-        if torch.rand(1).item() < streak_p:
+        # 4. Vectorized raster streak anomalies (only if streak_p > 0)
+        if streak_p > 0 and torch.rand(1).item() < streak_p:
             h, w = clean_tensor.shape[-2:]
             num_streaks = int(torch.randint(1, 4, (1,)).item())
             row_indices = torch.randint(0, h, (num_streaks,), device=noisy_raw.device)
