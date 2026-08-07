@@ -605,6 +605,43 @@ class DenoisingEvaluator:
         self.espi_fn = ESPILoss(channels=1).to(device)
         self.sobel_fn = SobelEdgeLoss().to(device)
 
+    def _denoise_tiled(
+        self, x: torch.Tensor, patch_size: int = 128, num_samples: int = 5
+    ) -> torch.Tensor:
+        if hasattr(self.model, "crop_size"):
+            patch_size = self.model.crop_size[0]
+
+        # Use 50% overlap for smooth blending
+        stride = patch_size // 2
+        B, C, H, W = x.shape
+        output = torch.zeros_like(x)
+        weight_sum = torch.zeros_like(x)
+
+        # 2D Hann window for smooth cosine blending across tile boundaries
+        w1d = torch.hann_window(patch_size, periodic=False, device=x.device)
+        window = torch.outer(w1d, w1d).clamp(min=1e-4).unsqueeze(0).unsqueeze(0)
+
+        for y in range(0, H, stride):
+            for x_coord in range(0, W, stride):
+                y1 = min(y, H - patch_size)
+                x1 = min(x_coord, W - patch_size)
+                y2 = y1 + patch_size
+                x2 = x1 + patch_size
+                patch = x[:, :, y1:y2, x1:x2]
+
+                if hasattr(self.model, "denoise"):
+                    sample_preds = [
+                        self.model.denoise(patch) for _ in range(num_samples)
+                    ]
+                    pred_patch = torch.stack(sample_preds, dim=0).mean(dim=0)
+                else:
+                    pred_patch = self.model(patch)
+
+                output[:, :, y1:y2, x1:x2] += pred_patch * window
+                weight_sum[:, :, y1:y2, x1:x2] += window
+
+        return output / weight_sum
+
     def evaluate_test_set(
         self, test_loader: DataLoader, output_denoised_dir: Path
     ) -> Dict[str, float]:
@@ -634,7 +671,9 @@ class DenoisingEvaluator:
                 fname = fname_tuple[0]
                 noisy_b, clean_b = noisy_b.to(self.device), clean_b.to(self.device)
 
-                if self.use_amp:
+                if hasattr(self.model, "ar_decoder"):
+                    pred_b = self._denoise_tiled(noisy_b)
+                elif self.use_amp:
                     with torch.autocast(device_type="cuda", dtype=torch.float16):
                         pred_b = self.model(noisy_b)
                 else:
