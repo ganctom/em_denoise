@@ -118,11 +118,15 @@ class PatchFolderDataset(Dataset):
         if not self.filenames:
             raise FileNotFoundError(f"No .tif patches found in {self.clean_dir}")
 
+        self.is_val_or_test = any(
+            x in str(self.clean_dir).lower() for x in ["val", "test"]
+        )
         self.cached_clean_samples: List[Tuple[torch.Tensor, str]] = []
-        self.cached_noisy_samples: List[torch.Tensor] = []
-        if self.cache_in_ram:
+        self.fixed_noisy_samples: List[torch.Tensor] = []
+
+        if self.cache_in_ram or self.is_val_or_test:
             logger.info(
-                f"Caching {len(self.filenames)} clean TIFF patches from {self.clean_dir.parent.name} into RAM..."
+                f"Caching {len(self.filenames)} TIFF patches from {self.clean_dir.parent.name} into RAM..."
             )
             for fname in tqdm(
                 self.filenames, desc=f"RAM Caching ({self.clean_dir.parent.name})"
@@ -132,13 +136,20 @@ class PatchFolderDataset(Dataset):
                 clean_tensor = torch.from_numpy(clean_img).unsqueeze(0)
                 self.cached_clean_samples.append((clean_tensor, fname))
 
-                if self.noise_injector is None and self.noisy_dir is not None:
-                    noisy_path = self.noisy_dir / fname
-                    noisy_img = (
-                        tifffile.imread(str(noisy_path)).astype(np.float32) / 255.0
-                    )
-                    noisy_tensor = torch.from_numpy(noisy_img).unsqueeze(0)
-                    self.cached_noisy_samples.append(noisy_tensor)
+                if self.is_val_or_test:
+                    if self.noise_injector is not None:
+                        noisy_tensor = self.noise_injector(
+                            clean_tensor.unsqueeze(0)
+                        ).squeeze(0)
+                    elif self.noisy_dir is not None:
+                        noisy_path = self.noisy_dir / fname
+                        noisy_img = (
+                            tifffile.imread(str(noisy_path)).astype(np.float32) / 255.0
+                        )
+                        noisy_tensor = torch.from_numpy(noisy_img).unsqueeze(0)
+                    else:
+                        noisy_tensor = clean_tensor.clone()
+                    self.fixed_noisy_samples.append(noisy_tensor)
 
     def __len__(self) -> int:
         return len(self.filenames)
@@ -159,13 +170,15 @@ class PatchFolderDataset(Dataset):
         return noisy, clean
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, str]:
-        if self.cache_in_ram:
+        if self.is_val_or_test:
+            clean_tensor, fname = self.cached_clean_samples[idx]
+            noisy_tensor = self.fixed_noisy_samples[idx].clone()
+            clean_tensor = clean_tensor.clone()
+        elif self.cache_in_ram:
             clean_tensor, fname = self.cached_clean_samples[idx]
             clean_tensor = clean_tensor.clone()
             if self.noise_injector is not None:
                 noisy_tensor = self.noise_injector(clean_tensor.unsqueeze(0)).squeeze(0)
-            elif self.cached_noisy_samples:
-                noisy_tensor = self.cached_noisy_samples[idx].clone()
             else:
                 noisy_tensor = clean_tensor.clone()
         else:
@@ -263,6 +276,7 @@ class LMDBPatchDataset(Dataset):
         self.noise_injector = noise_injector
         self.cache_in_ram = cache_in_ram
         self.augment = augment
+        self.is_val_or_test = split in ["val", "test"]
 
         if not self.lmdb_path.exists():
             raise FileNotFoundError(f"LMDB store not found at {self.lmdb_path}")
@@ -291,8 +305,10 @@ class LMDBPatchDataset(Dataset):
                 for key_bytes, fname in zip(self.keys, tiff_files):
                     self.filename_map[key_bytes.decode("utf-8")] = fname
 
-        self.cached_samples: List[Tuple[torch.Tensor, torch.Tensor, str]] = []
-        if self.cache_in_ram:
+        self.cached_clean_samples: List[Tuple[torch.Tensor, str]] = []
+        self.fixed_val_samples: List[Tuple[torch.Tensor, torch.Tensor, str]] = []
+
+        if self.cache_in_ram or self.is_val_or_test:
             logger.info(f"Caching {len(self.keys)} LMDB '{split}' patches into RAM...")
             env = lmdb.open(str(self.lmdb_path), readonly=True, lock=False)
             with env.begin(write=False) as txn:
@@ -304,16 +320,21 @@ class LMDBPatchDataset(Dataset):
                         arr.astype(np.float32) / 255.0
                     ).unsqueeze(0)
 
-                    if self.noise_injector is not None:
-                        noisy_tensor = self.noise_injector(
-                            clean_tensor.unsqueeze(0)
-                        ).squeeze(0)
-                    else:
-                        noisy_tensor = clean_tensor.clone()
-
                     key_str = key.decode("utf-8")
                     fname_str = self.filename_map.get(key_str, key_str)
-                    self.cached_samples.append((noisy_tensor, clean_tensor, fname_str))
+
+                    if self.is_val_or_test:
+                        if self.noise_injector is not None:
+                            noisy_tensor = self.noise_injector(
+                                clean_tensor.unsqueeze(0)
+                            ).squeeze(0)
+                        else:
+                            noisy_tensor = clean_tensor.clone()
+                        self.fixed_val_samples.append(
+                            (noisy_tensor, clean_tensor, fname_str)
+                        )
+                    else:
+                        self.cached_clean_samples.append((clean_tensor, fname_str))
             env.close()
 
     def __len__(self) -> int:
@@ -335,10 +356,17 @@ class LMDBPatchDataset(Dataset):
         return noisy, clean
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, str]:
-        if self.cache_in_ram:
-            noisy_tensor, clean_tensor, key_str = self.cached_samples[idx]
+        if self.is_val_or_test:
+            noisy_tensor, clean_tensor, key_str = self.fixed_val_samples[idx]
             noisy_tensor = noisy_tensor.clone()
             clean_tensor = clean_tensor.clone()
+        elif self.cache_in_ram:
+            clean_tensor, key_str = self.cached_clean_samples[idx]
+            clean_tensor = clean_tensor.clone()
+            if self.noise_injector is not None:
+                noisy_tensor = self.noise_injector(clean_tensor.unsqueeze(0)).squeeze(0)
+            else:
+                noisy_tensor = clean_tensor.clone()
         else:
             import lmdb
 
@@ -847,6 +875,7 @@ def main() -> None:
             read_std=cfg.noise.read_std,
             gain_variance=cfg.noise.gain_variance,
             streak_probability=cfg.noise.streak_probability,
+            inverted_bse=getattr(cfg.noise, "inverted_bse", True),
         )
 
     data_dir = Path(args.data_dir) if args.data_dir else None
@@ -976,7 +1005,9 @@ def main() -> None:
     )
     loss_type = getattr(cfg.loss, "loss_type", "composite").lower()
     if loss_type == "dynamic":
-        criterion = DynamicEMLoss(channels=1).to(device)
+        criterion = DynamicEMLoss(
+            channels=1, inverted_bse=getattr(cfg.noise, "inverted_bse", True)
+        ).to(device)
         logger.info(
             "Initialized DynamicEMLoss (learnable homoscedastic uncertainty weighting)"
         )

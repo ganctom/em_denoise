@@ -1,7 +1,7 @@
 # Pipeline Configuration for SBF-SEM Connectomics Denoising
 
 experiment:
-  name: "02_loss_enhanced"
+  name: "21_enh_loss_ResUNet_param_noise_SSIM_LAPL_0.5_0.5_photon_0.04_0.06"
   output_dir: "/Users/ganctoma/SW/sort/N2V/run_42"
 
 data:
@@ -36,22 +36,23 @@ noise:
   filter_type: "gaussian"          # "gaussian" or "median" for pseudo-clean estimation
   gaussian_sigma: 2.0              # Sigma for gaussian filter (default: 0.7)
   noise_amplification: 2.0         # Scale empirical noise deviation: 1.0=exact, 2.0=2x stronger, 0.5=weaker
-  photon_scale: [0.02, 0.04]       # Simulated photon count scale (can be float or [min, max] list)
-  read_std: [5.0, 15.0]            # Detector readout noise std in uint8 space (can be float or [min, max] list)
-  gain_variance: [0.01, 0.25]      # Per-pixel detector gain variation (can be float or [min, max] list)
+  photon_scale:   [0.04, 0.06]      #  Simulated photon count scale (can be float or [min, max] list)
+  read_std: 8.0 #[5.0, 15.0]             Detector readout noise std in uint8 space (can be float or [min, max] list)
+  gain_variance: 0.02 # [0.01, 0.25]       Per-pixel detector gain variation (can be float or [min, max] list)
+  inverted_bse: true              # True if membranes appear dark (un-inverts to physical BSE space for Poisson sampling)
 model:
   # Model Architecture Selection:
   #   - "connectomics": NAFBlock + LaplacianEdgeAttention global residual architecture (default)
   #   - "residual_unet": Pre-activation ResBlock UNet with GroupNorm, GELU & strided downsampling
   #   - "modern_unet"  : Modern ResConvBlock UNet with bilinear upsampling
-  model_type: "connectomics"
+  model_type: "residual_unet"
   base_dim: 32
 
 training:
   batch_size: 32
   epochs: 10
   learning_rate: 0.0002
-  cache_in_ram: false         # If false, dynamic noise synthesis is sampled fresh on every epoch
+  cache_in_ram: true         # If false, dynamic noise synthesis is sampled fresh on every epoch
   device: "mps"              # Hardware backend: "mps", "cuda", or "cpu"
 
 loss:
@@ -61,11 +62,11 @@ loss:
   #   - "composite": Legacy MSE + Sobel edge + SSIM
   loss_type: "enhanced"
   # Weights for "enhanced" loss mode:
-  charbonnier_weight: 0.3          # Sharpness-preserving pseudo-Huber loss
-  ssim_weight: 0.3                 # Structural similarity index
-  laplacian_weight: 0.15           # 2nd-order derivative for vesicle/organelle curvature
-  ffl_weight: 0.15                 # Focal Frequency Loss for fine spatial textures
-  espi_weight: 0.1                 # Edge Preservation Index targeting strong membranes (top 10%)
+  charbonnier_weight: 0.0         # Sharpness-preserving pseudo-Huber loss
+  ssim_weight: 0.5                 # Structural similarity index
+  laplacian_weight: 0.5         # 2nd-order derivative for vesicle/organelle curvature
+  ffl_weight: 0.0                 # Focal Frequency Loss for fine spatial textures
+  espi_weight: 0.0                 # Edge Preservation Index targeting strong membranes (top 10%)
   # Weights for legacy "composite" loss mode:
   mse_weight: 0.2
   edge_weight: 0.3

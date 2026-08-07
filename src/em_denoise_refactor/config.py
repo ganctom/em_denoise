@@ -71,6 +71,7 @@ class NoiseConfig:
     streak_probability: float | list[float] = field(
         default_factory=lambda: [0.05, 0.20]
     )
+    inverted_bse: bool = True  # True if membranes are dark (inverted BSE mode)
 
 
 @dataclass

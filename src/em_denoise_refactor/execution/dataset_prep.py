@@ -141,6 +141,7 @@ class DatasetPreparer:
                 read_std=self.cfg.noise.read_std,
                 gain_variance=self.cfg.noise.gain_variance,
                 streak_probability=self.cfg.noise.streak_probability,
+                inverted_bse=getattr(self.cfg.noise, "inverted_bse", True),
             )
 
         lmdb_path = self.base_output_dir / "patch_store.lmdb"

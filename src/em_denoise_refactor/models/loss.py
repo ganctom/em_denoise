@@ -231,14 +231,19 @@ class GeneralizedAnscombeLoss(nn.Module):
         sigma: float = 0.0,
         gain: float = 0.0,
         eps: float = 1e-6,
+        inverted_bse: bool = True,
     ) -> None:
         super().__init__()
         self.alpha = alpha
         self.sigma = sigma
         self.gain = gain
         self.eps = eps
+        self.inverted_bse = inverted_bse
 
     def _anscombe(self, x: torch.Tensor) -> torch.Tensor:
+        # Un-invert to physical BSE electron space if inverted_bse is True (dark membranes -> high signal)
+        if self.inverted_bse:
+            x = 1.0 - x
         val = (
             self.alpha * x
             + (3.0 / 8.0) * (self.alpha**2)
@@ -437,13 +442,14 @@ class DynamicEMLoss(nn.Module):
         vst_alpha: float = 1.0,
         vst_sigma: float = 0.0,
         vst_gain: float = 0.0,
+        inverted_bse: bool = True,
     ) -> None:
         super().__init__()
 
         self.charbonnier = CharbonnierLoss(eps=charbonnier_eps)
         self.ffl = FocalFrequencyLoss(alpha=ffl_alpha)
         self.vst = GeneralizedAnscombeLoss(
-            alpha=vst_alpha, sigma=vst_sigma, gain=vst_gain
+            alpha=vst_alpha, sigma=vst_sigma, gain=vst_gain, inverted_bse=inverted_bse
         )
         self.laplacian = LaplacianLoss(channels=channels)
 

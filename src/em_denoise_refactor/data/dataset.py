@@ -141,11 +141,13 @@ class SBFSEMNoiseSynthesizer(NoiseSynthesizer):
         read_std: Union[float, Tuple[float, float], List[float]] = 8.0,
         gain_variance: Union[float, Tuple[float, float], List[float]] = 0.02,
         streak_probability: Union[float, Tuple[float, float], List[float]] = 0.15,
+        inverted_bse: bool = True,
     ) -> None:
         self.photon_scale = photon_scale
         self.read_std = read_std
         self.gain_variance = gain_variance
         self.streak_p = streak_probability
+        self.inverted_bse = inverted_bse
 
     def _sample_param(
         self,
@@ -175,15 +177,21 @@ class SBFSEMNoiseSynthesizer(NoiseSynthesizer):
         # Lift to uint8-equivalent scale for correct Poisson statistics.
         img_255 = clean_tensor * 255.0
 
+        # Un-invert to raw BSE electron signal space if inverted_bse is True (dark membranes -> high electron count)
+        if self.inverted_bse:
+            raw_bse = 255.0 - img_255
+        else:
+            raw_bse = img_255
+
         # Sample randomized parameters for this patch/batch
         photon_scale = self._sample_param(self.photon_scale, clean_tensor)
         read_std = self._sample_param(self.read_std, clean_tensor)
         gain_variance = self._sample_param(self.gain_variance, clean_tensor)
         streak_p = self._sample_prob(self.streak_p)
 
-        # 1. Shot noise (Poisson process in photon space)
-        photons = torch.clamp(img_255 * photon_scale, min=1e-5)
-        noisy = torch.poisson(photons) / photon_scale
+        # 1. Shot noise (Poisson process in raw electron space)
+        photons = torch.clamp(raw_bse * photon_scale, min=1e-5)
+        noisy_raw = torch.poisson(photons) / photon_scale
 
         # 2. Per-pixel detector gain variation (fixed-pattern noise)
         if isinstance(gain_variance, Tensor) or gain_variance > 0:
@@ -192,21 +200,27 @@ class SBFSEMNoiseSynthesizer(NoiseSynthesizer):
                 pass
             else:
                 # torch.normal doesn't broadcast well with tensor std, so we do it manually:
-                gain = 1.0 + torch.randn_like(noisy) * gain_variance
-                noisy = noisy * gain
+                gain = 1.0 + torch.randn_like(noisy_raw) * gain_variance
+                noisy_raw = noisy_raw * gain
 
         # 3. Additive Gaussian read-out noise (in uint8 scale)
-        noisy = noisy + torch.randn_like(noisy) * read_std
+        noisy_raw = noisy_raw + torch.randn_like(noisy_raw) * read_std
 
         # 4. Vectorized raster streak anomalies
         if torch.rand(1).item() < streak_p:
             h, w = clean_tensor.shape[-2:]
             num_streaks = int(torch.randint(1, 4, (1,)).item())
-            row_indices = torch.randint(0, h, (num_streaks,), device=noisy.device)
-            intensities = torch.randn(num_streaks, 1, device=noisy.device) * (
+            row_indices = torch.randint(0, h, (num_streaks,), device=noisy_raw.device)
+            intensities = torch.randn(num_streaks, 1, device=noisy_raw.device) * (
                 0.3 * 255.0
             )
-            noisy[..., row_indices, :] += intensities.expand(-1, w)
+            noisy_raw[..., row_indices, :] += intensities.expand(-1, w)
+
+        # Re-invert back to display space if inverted_bse is True
+        if self.inverted_bse:
+            noisy = 255.0 - noisy_raw
+        else:
+            noisy = noisy_raw
 
         # Normalize back to [0, 1] and clamp to valid range
         return (noisy / 255.0).clamp_(0.0, 1.0)
