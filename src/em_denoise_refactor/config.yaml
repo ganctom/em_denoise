@@ -46,8 +46,17 @@ model:
   #   - "connectomics": NAFBlock + LaplacianEdgeAttention global residual architecture (default)
   #   - "residual_unet": Pre-activation ResBlock UNet with GroupNorm, GELU & strided downsampling
   #   - "modern_unet"  : Modern ResConvBlock UNet with bilinear upsampling
+  #   - "cosdd"        : Unsupervised Correlated & Signal-Dependent Ladder VAE + PixelCNN
   model_type: "residual_unet"
   base_dim: 32
+
+cosdd:
+  s_code_channels: 64             # Latent signal code channels
+  number_layers: 14               # Depth of Ladder VAE
+  number_components: 3            # Number of GMM noise components
+  scale_initialisation: true      # Scale initialization for VDVAE stability
+  noise_direction: "x"            # Axis along which noise is correlated ('x', 'y', or 'none')
+  use_direct_denoiser: false      # Option to train secondary direct denoiser UNet
 
 training:
   batch_size: 32

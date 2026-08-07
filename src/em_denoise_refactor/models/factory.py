@@ -14,6 +14,7 @@ def build_model(
     in_channels: int = 1,
     out_channels: int = 1,
     base_dim: int = 32,
+    **kwargs,
 ) -> nn.Module:
     """
     Factory function to instantiate neural network architectures.
@@ -47,8 +48,21 @@ def build_model(
             out_channels=out_channels,
             base_dim=base_dim,
         )
+    elif m_type in ("cosdd", "cosdd_lvae"):
+        from em_denoise_refactor.models.cosdd import COSDDModel
+
+        return COSDDModel(
+            in_channels=in_channels,
+            crop_size=kwargs.get("crop_size", (128, 128)),
+            s_code_channels=kwargs.get("s_code_channels", 64),
+            number_layers=kwargs.get("number_layers", 14),
+            number_components=kwargs.get("number_components", 3),
+            scale_initialisation=kwargs.get("scale_initialisation", True),
+            noise_direction=kwargs.get("noise_direction", "x"),
+            use_direct_denoiser=kwargs.get("use_direct_denoiser", False),
+        )
     else:
-        valid_models = ["connectomics", "residual_unet", "modern_unet"]
+        valid_models = ["connectomics", "residual_unet", "modern_unet", "cosdd"]
         raise ValueError(
             f"Unknown model_type '{model_type}'. Choose from: {valid_models}"
         )

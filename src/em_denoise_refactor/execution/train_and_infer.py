@@ -455,7 +455,9 @@ class DenoisingTrainer:
             noisy_b, clean_b = noisy_b.to(self.device), clean_b.to(self.device)
 
             self.optimizer.zero_grad()
-            if self.use_amp:
+            if hasattr(self.model, "ar_decoder"):
+                pred_b, loss_out = self.model(noisy_b)
+            elif self.use_amp:
                 with torch.autocast(device_type="cuda", dtype=torch.float16):
                     pred_b = self.model(noisy_b)
                     loss_out = self.criterion(pred_b, clean_b)
@@ -513,7 +515,9 @@ class DenoisingTrainer:
             for noisy_b, clean_b, _ in pbar:
                 noisy_b, clean_b = noisy_b.to(self.device), clean_b.to(self.device)
 
-                if self.use_amp:
+                if hasattr(self.model, "ar_decoder"):
+                    pred_b, loss_out = self.model(noisy_b)
+                elif self.use_amp:
                     with torch.autocast(device_type="cuda", dtype=torch.float16):
                         pred_b = self.model(noisy_b)
                         loss_out = self.criterion(pred_b, clean_b)
@@ -997,8 +1001,22 @@ def main() -> None:
         )
     )
     base_dim = cfg.model.base_dim if hasattr(cfg, "model") and cfg.model else 32
+    cosdd_opts = {}
+    if hasattr(cfg, "cosdd") and cfg.cosdd:
+        cosdd_opts = {
+            "s_code_channels": getattr(cfg.cosdd, "s_code_channels", 64),
+            "number_layers": getattr(cfg.cosdd, "number_layers", 14),
+            "number_components": getattr(cfg.cosdd, "number_components", 3),
+            "scale_initialisation": getattr(cfg.cosdd, "scale_initialisation", True),
+            "noise_direction": getattr(cfg.cosdd, "noise_direction", "x"),
+            "use_direct_denoiser": getattr(cfg.cosdd, "use_direct_denoiser", False),
+        }
     model = build_model(
-        model_type=model_type, in_channels=1, out_channels=1, base_dim=base_dim
+        model_type=model_type,
+        in_channels=1,
+        out_channels=1,
+        base_dim=base_dim,
+        **cosdd_opts,
     ).to(device)
     logger.info(
         f"Initialized neural network architecture: '{model_type}' (base_dim={base_dim})"

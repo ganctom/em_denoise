@@ -107,10 +107,18 @@ class LossConfig:
 
 
 @dataclass
+class COSDDConfig:
+    s_code_channels: int = 64
+    number_layers: int = 14
+    number_components: int = 3
+    scale_initialisation: bool = True
+    noise_direction: str = "x"
+    use_direct_denoiser: bool = False
+
+
+@dataclass
 class ModelConfig:
-    model_type: str = (
-        "connectomics"  # Options: "connectomics", "residual_unet", "modern_unet"
-    )
+    model_type: str = "connectomics"  # Options: "connectomics", "residual_unet", "modern_unet", "cosdd"
     base_dim: int = 32
 
 
@@ -124,6 +132,7 @@ class PipelineConfig:
     )
     noise: NoiseConfig = field(default_factory=NoiseConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
+    cosdd: COSDDConfig = field(default_factory=COSDDConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     loss: LossConfig = field(default_factory=LossConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
@@ -137,6 +146,7 @@ class PipelineConfig:
             extraction=ExtractionSettingsConfig(**d.get("extraction", {})),
             noise=NoiseConfig(**d.get("noise", {})),
             model=ModelConfig(**d.get("model", {})),
+            cosdd=COSDDConfig(**d.get("cosdd", {})),
             training=TrainingConfig(**d.get("training", {})),
             loss=LossConfig(**d.get("loss", {})),
             inference=InferenceConfig(**d.get("inference", {})),
