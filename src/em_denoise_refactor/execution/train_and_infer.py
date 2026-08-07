@@ -472,6 +472,7 @@ class DenoisingTrainer:
                 metrics = {"loss_total": float(loss.item())}
 
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
 
             batch_size = noisy_b.size(0)
