@@ -84,12 +84,20 @@ class TrainingConfig:
 @dataclass
 class InferenceConfig:
     custom_input_dir: Optional[Path] = None
+    preview_image: Optional[Path] = None
+    preview_crop_size: int = 512
+    preview_crop_y: Optional[int] = None
+    preview_crop_x: Optional[int] = None
 
     def __post_init__(self):
         if self.custom_input_dir is not None and self.custom_input_dir != "":
             self.custom_input_dir = Path(self.custom_input_dir)
         else:
             self.custom_input_dir = None
+        if self.preview_image is not None and self.preview_image != "":
+            self.preview_image = Path(self.preview_image)
+        else:
+            self.preview_image = None
 
 
 @dataclass
@@ -145,6 +153,32 @@ class N2VConfig:
 
 
 @dataclass
+class N2NConfig:
+    """
+    Configuration for Noise2Noise (N2N) training on sbem-n2n-overlaps shards.
+    """
+
+    enabled: bool = False
+    overlaps_dir: str = ""
+    pair_direction: str = (
+        "random_swap"  # "random_swap", "first_to_second", "second_to_first"
+    )
+    orientation: str = "all"  # "all", "horizontal", "vertical"
+    max_train_pairs: Optional[int] = 15000
+    max_val_pairs: Optional[int] = 1500
+    max_test_pairs: Optional[int] = 500
+    seed: int = 42
+    augment_rot90: bool = False
+    align_patches: bool = False
+    align_max_shift_px: int = 16
+    align_blur_sigma: float = 1.0
+    patch_sampling: str = (
+        "random"  # "random" (1 crop/stripe/epoch) or "tile" (full stripe tiling)
+    )
+    tile_stride: Optional[int] = None  # Defaults to extraction.patch_size when null
+
+
+@dataclass
 class ModelConfig:
     model_type: str = "connectomics"  # Options: "connectomics", "residual_unet", "modern_unet", "cosdd", "n2v"
     base_dim: int = 32
@@ -162,6 +196,7 @@ class PipelineConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     cosdd: COSDDConfig = field(default_factory=COSDDConfig)
     n2v: N2VConfig = field(default_factory=N2VConfig)
+    n2n: N2NConfig = field(default_factory=N2NConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     loss: LossConfig = field(default_factory=LossConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
@@ -177,6 +212,7 @@ class PipelineConfig:
             model=ModelConfig(**d.get("model", {})),
             cosdd=COSDDConfig(**d.get("cosdd", {})),
             n2v=N2VConfig(**d.get("n2v", {})),
+            n2n=N2NConfig(**d.get("n2n", {})),
             training=TrainingConfig(**d.get("training", {})),
             loss=LossConfig(**d.get("loss", {})),
             inference=InferenceConfig(**d.get("inference", {})),

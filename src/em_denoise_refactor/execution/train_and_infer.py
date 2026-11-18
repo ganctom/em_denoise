@@ -30,6 +30,7 @@ from em_denoise_refactor.data.dataset import (
     EmpiricalNoiseSynthesizer,
 )
 from em_denoise_refactor.data.n2v_dataset import N2VDatasetWrapper
+from em_denoise_refactor.data.n2n_dataset import N2NOverlapPairDataset
 from em_denoise_refactor.execution.calibration import run_calibration
 from em_denoise_refactor.models.factory import build_model
 from em_denoise_refactor.models.loss import (
@@ -791,6 +792,85 @@ class DenoisingEvaluator:
 
 
 # -------------------------------------------------------------------------
+# Checkpoint Preview Helper
+# -------------------------------------------------------------------------
+
+
+def _load_preview_crop(
+    image_path: Path,
+    crop_size: int = 512,
+    crop_y: Optional[int] = None,
+    crop_x: Optional[int] = None,
+) -> np.ndarray:
+    """Load a fixed 2D float32 [0, 1] crop from a raw TIFF for checkpoint previews."""
+    arr = tifffile.imread(str(image_path))
+    if arr.ndim > 2:
+        arr = arr[0]
+    h, w = arr.shape
+    cs = min(crop_size, h, w)
+    y0 = (h - cs) // 2 if crop_y is None else min(max(0, crop_y), h - cs)
+    x0 = (w - cs) // 2 if crop_x is None else min(max(0, crop_x), w - cs)
+    crop = arr[y0 : y0 + cs, x0 : x0 + cs]
+    if crop.dtype == np.uint8:
+        return crop.astype(np.float32) / 255.0
+    crop_f = crop.astype(np.float32)
+    if crop_f.max() > 1.0:
+        crop_f = crop_f / 255.0
+    return np.clip(crop_f, 0.0, 1.0)
+
+
+def _save_checkpoint_preview(
+    model: nn.Module,
+    raw_crop: np.ndarray,
+    previews_dir: Path,
+    epoch: int,
+    device: torch.device,
+    writer: Optional[Any] = None,
+) -> None:
+    """Denoise a fixed raw crop and save TIFF + side-by-side PNG + TensorBoard image."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    previews_dir.mkdir(parents=True, exist_ok=True)
+    if epoch == 1:
+        raw_u8 = np.clip(raw_crop * 255.0, 0, 255).astype(np.uint8)
+        tifffile.imwrite(str(previews_dir / "raw_crop.tif"), raw_u8)
+        if writer is not None:
+            writer.add_image("Preview/Raw", raw_crop[None, ...], global_step=0)
+
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        inp = torch.from_numpy(raw_crop).unsqueeze(0).unsqueeze(0).to(device)
+        if hasattr(model, "ar_decoder"):
+            pred = model.denoise(inp)
+        else:
+            pred = model(inp)
+        denoised = torch.clamp(pred, 0.0, 1.0)[0, 0].cpu().numpy()
+    if was_training:
+        model.train()
+
+    denoised_u8 = np.clip(denoised * 255.0, 0, 255).astype(np.uint8)
+    tifffile.imwrite(str(previews_dir / f"epoch_{epoch:03d}.tif"), denoised_u8)
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 5), dpi=120)
+    axes[0].imshow(raw_crop, cmap="gray", vmin=0.0, vmax=1.0)
+    axes[0].set_title("Raw Input")
+    axes[0].axis("off")
+    axes[1].imshow(denoised, cmap="gray", vmin=0.0, vmax=1.0)
+    axes[1].set_title(f"Denoised (Epoch {epoch:02d})")
+    axes[1].axis("off")
+    plt.tight_layout()
+    fig.savefig(str(previews_dir / f"epoch_{epoch:03d}_comparison.png"))
+    plt.close(fig)
+
+    if writer is not None:
+        writer.add_image("Preview/Denoised", denoised[None, ...], global_step=epoch)
+
+
+# -------------------------------------------------------------------------
 # CLI & Execution Entry Point
 # -------------------------------------------------------------------------
 
@@ -930,6 +1010,12 @@ def main() -> None:
         )
     )
     is_n2v_mode = model_type.lower() in ("n2v", "noise2void", "n2v2")
+    is_n2n_mode = hasattr(cfg, "n2n") and bool(getattr(cfg.n2n, "enabled", False))
+    if is_n2n_mode and is_n2v_mode:
+        raise ValueError(
+            "n2n.enabled=True cannot be combined with model_type='n2v'. "
+            "Use a non-blind-spot backbone such as 'connectomics', 'residual_unet', or 'modern_unet'."
+        )
 
     run_dir = output_dir / exp_name if exp_name else output_dir
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -956,6 +1042,13 @@ def main() -> None:
         logger.info(
             "N2V self-supervised mode: noise synthesizer BYPASSED. "
             "LMDB patches will be used as raw noisy inputs."
+        )
+    elif is_n2n_mode:
+        # N2N uses real paired noisy overlap crops from sbem-n2n-overlaps.
+        noise_injector = None
+        logger.info(
+            "N2N overlap-pair mode: noise synthesizer BYPASSED. "
+            f"Reading paired noisy overlaps from: {cfg.n2n.overlaps_dir}"
         )
     elif getattr(cfg.noise, "synthesizer_type", "parametric") == "empirical":
         model_path = Path(getattr(cfg.noise, "empirical_model_path", "noise_model.npy"))
@@ -988,7 +1081,56 @@ def main() -> None:
 
     if not args.eval_only:
         logger.info("Initializing Train & Validation Datasets...")
-        if data_dir is not None:
+        if is_n2n_mode:
+            overlaps_dir = Path(cfg.n2n.overlaps_dir)
+            train_dataset = N2NOverlapPairDataset(
+                overlaps_dir=overlaps_dir,
+                split="train",
+                patch_size=cfg.extraction.patch_size,
+                first_sec=cfg.data.first_sec,
+                last_sec=cfg.data.last_sec,
+                split_strategy=cfg.splitting.strategy,
+                block_size=cfg.splitting.block_size,
+                train_ratio=cfg.splitting.train_ratio,
+                val_ratio=cfg.splitting.val_ratio,
+                guard_band_size=cfg.splitting.guard_band_size,
+                orientation=cfg.n2n.orientation,
+                max_pairs=cfg.n2n.max_train_pairs,
+                pair_direction=cfg.n2n.pair_direction,
+                cache_in_ram=cfg.training.cache_in_ram,
+                augment=True,
+                augment_rot90=cfg.n2n.augment_rot90,
+                seed=cfg.n2n.seed,
+                align_patches=cfg.n2n.align_patches,
+                align_max_shift_px=cfg.n2n.align_max_shift_px,
+                align_blur_sigma=cfg.n2n.align_blur_sigma,
+                patch_sampling=cfg.n2n.patch_sampling,
+                tile_stride=cfg.n2n.tile_stride,
+            )
+            val_dataset = N2NOverlapPairDataset(
+                overlaps_dir=overlaps_dir,
+                split="val",
+                patch_size=cfg.extraction.patch_size,
+                first_sec=cfg.data.first_sec,
+                last_sec=cfg.data.last_sec,
+                split_strategy=cfg.splitting.strategy,
+                block_size=cfg.splitting.block_size,
+                train_ratio=cfg.splitting.train_ratio,
+                val_ratio=cfg.splitting.val_ratio,
+                guard_band_size=cfg.splitting.guard_band_size,
+                orientation=cfg.n2n.orientation,
+                max_pairs=cfg.n2n.max_val_pairs,
+                pair_direction=cfg.n2n.pair_direction,
+                cache_in_ram=cfg.training.cache_in_ram,
+                augment=False,
+                seed=cfg.n2n.seed,
+                align_patches=cfg.n2n.align_patches,
+                align_max_shift_px=cfg.n2n.align_max_shift_px,
+                align_blur_sigma=cfg.n2n.align_blur_sigma,
+                patch_sampling=cfg.n2n.patch_sampling,
+                tile_stride=cfg.n2n.tile_stride,
+            )
+        elif data_dir is not None:
             logger.info(f"Loading custom dataset from directory: {data_dir}")
             root_dir = (
                 data_dir.parent
@@ -1215,6 +1357,29 @@ def main() -> None:
             writer=writer,
         )
 
+        preview_crop: Optional[np.ndarray] = None
+        previews_dir = run_dir / "previews"
+        if (
+            hasattr(cfg, "inference")
+            and cfg.inference
+            and getattr(cfg.inference, "preview_image", None) is not None
+        ):
+            preview_path = Path(cfg.inference.preview_image)
+            if preview_path.exists():
+                preview_crop = _load_preview_crop(
+                    preview_path,
+                    crop_size=getattr(cfg.inference, "preview_crop_size", 512),
+                    crop_y=getattr(cfg.inference, "preview_crop_y", None),
+                    crop_x=getattr(cfg.inference, "preview_crop_x", None),
+                )
+                logger.info(
+                    f"Checkpoint preview enabled on {preview_crop.shape} crop from: {preview_path}"
+                )
+            else:
+                logger.warning(
+                    f"preview_image not found, skipping previews: {preview_path}"
+                )
+
         logger.info(f"Starting Network Training ({epochs} epochs)...")
         start_time = time.time()
         best_val_loss = float("inf")
@@ -1234,6 +1399,16 @@ def main() -> None:
             )
             if is_best:
                 best_checkpoint_path = best_ckpt
+
+            if preview_crop is not None:
+                _save_checkpoint_preview(
+                    model=model,
+                    raw_crop=preview_crop,
+                    previews_dir=previews_dir,
+                    epoch=epoch,
+                    device=device,
+                    writer=writer,
+                )
 
             if writer is not None:
                 writer.add_scalar("Loss/Train", train_loss, epoch)
@@ -1309,6 +1484,33 @@ def main() -> None:
         )
         test_dataset = CustomTIFFDataset(custom_input_dir, cache_in_ram=True)
         test_denoised_dir = run_dir / "custom_inference" / "denoised"
+    elif is_n2n_mode:
+        overlaps_dir = Path(cfg.n2n.overlaps_dir)
+        logger.info(f"Loading N2N test pairs from overlaps store: {overlaps_dir}")
+        test_denoised_dir = run_dir / "test" / "denoised"
+        test_dataset = N2NOverlapPairDataset(
+            overlaps_dir=overlaps_dir,
+            split="test",
+            patch_size=cfg.extraction.patch_size,
+            first_sec=cfg.data.first_sec,
+            last_sec=cfg.data.last_sec,
+            split_strategy=cfg.splitting.strategy,
+            block_size=cfg.splitting.block_size,
+            train_ratio=cfg.splitting.train_ratio,
+            val_ratio=cfg.splitting.val_ratio,
+            guard_band_size=cfg.splitting.guard_band_size,
+            orientation=cfg.n2n.orientation,
+            max_pairs=cfg.n2n.max_test_pairs,
+            pair_direction=cfg.n2n.pair_direction,
+            cache_in_ram=cfg.training.cache_in_ram,
+            augment=False,
+            seed=cfg.n2n.seed,
+            align_patches=cfg.n2n.align_patches,
+            align_max_shift_px=cfg.n2n.align_max_shift_px,
+            align_blur_sigma=cfg.n2n.align_blur_sigma,
+            patch_sampling=cfg.n2n.patch_sampling,
+            tile_stride=cfg.n2n.tile_stride,
+        )
     elif test_clean_dir.exists() and len(list(test_clean_dir.glob("*.tif"))) > 0:
         logger.info(f"Loading test set from TIFF directory: {test_clean_dir}")
         test_denoised_dir = run_dir / "test" / "denoised"

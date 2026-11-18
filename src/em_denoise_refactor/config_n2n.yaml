@@ -1,0 +1,64 @@
+# Pipeline Configuration for SBF-SEM Noise2Noise (N2N) Overlap Training
+
+experiment:
+  name: "04_n2n_resunet_charbonnier_aligned_lr0.0004_10ep_50k_patches"
+  output_dir: "/Users/ganctoma/SW/sort/N2V/run_43_n2n"
+
+data:
+  sbem_root: "/Volumes/tachyon/groups/scratch/gmicro_sem/gfriedri/_EM_acquisitions/20260201_RoLi_F1/"
+  grid_num: 0
+  first_sec: 1250
+  last_sec: 8000
+
+splitting:
+  strategy: "mod10"          # "mod10" splits narrow local shard ranges cleanly across train/val/test
+  block_size: 100
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+  guard_band_size: 5
+
+extraction:
+  patch_size: 128            # Square crop size sampled from each (H_ov, W_ov) overlap pair
+
+n2n:
+  enabled: true
+  overlaps_dir: "/Users/ganctoma/SW/sort/N2V/run_43_n2n/0x_overlaps"
+  pair_direction: "random_swap"   # "random_swap", "first_to_second", or "second_to_first"
+  orientation: "all"              # "all", "horizontal", or "vertical"
+  max_train_pairs: 50000           # Use all available train pairs in local shards
+  max_val_pairs: 10000
+  max_test_pairs: 10000
+  seed: 42
+  augment_rot90: false            # Keep false to preserve fast/slow scan noise anisotropy
+  align_patches: false            # Toggle cross-correlation patch registration ON/OFF
+  align_max_shift_px: 16          # Max integer shift (px) searched in each axis
+  align_blur_sigma: 1.0           # Gaussian smoothing sigma used only for shift estimation
+  patch_sampling: "tile"          # "tile" (full stripe tiling) or "random" (1 crop/stripe/epoch)
+  tile_stride: null               # null = patch_size (non-overlapping grid + flush edge tiles)
+
+model:
+  model_type: "residual_unet"     # "connectomics", "residual_unet", or "modern_unet"
+  base_dim: 32
+
+training:
+  batch_size: 32
+  epochs: 10
+  learning_rate: 0.0004
+  cache_in_ram: true              # Shard-grouped sequential pre-load into RAM
+  device: "mps"                   # "mps", "cuda", or "cpu"
+
+loss:
+  loss_type: "enhanced"
+  charbonnier_weight: 1.0         # Unbiased pseudo-L1 loss for N2N
+  ssim_weight: 0.0
+  laplacian_weight: 0.0
+  ffl_weight: 0.0
+  espi_weight: 0.0
+
+inference:
+  # Same test tiles as run_42 N2V2 / COSDD runs for direct visual comparison
+  custom_input_dir: "/Users/ganctoma/SW/sort/N2V/test_raw"
+  # Small fixed crop denoised & saved at every checkpoint (TIFF stack + PNG + TensorBoard)
+  preview_image: "/Users/ganctoma/SW/sort/N2V/test_raw/20260201_RoLi_F1_g0000_t0436_s05329.tif"
+  preview_crop_size: 512
