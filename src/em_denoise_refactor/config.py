@@ -117,8 +117,36 @@ class COSDDConfig:
 
 
 @dataclass
+class N2VConfig:
+    """
+    Configuration for the N2V2 / StructN2V self-supervised blind-spot training regime.
+
+    Attributes
+    ----------
+    blind_spot_strict : bool
+        If True (default), the top encoder-to-decoder skip connection in N2VUNet is
+        severed, preserving the blind-spot invariant as required by N2V2 theory.
+        Set False to re-enable it for ablation on sub-pixel EM features.
+    mask_ratio : float
+        Fraction of pixels replaced per patch per forward pass. N2V default is 0.015
+        (~1 in 66 pixels). Higher values increase the self-supervised signal but reduce
+        spatial resolution of the learned representation.
+    mask_mode : str
+        Masking strategy:
+          - "random"     : N2V2 mode. Random point mask with 3x3 median substitution.
+          - "horizontal" : StructN2V mode. Horizontal stripe mask targeting raster
+                           charging artifacts (SBF-SEM horizontal streak noise).
+          - "vertical"   : StructN2V mode. Vertical stripe mask.
+    """
+
+    blind_spot_strict: bool = True
+    mask_ratio: float = 0.015
+    mask_mode: str = "random"  # "random", "horizontal", "vertical"
+
+
+@dataclass
 class ModelConfig:
-    model_type: str = "connectomics"  # Options: "connectomics", "residual_unet", "modern_unet", "cosdd"
+    model_type: str = "connectomics"  # Options: "connectomics", "residual_unet", "modern_unet", "cosdd", "n2v"
     base_dim: int = 32
 
 
@@ -133,6 +161,7 @@ class PipelineConfig:
     noise: NoiseConfig = field(default_factory=NoiseConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     cosdd: COSDDConfig = field(default_factory=COSDDConfig)
+    n2v: N2VConfig = field(default_factory=N2VConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     loss: LossConfig = field(default_factory=LossConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
@@ -147,6 +176,7 @@ class PipelineConfig:
             noise=NoiseConfig(**d.get("noise", {})),
             model=ModelConfig(**d.get("model", {})),
             cosdd=COSDDConfig(**d.get("cosdd", {})),
+            n2v=N2VConfig(**d.get("n2v", {})),
             training=TrainingConfig(**d.get("training", {})),
             loss=LossConfig(**d.get("loss", {})),
             inference=InferenceConfig(**d.get("inference", {})),

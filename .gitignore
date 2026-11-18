@@ -11,7 +11,10 @@ wheels/
 
 # PyCharm / IDEs
 .idea/
+.vscode/
 
+# Local environment
+.env
 
 .pytest_cache/
 .ruff_cache/

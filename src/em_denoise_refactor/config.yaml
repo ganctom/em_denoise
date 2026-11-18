@@ -1,7 +1,7 @@
 # Pipeline Configuration for SBF-SEM Connectomics Denoising
 
 experiment:
-  name: "21_enh_loss_ResUNet_param_noise_SSIM_LAPL_0.5_0.5_photon_0.04_0.06"
+  name: "24_n2v_horizontal_lr0.0004_20ep"
   output_dir: "/Users/ganctoma/SW/sort/N2V/run_42"
 
 data:
@@ -36,7 +36,7 @@ noise:
   filter_type: "gaussian"          # "gaussian" or "median" for pseudo-clean estimation
   gaussian_sigma: 2.0              # Sigma for gaussian filter (default: 0.7)
   noise_amplification: 2.0         # Scale empirical noise deviation: 1.0=exact, 2.0=2x stronger, 0.5=weaker
-  photon_scale:   [0.04, 0.06]      #  Simulated photon count scale (can be float or [min, max] list)
+  photon_scale:   0.05      #  Simulated photon count scale (can be float or [min, max] list)
   read_std: 8.0 #[5.0, 15.0]             Detector readout noise std in uint8 space (can be float or [min, max] list)
   gain_variance: 0.02 # [0.01, 0.25]       Per-pixel detector gain variation (can be float or [min, max] list)
   streak_probability: 0.0          # Set to 0.0 to disable horizontal raster charging streak injection
@@ -47,21 +47,30 @@ model:
   #   - "residual_unet": Pre-activation ResBlock UNet with GroupNorm, GELU & strided downsampling
   #   - "modern_unet"  : Modern ResConvBlock UNet with bilinear upsampling
   #   - "cosdd"        : Unsupervised Correlated & Signal-Dependent Ladder VAE + PixelCNN
-  model_type: "residual_unet"
+  #   - "n2v"          : N2V2 self-supervised blind-spot UNet (NAFBlock + MaxBlurPool, no clean targets needed)
+  model_type: "n2v"
   base_dim: 32
 
 cosdd:
   s_code_channels: 64             # Latent signal code channels
-  number_layers: 14               # Depth of Ladder VAE
+  number_layers: 6               # Depth of Ladder VAE
   number_components: 3            # Number of GMM noise components
   scale_initialisation: true      # Scale initialization for VDVAE stability
   noise_direction: "x"            # Axis along which noise is correlated ('x', 'y', or 'none')
   use_direct_denoiser: false      # Option to train secondary direct denoiser UNet
 
+n2v:
+  # N2V2 / StructN2V self-supervised blind-spot training configuration.
+  # Only used when model.model_type is set to "n2v".
+  # When active, the noise synthesizer is BYPASSED: LMDB patches are treated as raw noisy inputs.
+  blind_spot_strict: true         # Sever top encoder skip (N2V2-correct). Set false to re-enable for ablation.
+  mask_ratio: 0.015               # Fraction of pixels masked per patch (~1 in 66). N2V2 default.
+  mask_mode: "horizontal"         # "random" (N2V2 point mask) | "horizontal" (StructN2V, targets raster streaks) | "vertical"
+
 training:
   batch_size: 32
-  epochs: 10
-  learning_rate: 0.0002
+  epochs: 20
+  learning_rate: 0.0004
   cache_in_ram: true         # If false, dynamic noise synthesis is sampled fresh on every epoch
   device: "mps"              # Hardware backend: "mps", "cuda", or "cpu"
 

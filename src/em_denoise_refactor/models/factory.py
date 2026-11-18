@@ -23,6 +23,8 @@ def build_model(
       - "connectomics", "nafnet": NAFBlock + LaplacianEdgeAttention global residual network
       - "residual_unet", "res_unet": Deep Pre-activation Residual UNet with GroupNorm & GELU
       - "modern_unet": Modern ResConvBlock UNet with bilinear upsampling
+      - "cosdd": Unsupervised Correlated & Signal-Dependent Ladder VAE + PixelCNN
+      - "n2v", "noise2void": N2V2 self-supervised blind-spot UNet (NAFBlock + MaxBlurPool)
     """
     m_type = model_type.lower().strip()
 
@@ -61,8 +63,17 @@ def build_model(
             noise_direction=kwargs.get("noise_direction", "x"),
             use_direct_denoiser=kwargs.get("use_direct_denoiser", False),
         )
+    elif m_type in ("n2v", "noise2void", "n2v2"):
+        from em_denoise_refactor.models.n2v import N2VUNet
+
+        return N2VUNet(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            base_dim=base_dim,
+            blind_spot_strict=kwargs.get("blind_spot_strict", True),
+        )
     else:
-        valid_models = ["connectomics", "residual_unet", "modern_unet", "cosdd"]
+        valid_models = ["connectomics", "residual_unet", "modern_unet", "cosdd", "n2v"]
         raise ValueError(
             f"Unknown model_type '{model_type}'. Choose from: {valid_models}"
         )

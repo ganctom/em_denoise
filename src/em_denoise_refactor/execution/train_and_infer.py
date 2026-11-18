@@ -29,6 +29,7 @@ from em_denoise_refactor.data.dataset import (
     SBFSEMNoiseSynthesizer,
     EmpiricalNoiseSynthesizer,
 )
+from em_denoise_refactor.data.n2v_dataset import N2VDatasetWrapper
 from em_denoise_refactor.execution.calibration import run_calibration
 from em_denoise_refactor.models.factory import build_model
 from em_denoise_refactor.models.loss import (
@@ -442,6 +443,7 @@ class DenoisingTrainer:
         self.model.train()
         total_loss = 0.0
         total_metrics: Dict[str, float] = {}
+        is_n2v = getattr(self.model, "is_n2v", False)
 
         pbar = tqdm(
             enumerate(dataloader),
@@ -451,31 +453,49 @@ class DenoisingTrainer:
             bar_format="{desc}: {percentage:3.0f}%| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}",
         )
 
-        for batch_idx, (noisy_b, clean_b, _) in pbar:
-            noisy_b, clean_b = noisy_b.to(self.device), clean_b.to(self.device)
+        for batch_idx, batch in pbar:
+            if is_n2v:
+                # N2V batch: (masked_input, original_noisy, mask, fname)
+                masked_b, original_b, mask_b, _ = batch
+                masked_b = masked_b.to(self.device)
+                original_b = original_b.to(self.device)
+                mask_b = mask_b.to(self.device).float()
 
-            self.optimizer.zero_grad()
-            if hasattr(self.model, "ar_decoder"):
-                pred_b, loss_out = self.model(noisy_b)
-            elif self.use_amp:
-                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                self.optimizer.zero_grad()
+                pred_b = self.model(masked_b)
+                # Blind-spot loss: MSE only at masked positions
+                loss = ((pred_b - original_b) ** 2 * mask_b).sum() / torch.clamp(
+                    mask_b.sum(), min=1.0
+                )
+                metrics = {"loss_masked_mse": float(loss.item())}
+                batch_size = masked_b.size(0)
+            else:
+                # Supervised batch: (noisy, clean, fname)
+                noisy_b, clean_b, _ = batch
+                noisy_b, clean_b = noisy_b.to(self.device), clean_b.to(self.device)
+
+                self.optimizer.zero_grad()
+                if hasattr(self.model, "ar_decoder"):
+                    pred_b, loss_out = self.model(noisy_b)
+                elif self.use_amp:
+                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                        pred_b = self.model(noisy_b)
+                        loss_out = self.criterion(pred_b, clean_b)
+                else:
                     pred_b = self.model(noisy_b)
                     loss_out = self.criterion(pred_b, clean_b)
-            else:
-                pred_b = self.model(noisy_b)
-                loss_out = self.criterion(pred_b, clean_b)
 
-            if isinstance(loss_out, tuple):
-                loss, metrics = loss_out
-            else:
-                loss = loss_out
-                metrics = {"loss_total": float(loss.item())}
+                if isinstance(loss_out, tuple):
+                    loss, metrics = loss_out
+                else:
+                    loss = loss_out
+                    metrics = {"loss_total": float(loss.item())}
+                batch_size = noisy_b.size(0)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
 
-            batch_size = noisy_b.size(0)
             batch_loss = float(loss.item())
             total_loss += batch_loss * batch_size
 
@@ -486,7 +506,9 @@ class DenoisingTrainer:
                 self._purge_memory()
 
             postfix = {"loss": f"{batch_loss:.5f}"}
-            if "loss_charbonnier" in metrics:
+            if is_n2v:
+                postfix["masked_mse"] = f"{batch_loss:.5f}"
+            elif "loss_charbonnier" in metrics:
                 postfix["chrb"] = f"{metrics['loss_charbonnier']:.4f}"
             elif "loss_edge" in metrics and metrics["loss_edge"] > 0:
                 postfix["edge"] = f"{metrics['loss_edge']:.4f}"
@@ -504,6 +526,7 @@ class DenoisingTrainer:
         val_psnrs: List[float] = []
         val_ssims: List[float] = []
         total_val_metrics: Dict[str, float] = {}
+        is_n2v = getattr(self.model, "is_n2v", False)
 
         pbar = tqdm(
             dataloader,
@@ -513,40 +536,58 @@ class DenoisingTrainer:
         )
 
         with torch.no_grad():
-            for noisy_b, clean_b, _ in pbar:
-                noisy_b, clean_b = noisy_b.to(self.device), clean_b.to(self.device)
+            for batch in pbar:
+                if is_n2v:
+                    # N2V val batch: (masked_input, original_noisy, mask, fname)
+                    masked_b, original_b, mask_b, _ = batch
+                    masked_b = masked_b.to(self.device)
+                    original_b = original_b.to(self.device)
+                    mask_b = mask_b.to(self.device).float()
 
-                if hasattr(self.model, "ar_decoder"):
-                    pred_b, loss_out = self.model(noisy_b)
-                elif self.use_amp:
-                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    pred_b = self.model(masked_b)
+                    # Blind-spot loss at masked positions only
+                    loss = ((pred_b - original_b) ** 2 * mask_b).sum() / torch.clamp(
+                        mask_b.sum(), min=1.0
+                    )
+                    metrics = {"loss_masked_mse": float(loss.item())}
+                    batch_size = masked_b.size(0)
+                    # N2V has no clean reference for PSNR/SSIM during training —
+                    # skip to avoid misleading metrics (val PSNR will show 0.0)
+                else:
+                    # Supervised val batch: (noisy, clean, fname)
+                    noisy_b, clean_b, _ = batch
+                    noisy_b, clean_b = noisy_b.to(self.device), clean_b.to(self.device)
+
+                    if hasattr(self.model, "ar_decoder"):
+                        pred_b, loss_out = self.model(noisy_b)
+                    elif self.use_amp:
+                        with torch.autocast(device_type="cuda", dtype=torch.float16):
+                            pred_b = self.model(noisy_b)
+                            loss_out = self.criterion(pred_b, clean_b)
+                    else:
                         pred_b = self.model(noisy_b)
                         loss_out = self.criterion(pred_b, clean_b)
-                else:
-                    pred_b = self.model(noisy_b)
-                    loss_out = self.criterion(pred_b, clean_b)
 
-                if isinstance(loss_out, tuple):
-                    loss, metrics = loss_out
-                else:
-                    loss = loss_out
-                    metrics = {"loss_total": float(loss.item())}
+                    if isinstance(loss_out, tuple):
+                        loss, metrics = loss_out
+                    else:
+                        loss = loss_out
+                        metrics = {"loss_total": float(loss.item())}
 
-                batch_size = noisy_b.size(0)
+                    batch_size = noisy_b.size(0)
+                    pred_clamp = torch.clamp(pred_b, 0.0, 1.0)
+
+                    for i in range(pred_b.size(0)):
+                        c_np = clean_b[i, 0].cpu().numpy()
+                        p_np = pred_clamp[i, 0].cpu().numpy()
+                        val_psnrs.append(EvaluationMetrics.compute_psnr(p_np, c_np))
+                        val_ssims.append(EvaluationMetrics.compute_ssim(p_np, c_np))
+
                 total_val_loss += float(loss.item()) * batch_size
-
                 for k, v in metrics.items():
                     total_val_metrics[k] = (
                         total_val_metrics.get(k, 0.0) + float(v) * batch_size
                     )
-
-                pred_clamp = torch.clamp(pred_b, 0.0, 1.0)
-
-                for i in range(pred_b.size(0)):
-                    c_np = clean_b[i, 0].cpu().numpy()
-                    p_np = pred_clamp[i, 0].cpu().numpy()
-                    val_psnrs.append(EvaluationMetrics.compute_psnr(p_np, c_np))
-                    val_ssims.append(EvaluationMetrics.compute_ssim(p_np, c_np))
 
         self._purge_memory()
         num_samples = len(dataloader.dataset)
@@ -796,8 +837,8 @@ def parse_args() -> argparse.Namespace:
         "--model-type",
         type=str,
         default=None,
-        choices=["connectomics", "residual_unet", "modern_unet"],
-        help="Override neural network model architecture (connectomics, residual_unet, or modern_unet).",
+        choices=["connectomics", "residual_unet", "modern_unet", "cosdd", "n2v"],
+        help="Override neural network model architecture.",
     )
     parser.add_argument(
         "--device",
@@ -878,6 +919,18 @@ def main() -> None:
     learning_rate = args.lr if args.lr is not None else cfg.training.learning_rate
     device_str = args.device if args.device is not None else cfg.training.device
 
+    # Resolve model_type early so N2V mode can influence dataset construction below
+    model_type = (
+        args.model
+        if args.model
+        else (
+            cfg.model.model_type
+            if hasattr(cfg, "model") and cfg.model
+            else "connectomics"
+        )
+    )
+    is_n2v_mode = model_type.lower() in ("n2v", "noise2void", "n2v2")
+
     run_dir = output_dir / exp_name if exp_name else output_dir
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -895,7 +948,16 @@ def main() -> None:
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
     lmdb_store_path = output_dir / "patch_store.lmdb"
-    if getattr(cfg.noise, "synthesizer_type", "parametric") == "empirical":
+
+    if is_n2v_mode:
+        # N2V is self-supervised: training uses raw noisy patches directly.
+        # The noise synthesizer must NOT be applied — LMDB patches ARE the noisy inputs.
+        noise_injector = None
+        logger.info(
+            "N2V self-supervised mode: noise synthesizer BYPASSED. "
+            "LMDB patches will be used as raw noisy inputs."
+        )
+    elif getattr(cfg.noise, "synthesizer_type", "parametric") == "empirical":
         model_path = Path(getattr(cfg.noise, "empirical_model_path", "noise_model.npy"))
         if not model_path.is_absolute():
             model_path = output_dir / model_path
@@ -1017,6 +1079,36 @@ def main() -> None:
             val_dataset, batch_size=min(batch_size, len(val_dataset)), shuffle=False
         )
 
+        if is_n2v_mode:
+            # Wrap both splits with N2V blind-spot masking.
+            # The inner datasets already have noise_injector=None so noisy == clean == raw EM.
+            n2v_mask_ratio = (
+                getattr(cfg.n2v, "mask_ratio", 0.015) if hasattr(cfg, "n2v") else 0.015
+            )
+            n2v_mask_mode = (
+                getattr(cfg.n2v, "mask_mode", "random")
+                if hasattr(cfg, "n2v")
+                else "random"
+            )
+            train_loader = DataLoader(
+                N2VDatasetWrapper(
+                    train_dataset, mask_ratio=n2v_mask_ratio, mask_mode=n2v_mask_mode
+                ),
+                batch_size=min(batch_size, len(train_dataset)),
+                shuffle=True,
+            )
+            val_loader = DataLoader(
+                N2VDatasetWrapper(
+                    val_dataset, mask_ratio=n2v_mask_ratio, mask_mode=n2v_mask_mode
+                ),
+                batch_size=min(batch_size, len(val_dataset)),
+                shuffle=False,
+            )
+            logger.info(
+                f"N2V masking: mode='{n2v_mask_mode}', ratio={n2v_mask_ratio:.4f}. "
+                f"Datasets wrapped with N2VDatasetWrapper."
+            )
+
         logger.info(
             f"Dataset Size: {len(train_dataset)} Train patches | {len(val_dataset)} Val patches"
         )
@@ -1031,15 +1123,7 @@ def main() -> None:
     logger.info(f"Using target device: {device}")
     use_amp = device.type == "cuda"
 
-    model_type = (
-        args.model
-        if args.model
-        else (
-            cfg.model.model_type
-            if hasattr(cfg, "model") and cfg.model
-            else "connectomics"
-        )
-    )
+    # model_type resolved early (before dataset construction) as `model_type` and `is_n2v_mode`
     base_dim = cfg.model.base_dim if hasattr(cfg, "model") and cfg.model else 32
     cosdd_opts = {}
     if hasattr(cfg, "cosdd") and cfg.cosdd:
@@ -1051,12 +1135,18 @@ def main() -> None:
             "noise_direction": getattr(cfg.cosdd, "noise_direction", "x"),
             "use_direct_denoiser": getattr(cfg.cosdd, "use_direct_denoiser", False),
         }
+    n2v_opts = {}
+    if hasattr(cfg, "n2v") and cfg.n2v:
+        n2v_opts = {
+            "blind_spot_strict": getattr(cfg.n2v, "blind_spot_strict", True),
+        }
     model = build_model(
         model_type=model_type,
         in_channels=1,
         out_channels=1,
         base_dim=base_dim,
         **cosdd_opts,
+        **n2v_opts,
     ).to(device)
     logger.info(
         f"Initialized neural network architecture: '{model_type}' (base_dim={base_dim})"
