@@ -1,0 +1,72 @@
+# Pipeline Configuration for SBF-SEM Noise2Noise (N2N) Duplicated-Tile Training
+
+experiment:
+  name: "01_n2n_dupl_modunet_char_095_ssim_005_lr0.00005_10ep_ps128_all_patch"  # Run subdirectory created under output_dir
+  output_dir: "/Users/ganctoma/SW/sort/N2V/run_44_n2n_dupl_tiles"  # Root folder for run outputs, checkpoints, logs
+
+data:
+  # Retained for PipelineConfig compatibility; not read when n2n.source == "duplicates"
+  sbem_root: "/Volumes/tachyon/groups/scratch/gmicro_sem/gfriedri/_EM_acquisitions/20260201_RoLi_F1/"
+  grid_num: 0
+  first_sec: 1250
+  last_sec: 22800
+
+splitting:
+  strategy: "random"             # For duplicates: always uses seeded random splitting (see n2n.split_unit & n2n.split_seed)
+  train_ratio: 0.8               # Fraction of split units assigned to train
+  val_ratio: 0.1                 # Fraction of split units assigned to validation
+  test_ratio: 0.1                # Fraction of split units assigned to test
+
+extraction:
+  patch_size: 128                # Square crop size (px) extracted from full tiles (e.g. 128, 192, 256)
+
+n2n:
+  enabled: true                  # Enable Noise2Noise mode (bypasses synthetic noise injection)
+  source: "duplicates"           # "overlaps" (sbem-n2n-overlaps tar shards) | "duplicates" (whole duplicated .tif tiles)
+  duplicates_dir: "/Users/ganctoma/SW/sort/N2V/run_44_n2n_dupl_tiles/0x_all_dupl_tiles"  # Folder of ..._g{G}_t{T}_s{S}.tif tiles
+  pair_mode: "all"               # "all" (all unordered pairs in a cluster) | "neighbours" (consecutive sections s, s+1 only)
+  split_unit: "patch"            # "group" (tile_id x section cluster, recommended) | "image" (per tile) | "patch" (per crop)
+  split_seed: 42                 # RNG seed for reproducible train/val/test split
+  pair_direction: "first_to_second"  # "random_swap" (50/50 on train, 0->1 on val/test) | "first_to_second" | "second_to_first"
+  max_train_pairs: 5000          # Cap train pairs/tiles after splitting (null = use all)
+  max_val_pairs: 1000            # Cap val pairs/tiles after splitting (null = use all)
+  max_test_pairs: 1000           # Cap test pairs/tiles after splitting (null = use all)
+  seed: 42                       # RNG seed for patch sampling and pair subsampling
+  max_cache_tiles: 32            # Max full tiles kept in per-worker LRU cache when training.cache_in_ram is false
+  augment_rot90: true           # false = H/V flips only (preserves scan-axis noise anisotropy) | true = also 90-deg rotations
+  align_patches: true            # true = per-patch FFT integer-shift registration | false = raw coordinates
+  align_max_shift_px: 16         # Max integer shift (px) searched per axis when align_patches is true
+  align_blur_sigma: 1.0          # Gaussian smoothing sigma (px) used only for shift estimation
+  patch_sampling: "random"       # "random" (1 random crop per pair per epoch) | "tile" (full-tile grid with tile_stride)
+  tile_stride: null              # Stride (px) when patch_sampling == "tile" (null = patch_size, non-overlapping)
+  trim_enabled: false            # Overlap-only margin trimming; ignored with a warning when source == "duplicates"
+  quality_filter_enabled: false   # Reject patches scoring below min_pair_quality
+  quality_metric: "ssim"         # "ssim" (structural similarity on smoothed crops) | "ncc" (normalized cross-correlation)
+  min_pair_quality: 0.80         # Minimum score to accept a patch ([-1, 1] for ncc/ssim)
+  quality_blur_sigma: 1.5        # Gaussian smoothing sigma (px) applied before quality scoring
+
+model:
+  model_type: "modern_unet"      # "modern_unet" | "residual_unet" | "connectomics" | "cosdd" (note: "n2v" cannot be used with n2n)
+  base_dim: 32                   # Base channel width of the U-Net (e.g. 16, 32, 64)
+
+training:
+  batch_size: 32                 # Mini-batch size
+  epochs: 5                     # Total training epochs
+  learning_rate: 0.00005         # AdamW learning rate
+  cache_in_ram: false            # false = bounded LRU tile cache (low RAM) | true = preload all split tiles into RAM
+  device: "mps"                  # "mps" (Apple Silicon) | "cuda" (NVIDIA GPU) | "cpu"
+  num_workers: 0                 # DataLoader worker processes (0 = main process; >0 for parallel disk I/O)
+
+loss:
+  loss_type: "enhanced"          # "enhanced" (weighted terms below) | "dynamic" (auto-weighted) | "composite" (legacy MSE+Sobel+SSIM)
+  charbonnier_weight: 0.95       # Pseudo-L1 sharpness-preserving loss weight (when loss_type == "enhanced")
+  ssim_weight: 0.05              # Structural similarity loss weight
+  laplacian_weight: 0.0          # 2nd-order derivative loss weight (keep 0.0 for N2N noisy targets)
+  ffl_weight: 0.0                # Focal Frequency Loss weight (keep 0.0 for N2N noisy targets)
+  espi_weight: 0.0               # Edge Preservation Index weight (keep 0.0 for N2N noisy targets)
+  edge_weight: 0.0               # Sobel edge loss weight (keep 0.0 for N2N noisy targets)
+
+inference:
+  custom_input_dir: "/Users/ganctoma/SW/sort/N2V/test_raw"  # Folder of .tif images to denoise after training (null = N2N test split only)
+  preview_image: "/Users/ganctoma/SW/sort/N2V/test_raw/20260201_RoLi_F1_g0000_t0436_s05329.tif"  # Fixed .tif for per-epoch preview (or null)
+  preview_crop_size: 1024         # Center crop size (px) used for per-epoch preview

@@ -34,6 +34,7 @@ from em_denoise_refactor.data.n2n_dataset import (
     N2NOverlapPairDataset,
     N2NStreamingShardDataset,
 )
+from em_denoise_refactor.data.n2n_duplicate_dataset import N2NDuplicateTileDataset
 from em_denoise_refactor.execution.calibration import run_calibration
 from em_denoise_refactor.models.factory import build_model
 from em_denoise_refactor.models.loss import (
@@ -972,6 +973,43 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _build_n2n_duplicate_dataset(
+    cfg: PipelineConfig,
+    split: str,
+    max_pairs: Optional[int],
+    augment: bool,
+) -> N2NDuplicateTileDataset:
+    """Build an N2NDuplicateTileDataset from PipelineConfig for a given split."""
+    return N2NDuplicateTileDataset(
+        duplicates_dir=Path(cfg.n2n.duplicates_dir),
+        split=split,
+        patch_size=cfg.extraction.patch_size,
+        train_ratio=cfg.splitting.train_ratio,
+        val_ratio=cfg.splitting.val_ratio,
+        test_ratio=cfg.splitting.test_ratio,
+        pair_mode=getattr(cfg.n2n, "pair_mode", "all"),
+        split_unit=getattr(cfg.n2n, "split_unit", "group"),
+        split_seed=getattr(cfg.n2n, "split_seed", 42),
+        pair_direction=cfg.n2n.pair_direction,
+        max_pairs=max_pairs,
+        cache_in_ram=cfg.training.cache_in_ram,
+        max_cache_tiles=getattr(cfg.n2n, "max_cache_tiles", 32),
+        augment=augment,
+        augment_rot90=cfg.n2n.augment_rot90,
+        seed=cfg.n2n.seed,
+        align_patches=cfg.n2n.align_patches,
+        align_max_shift_px=cfg.n2n.align_max_shift_px,
+        align_blur_sigma=cfg.n2n.align_blur_sigma,
+        patch_sampling=cfg.n2n.patch_sampling,
+        tile_stride=cfg.n2n.tile_stride,
+        trim_enabled=cfg.n2n.trim_enabled,
+        quality_filter_enabled=cfg.n2n.quality_filter_enabled,
+        quality_metric=cfg.n2n.quality_metric,
+        min_pair_quality=cfg.n2n.min_pair_quality,
+        quality_blur_sigma=cfg.n2n.quality_blur_sigma,
+    )
+
+
 def main() -> None:
     args = parse_args()
 
@@ -1014,6 +1052,15 @@ def main() -> None:
     )
     is_n2v_mode = model_type.lower() in ("n2v", "noise2void", "n2v2")
     is_n2n_mode = hasattr(cfg, "n2n") and bool(getattr(cfg.n2n, "enabled", False))
+    n2n_source = (
+        getattr(cfg.n2n, "source", "overlaps").lower().strip()
+        if is_n2n_mode
+        else "overlaps"
+    )
+    if is_n2n_mode and n2n_source not in ("overlaps", "duplicates"):
+        raise ValueError(
+            f"n2n.source must be 'overlaps' or 'duplicates', got '{n2n_source}'"
+        )
     if is_n2n_mode and is_n2v_mode:
         raise ValueError(
             "n2n.enabled=True cannot be combined with model_type='n2v'. "
@@ -1045,6 +1092,12 @@ def main() -> None:
         logger.info(
             "N2V self-supervised mode: noise synthesizer BYPASSED. "
             "LMDB patches will be used as raw noisy inputs."
+        )
+    elif is_n2n_mode and n2n_source == "duplicates":
+        noise_injector = None
+        logger.info(
+            "N2N duplicate-tile mode: noise synthesizer BYPASSED. "
+            f"Reading paired duplicate tiles from: {cfg.n2n.duplicates_dir}"
         )
     elif is_n2n_mode:
         # N2N uses real paired noisy overlap crops from sbem-n2n-overlaps.
@@ -1084,7 +1137,25 @@ def main() -> None:
 
     if not args.eval_only:
         logger.info("Initializing Train & Validation Datasets...")
-        if is_n2n_mode and getattr(cfg.n2n, "streaming", False):
+        if is_n2n_mode and n2n_source == "duplicates":
+            train_dataset = _build_n2n_duplicate_dataset(
+                cfg=cfg,
+                split="train",
+                max_pairs=cfg.n2n.max_train_pairs,
+                augment=True,
+            )
+            val_dataset = _build_n2n_duplicate_dataset(
+                cfg=cfg,
+                split="val",
+                max_pairs=cfg.n2n.max_val_pairs,
+                augment=False,
+            )
+            split_summary_path = run_dir / "duplicate_splits.json"
+            train_dataset.save_split_summary(split_summary_path)
+            logger.info(
+                f"Saved duplicate-tile split table (seed={cfg.n2n.split_seed}) to: {split_summary_path}"
+            )
+        elif is_n2n_mode and getattr(cfg.n2n, "streaming", False):
             overlaps_dir = Path(cfg.n2n.overlaps_dir)
             train_dataset = N2NStreamingShardDataset(
                 overlaps_dir=overlaps_dir,
@@ -1567,6 +1638,15 @@ def main() -> None:
         )
         test_dataset = CustomTIFFDataset(custom_input_dir, cache_in_ram=True)
         test_denoised_dir = run_dir / "custom_inference" / "denoised"
+    elif is_n2n_mode and n2n_source == "duplicates":
+        logger.info(f"Loading N2N duplicate test pairs from: {cfg.n2n.duplicates_dir}")
+        test_denoised_dir = run_dir / "test" / "denoised"
+        test_dataset = _build_n2n_duplicate_dataset(
+            cfg=cfg,
+            split="test",
+            max_pairs=cfg.n2n.max_test_pairs,
+            augment=False,
+        )
     elif is_n2n_mode and getattr(cfg.n2n, "streaming", False):
         overlaps_dir = Path(cfg.n2n.overlaps_dir)
         logger.info(

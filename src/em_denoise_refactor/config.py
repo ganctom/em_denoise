@@ -156,11 +156,20 @@ class N2VConfig:
 @dataclass
 class N2NConfig:
     """
-    Configuration for Noise2Noise (N2N) training on sbem-n2n-overlaps shards.
+    Configuration for Noise2Noise (N2N) training on sbem-n2n-overlaps shards
+    or duplicated SBEMimage tiles.
     """
 
     enabled: bool = False
+    source: str = "overlaps"  # "overlaps" or "duplicates"
     overlaps_dir: str = ""
+    duplicates_dir: str = ""
+    pair_mode: str = "all"  # "all" or "neighbours" (duplicates mode)
+    split_unit: str = "group"  # "group", "image", or "patch" (duplicates mode)
+    split_seed: int = 42
+    max_cache_tiles: int = (
+        32  # Bounded LRU tile cache per worker when cache_in_ram=False
+    )
     pair_direction: str = (
         "random_swap"  # "random_swap", "first_to_second", "second_to_first"
     )
