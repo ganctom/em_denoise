@@ -15,6 +15,7 @@ from __future__ import annotations
 from collections import OrderedDict, defaultdict
 import json
 import logging
+import math
 from pathlib import Path
 import random
 import re
@@ -22,6 +23,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import zlib
 
 import numpy as np
+from scipy.ndimage import shift as ndi_shift
 import tifffile
 import torch
 from torch.utils.data import Dataset, get_worker_info
@@ -29,6 +31,7 @@ from torch.utils.data import Dataset, get_worker_info
 from em_denoise_refactor.data.n2n_dataset import (
     _compute_pair_quality,
     _estimate_integer_shift,
+    _estimate_subpixel_shift,
     _format_pair_tensors,
 )
 
@@ -134,6 +137,7 @@ class N2NDuplicateTileDataset(Dataset):
         augment_rot90: bool = False,
         seed: int = 42,
         align_patches: bool = False,
+        align_subpixel: bool = False,
         align_max_shift_px: int = 16,
         align_blur_sigma: float = 1.0,
         patch_sampling: str = "random",
@@ -162,6 +166,7 @@ class N2NDuplicateTileDataset(Dataset):
         self.augment_rot90 = bool(augment_rot90)
         self.seed = int(seed)
         self.align_patches = bool(align_patches)
+        self.align_subpixel = bool(align_subpixel)
         self.align_max_shift_px = int(align_max_shift_px)
         self.align_blur_sigma = float(align_blur_sigma)
         self.patch_sampling = patch_sampling.lower().strip()
@@ -603,18 +608,41 @@ class N2NDuplicateTileDataset(Dataset):
             crop1 = img1[y0 : y0 + ps, x0 : x0 + ps]
 
             if self.align_patches:
-                dy, dx = _estimate_integer_shift(
-                    crop0,
-                    crop1,
-                    max_shift=self.align_max_shift_px,
-                    blur_sigma=self.align_blur_sigma,
-                )
-                y1 = y0 - dy
-                x1 = x0 - dx
-                if y1 < 0 or y1 + ps > h1 or x1 < 0 or x1 + ps > w1:
-                    self.rejected_oob_count += 1
-                    continue
-                crop1 = img1[y1 : y1 + ps, x1 : x1 + ps]
+                if self.align_subpixel:
+                    dy_f, dx_f = _estimate_subpixel_shift(
+                        crop0,
+                        crop1,
+                        max_shift=self.align_max_shift_px,
+                        blur_sigma=self.align_blur_sigma,
+                    )
+                    pad = math.ceil(max(abs(dy_f), abs(dx_f))) + 4
+                    y_lo = y0 - pad
+                    y_hi = y0 + ps + pad
+                    x_lo = x0 - pad
+                    x_hi = x0 + ps + pad
+                    if y_lo < 0 or y_hi > h1 or x_lo < 0 or x_hi > w1:
+                        self.rejected_oob_count += 1
+                        continue
+                    img1_pad = img1[y_lo:y_hi, x_lo:x_hi].astype(np.float32)
+                    shifted_pad = ndi_shift(
+                        img1_pad, shift=(dy_f, dx_f), order=3, mode="nearest"
+                    )
+                    crop1 = np.clip(
+                        shifted_pad[pad : pad + ps, pad : pad + ps], 0.0, 255.0
+                    )
+                else:
+                    dy, dx = _estimate_integer_shift(
+                        crop0,
+                        crop1,
+                        max_shift=self.align_max_shift_px,
+                        blur_sigma=self.align_blur_sigma,
+                    )
+                    y1 = y0 - dy
+                    x1 = x0 - dx
+                    if y1 < 0 or y1 + ps > h1 or x1 < 0 or x1 + ps > w1:
+                        self.rejected_oob_count += 1
+                        continue
+                    crop1 = img1[y1 : y1 + ps, x1 : x1 + ps]
 
             if self.quality_filter_enabled:
                 score = _compute_pair_quality(
@@ -649,7 +677,11 @@ class N2NDuplicateTileDataset(Dataset):
         if not self.pairs:
             raise RuntimeError("No valid duplicate pairs remain in dataset.")
 
-        attempts = max(1, len(self.pairs))
+        attempts = (
+            max(1, min(len(self), 256))
+            if self.tile_index is not None
+            else max(1, len(self.pairs))
+        )
         cur_idx = idx % len(self)
 
         for _ in range(attempts):

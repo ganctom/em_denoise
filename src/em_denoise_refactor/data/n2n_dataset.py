@@ -29,6 +29,7 @@ from typing import Dict, List, Optional, Tuple
 import duckdb
 import numpy as np
 from scipy.ndimage import gaussian_filter
+from skimage.registration import phase_cross_correlation
 import tifffile
 import torch
 from torch.utils.data import Dataset, IterableDataset
@@ -72,6 +73,56 @@ def _estimate_integer_shift(
     roi = cc_shifted[cy - r : cy + r + 1, cx - r : cx + r + 1]
     iy, ix = np.unravel_index(np.argmax(roi), roi.shape)
     return int(iy - r), int(ix - r)
+
+
+def _estimate_subpixel_shift(
+    ref: np.ndarray,
+    mov: np.ndarray,
+    max_shift: int = 16,
+    blur_sigma: float = 1.0,
+    upsample_factor: int = 10,
+) -> Tuple[float, float]:
+    """
+    Estimate sub-pixel (dy, dx) shift such that `scipy.ndimage.shift(mov, (dy, dx))`
+    aligns `mov` with `ref`.
+
+    Uses a two-stage approach: coarse integer alignment via `_estimate_integer_shift`
+    (bounded to `[-max_shift, +max_shift]`), followed by Hann-windowed sub-pixel
+    cross-correlation on the overlapping interior so boundary windowing does not
+    bias the fractional peak.
+    """
+    idy, idx = _estimate_integer_shift(
+        ref, mov, max_shift=max_shift, blur_sigma=blur_sigma
+    )
+    h, w = ref.shape
+    ry0, ry1 = max(0, idy), h + min(0, idy)
+    rx0, rx1 = max(0, idx), w + min(0, idx)
+    my0, my1 = max(0, -idy), h + min(0, -idy)
+    mx0, mx1 = max(0, -idx), w + min(0, -idx)
+
+    if (ry1 - ry0) < 16 or (rx1 - rx0) < 16:
+        return float(idy), float(idx)
+
+    a = ref[ry0:ry1, rx0:rx1].astype(np.float32)
+    b = mov[my0:my1, mx0:mx1].astype(np.float32)
+    if blur_sigma > 0.0:
+        a = gaussian_filter(a, sigma=blur_sigma)
+        b = gaussian_filter(b, sigma=blur_sigma)
+
+    a = a - a.mean()
+    b = b - b.mean()
+    win = np.outer(np.hanning(a.shape[0]), np.hanning(a.shape[1])).astype(np.float32)
+    fshift, _, _ = phase_cross_correlation(
+        a * win,
+        b * win,
+        upsample_factor=upsample_factor,
+        normalization=None,
+    )
+    dy = float(idy + fshift[0])
+    dx = float(idx + fshift[1])
+    if abs(dy) > max_shift or abs(dx) > max_shift:
+        return float(idy), float(idx)
+    return dy, dx
 
 
 def _compute_pair_quality(

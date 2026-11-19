@@ -1,0 +1,75 @@
+# Textbook Noise2Noise (N2N) Clean Baseline Configuration for Duplicated SBEMimage Tiles
+# Addresses early plateau, loss bias, alignment blurring, and reproducibility gaps.
+
+experiment:
+  name: "02_n2n_dupl_resunet_mse_cosinelr_subpx_50ep"  # Run subdirectory created under output_dir
+  output_dir: "/Users/ganctoma/SW/sort/N2V/run_44_n2n_dupl_tiles"  # Root folder for run outputs, checkpoints, logs
+
+data:
+  # Retained for PipelineConfig compatibility; not read when n2n.source == "duplicates"
+  sbem_root: "/Volumes/tachyon/groups/scratch/gmicro_sem/gfriedri/_EM_acquisitions/20260201_RoLi_F1/"
+  grid_num: 0
+  first_sec: 1250
+  last_sec: 22800
+
+splitting:
+  strategy: "random"             # Seeded random splitting (see n2n.split_unit & n2n.split_seed)
+  train_ratio: 0.8               # Fraction of split units assigned to train
+  val_ratio: 0.1                 # Fraction of split units assigned to validation
+  test_ratio: 0.1                # Fraction of split units assigned to test
+
+extraction:
+  patch_size: 128                # Square crop size (px) extracted from full tiles (e.g. 128, 192, 256)
+
+n2n:
+  enabled: true                  # Enable Noise2Noise mode (bypasses synthetic noise injection)
+  source: "duplicates"           # "overlaps" (tar shards) | "duplicates" (whole duplicated .tif tiles)
+  duplicates_dir: "/Users/ganctoma/SW/sort/N2V/run_44_n2n_dupl_tiles/0x_all_dupl_tiles"
+  pair_mode: "all"               # "all" (all unordered pairs in cluster) | "neighbours" (consecutive s, s+1 only)
+  split_unit: "group"            # "group" (tile_id x section cluster, leak-free) | "image" | "patch"
+  split_seed: 42                 # RNG seed for reproducible train/val/test split
+  pair_direction: "random_swap"  # "random_swap" eliminates scan-1 -> scan-2 directional brightness bias
+  max_train_pairs: 5000          # Train patches per epoch
+  max_val_pairs: 1000            # Val patches per epoch
+  max_test_pairs: 1000           # Test patches for final evaluation
+  seed: 42                       # RNG seed for patch sampling
+  max_cache_tiles: 32            # Bounded LRU tile cache per worker when training.cache_in_ram is false
+  augment_rot90: false           # false = H/V flips only (preserves horizontal scan-axis noise anisotropy)
+  align_patches: true            # Enable cross-correlation registration
+  align_subpixel: true           # Two-stage sub-pixel phase cross-correlation + cubic spline shift (order=3)
+  align_max_shift_px: 16         # Max shift (px) searched per axis
+  align_blur_sigma: 1.0          # Gaussian smoothing sigma (px) used only for shift estimation
+  patch_sampling: "random"       # "random" (fresh random crops across full tile) | "tile" (fixed grid)
+  tile_stride: null              # Grid stride when patch_sampling == "tile" (null = patch_size)
+  trim_enabled: false            # Overlap-only option (not used for duplicates)
+  quality_filter_enabled: true   # Reject severely mismatched or flat patches
+  quality_metric: "ssim"         # "ssim" | "ncc"
+  min_pair_quality: 0.75         # Threshold tuned to duplicate-tile SSIM distribution (median ~0.83)
+  quality_blur_sigma: 1.5        # Gaussian smoothing sigma (px) applied before quality scoring
+
+model:
+  model_type: "residual_unet"    # 4-level pre-activation ResUNet (1, 2, 4, 8) with larger receptive field
+  base_dim: 32                   # Base channel width [32, 64, 128, 256]
+
+training:
+  batch_size: 32                 # Mini-batch size
+  epochs: 50                     # Enough optimizer steps (~7,800) to refine fine vesicles & membranes
+  learning_rate: 0.0003          # Peak AdamW learning rate after warmup
+  lr_scheduler: "cosine"         # "none" | "cosine" (linear warmup + CosineAnnealingLR)
+  lr_min: 0.000001               # Minimum LR at end of cosine decay
+  warmup_epochs: 2               # Linear LR warmup epochs
+  seed: 42                       # Global Python / NumPy / PyTorch RNG seed
+  cache_in_ram: false            # false = bounded LRU tile cache | true = preload all split tiles into RAM
+  device: "mps"                  # "mps" (Apple Silicon) | "cuda" (NVIDIA GPU) | "cpu"
+  num_workers: 0                 # DataLoader worker processes
+
+loss:
+  loss_type: "composite"         # Unbiased pure MSE loss for Noise2Noise conditional mean recovery
+  mse_weight: 1.0
+  edge_weight: 0.0               # Must be 0.0 for N2N noisy targets
+  ssim_weight: 0.0               # Must be 0.0 for N2N noisy targets (avoids variance-matching bias)
+
+inference:
+  custom_input_dir: "/Users/ganctoma/SW/sort/N2V/test_raw"
+  preview_image: "/Users/ganctoma/SW/sort/N2V/test_raw/20260201_RoLi_F1_g0000_t0436_s05329.tif"
+  preview_crop_size: 512

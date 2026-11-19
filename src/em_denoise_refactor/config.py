@@ -77,6 +77,10 @@ class TrainingConfig:
     batch_size: int = 64
     epochs: int = 100
     learning_rate: float = 0.0001
+    lr_scheduler: str = "none"  # "none" or "cosine"
+    lr_min: float = 1e-6
+    warmup_epochs: int = 0
+    seed: Optional[int] = 42
     cache_in_ram: bool = False
     device: str = "mps"
     num_workers: int = 0
@@ -180,6 +184,7 @@ class N2NConfig:
     seed: int = 42
     augment_rot90: bool = False
     align_patches: bool = False
+    align_subpixel: bool = False
     align_max_shift_px: int = 16
     align_blur_sigma: float = 1.0
     patch_sampling: str = (

@@ -9,10 +9,12 @@ and evaluates performance metrics (MSE, PSNR, SSIM) on test sets.
 """
 
 import argparse
+from dataclasses import asdict
 import gc
 import json
 import logging
 import math
+import random
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
@@ -21,6 +23,7 @@ import numpy as np
 import tifffile
 import torch
 import torch.nn as nn
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 from tqdm import tqdm
 
@@ -50,6 +53,110 @@ from em_denoise_refactor.models.loss import (
 from em_denoise_refactor.data.interfaces import NoiseSynthesizer
 
 logger = logging.getLogger("train_and_infer")
+
+
+def _set_global_seed(seed: int) -> None:
+    """Seed Python, NumPy, and PyTorch RNGs for reproducible runs."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _to_plain_data(obj: Any) -> Any:
+    """Recursively convert Path objects to strings for checkpoint/JSON safety."""
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {k: _to_plain_data(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_plain_data(v) for v in obj]
+    return obj
+
+
+def _serialize_config(cfg: PipelineConfig) -> Dict[str, Any]:
+    """Serialize a PipelineConfig dataclass to a plain JSON-safe dictionary."""
+    return _to_plain_data(asdict(cfg))
+
+
+def _build_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    epochs: int,
+    lr_scheduler: str = "none",
+    lr_min: float = 1e-6,
+    warmup_epochs: int = 0,
+) -> Optional[Any]:
+    """Construct an epoch-stepped LR scheduler ('none' or 'cosine' with optional warmup)."""
+    mode = lr_scheduler.lower().strip()
+    if mode not in ("none", "cosine"):
+        raise ValueError(
+            f"lr_scheduler must be 'none' or 'cosine', got '{lr_scheduler}'"
+        )
+    if mode == "none":
+        return None
+
+    total_epochs = max(1, int(epochs))
+    warmup = max(0, int(warmup_epochs))
+    if warmup > 0 and total_epochs > warmup:
+        start_factor = 0.1 if warmup == 1 else max(0.05, 1.0 / warmup)
+        warmup_sched = LinearLR(
+            optimizer, start_factor=start_factor, end_factor=1.0, total_iters=warmup
+        )
+        cosine_sched = CosineAnnealingLR(
+            optimizer, T_max=max(1, total_epochs - warmup), eta_min=float(lr_min)
+        )
+        return SequentialLR(
+            optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warmup]
+        )
+    if warmup > 0:
+        return LinearLR(
+            optimizer, start_factor=0.1, end_factor=1.0, total_iters=total_epochs
+        )
+    return CosineAnnealingLR(optimizer, T_max=total_epochs, eta_min=float(lr_min))
+
+
+def compute_noise_corrected_metrics(
+    pred_mse: float, raw_pair_mse: float
+) -> Tuple[float, float]:
+    """
+    Estimate noise-free MSE and PSNR on Noise2Noise pairs in [0, 1] range.
+
+    Under independent zero-mean noise with variance sigma^2 on both images:
+      MSE(x, y) = 2 * sigma^2
+      MSE(pred, y) = MSE(pred, clean) + sigma^2
+    Therefore:
+      est_clean_mse ≈ MSE(pred, y) - 0.5 * MSE(x, y).
+    """
+    est_clean_mse = max(float(pred_mse) - 0.5 * float(raw_pair_mse), 1e-10)
+    est_clean_psnr = float(-10.0 * math.log10(est_clean_mse))
+    return est_clean_mse, est_clean_psnr
+
+
+def _compute_residual_stats(
+    raw_255: np.ndarray, denoised_255: np.ndarray
+) -> Dict[str, float]:
+    """Compute mean, std, and lag-1 X/Y autocorrelations of (raw - denoised)."""
+    res = raw_255.astype(np.float32) - denoised_255.astype(np.float32)
+    mean_val = float(res.mean())
+    std_val = float(res.std())
+    centered = res - mean_val
+    var = float(np.mean(centered * centered))
+    if var < 1e-12:
+        ac_x = 0.0
+        ac_y = 0.0
+    else:
+        ac_x = (
+            float(np.mean(centered[:, :-1] * centered[:, 1:]) / var)
+            if res.shape[1] > 1
+            else 0.0
+        )
+        ac_y = (
+            float(np.mean(centered[:-1, :] * centered[1:, :]) / var)
+            if res.shape[0] > 1
+            else 0.0
+        )
+    return {"mean": mean_val, "std": std_val, "ac_x": ac_x, "ac_y": ac_y}
 
 
 # -------------------------------------------------------------------------
@@ -423,6 +530,18 @@ class DenoisingTrainer:
         self.checkpoints_dir = checkpoints_dir
         self.use_amp = use_amp
         self.writer = writer
+        self.amp_dtype = (
+            torch.bfloat16
+            if (
+                use_amp and torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+            )
+            else torch.float16
+        )
+        self.scaler = (
+            torch.amp.GradScaler("cuda")
+            if (use_amp and self.amp_dtype == torch.float16)
+            else None
+        )
 
         self.mps_manager = None
         if device.type == "mps":
@@ -447,6 +566,7 @@ class DenoisingTrainer:
     ) -> Tuple[float, Dict[str, float]]:
         self.model.train()
         total_loss = 0.0
+        total_samples = 0
         total_metrics: Dict[str, float] = {}
         is_n2v = getattr(self.model, "is_n2v", False)
 
@@ -483,7 +603,7 @@ class DenoisingTrainer:
                 if hasattr(self.model, "ar_decoder"):
                     pred_b, loss_out = self.model(noisy_b)
                 elif self.use_amp:
-                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    with torch.autocast(device_type="cuda", dtype=self.amp_dtype):
                         pred_b = self.model(noisy_b)
                         loss_out = self.criterion(pred_b, clean_b)
                 else:
@@ -497,12 +617,20 @@ class DenoisingTrainer:
                     metrics = {"loss_total": float(loss.item())}
                 batch_size = noisy_b.size(0)
 
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
+            if self.scaler is not None:
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
 
             batch_loss = float(loss.item())
             total_loss += batch_loss * batch_size
+            total_samples += batch_size
 
             for k, v in metrics.items():
                 total_metrics[k] = total_metrics.get(k, 0.0) + float(v) * batch_size
@@ -519,15 +647,18 @@ class DenoisingTrainer:
                 postfix["edge"] = f"{metrics['loss_edge']:.4f}"
             pbar.set_postfix(postfix)
 
-        num_samples = len(dataloader.dataset)
-        avg_metrics = {k: v / num_samples for k, v in total_metrics.items()}
-        return total_loss / num_samples, avg_metrics
+        denom = total_samples if total_samples > 0 else len(dataloader.dataset)
+        avg_metrics = {k: v / denom for k, v in total_metrics.items()}
+        return total_loss / denom, avg_metrics
 
     def validate(
         self, dataloader: DataLoader, epoch: int, total_epochs: int
     ) -> Tuple[float, float, float, Dict[str, float]]:
         self.model.eval()
         total_val_loss = 0.0
+        total_samples = 0
+        total_raw_pair_mse = 0.0
+        total_pred_mse = 0.0
         val_psnrs: List[float] = []
         val_ssims: List[float] = []
         total_val_metrics: Dict[str, float] = {}
@@ -559,14 +690,14 @@ class DenoisingTrainer:
                     # N2V has no clean reference for PSNR/SSIM during training —
                     # skip to avoid misleading metrics (val PSNR will show 0.0)
                 else:
-                    # Supervised val batch: (noisy, clean, fname)
+                    # Supervised / N2N val batch: (noisy, target, fname)
                     noisy_b, clean_b, _ = batch
                     noisy_b, clean_b = noisy_b.to(self.device), clean_b.to(self.device)
 
                     if hasattr(self.model, "ar_decoder"):
                         pred_b, loss_out = self.model(noisy_b)
                     elif self.use_amp:
-                        with torch.autocast(device_type="cuda", dtype=torch.float16):
+                        with torch.autocast(device_type="cuda", dtype=self.amp_dtype):
                             pred_b = self.model(noisy_b)
                             loss_out = self.criterion(pred_b, clean_b)
                     else:
@@ -580,7 +711,15 @@ class DenoisingTrainer:
                         metrics = {"loss_total": float(loss.item())}
 
                     batch_size = noisy_b.size(0)
-                    pred_clamp = torch.clamp(pred_b, 0.0, 1.0)
+                    pred_clamp = torch.clamp(pred_b.float(), 0.0, 1.0)
+                    raw_pair_mse = float(
+                        torch.mean((noisy_b.float() - clean_b.float()) ** 2).item()
+                    )
+                    pred_mse = float(
+                        torch.mean((pred_clamp - clean_b.float()) ** 2).item()
+                    )
+                    total_raw_pair_mse += raw_pair_mse * batch_size
+                    total_pred_mse += pred_mse * batch_size
 
                     for i in range(pred_b.size(0)):
                         c_np = clean_b[i, 0].cpu().numpy()
@@ -589,17 +728,28 @@ class DenoisingTrainer:
                         val_ssims.append(EvaluationMetrics.compute_ssim(p_np, c_np))
 
                 total_val_loss += float(loss.item()) * batch_size
+                total_samples += batch_size
                 for k, v in metrics.items():
                     total_val_metrics[k] = (
                         total_val_metrics.get(k, 0.0) + float(v) * batch_size
                     )
 
         self._purge_memory()
-        num_samples = len(dataloader.dataset)
-        mean_val_loss = total_val_loss / num_samples
+        denom = total_samples if total_samples > 0 else len(dataloader.dataset)
+        mean_val_loss = total_val_loss / denom
         mean_val_psnr = float(np.mean(val_psnrs)) if val_psnrs else 0.0
         mean_val_ssim = float(np.mean(val_ssims)) if val_ssims else 0.0
-        avg_val_metrics = {k: v / num_samples for k, v in total_val_metrics.items()}
+        avg_val_metrics = {k: v / denom for k, v in total_val_metrics.items()}
+        if not is_n2v and denom > 0:
+            mean_raw_pair_mse = total_raw_pair_mse / denom
+            mean_pred_mse = total_pred_mse / denom
+            est_clean_mse, est_clean_psnr = compute_noise_corrected_metrics(
+                mean_pred_mse, mean_raw_pair_mse
+            )
+            avg_val_metrics["raw_pair_mse"] = mean_raw_pair_mse
+            avg_val_metrics["pred_mse"] = mean_pred_mse
+            avg_val_metrics["est_clean_mse"] = est_clean_mse
+            avg_val_metrics["est_clean_psnr"] = est_clean_psnr
 
         return mean_val_loss, mean_val_psnr, mean_val_ssim, avg_val_metrics
 
@@ -610,6 +760,8 @@ class DenoisingTrainer:
         val_psnr: float,
         val_ssim: float,
         is_best: bool = False,
+        scheduler: Optional[Any] = None,
+        config: Optional[Dict[str, Any]] = None,
     ) -> Path:
         state = {
             "epoch": epoch,
@@ -617,6 +769,10 @@ class DenoisingTrainer:
                 k: v.cpu() for k, v in self.model.state_dict().items()
             },
             "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": (
+                scheduler.state_dict() if scheduler is not None else None
+            ),
+            "config": config,
             "val_loss": val_loss,
             "val_psnr": val_psnr,
             "val_ssim": val_ssim,
@@ -644,6 +800,13 @@ class DenoisingEvaluator:
         self.model = model
         self.device = device
         self.use_amp = use_amp
+        self.amp_dtype = (
+            torch.bfloat16
+            if (
+                use_amp and torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+            )
+            else torch.float16
+        )
 
         # Loss metric calculators for detailed test set evaluation
         self.charbonnier_fn = CharbonnierLoss().to(device)
@@ -721,7 +884,7 @@ class DenoisingEvaluator:
                 if hasattr(self.model, "ar_decoder"):
                     pred_b = self._denoise_tiled(noisy_b)
                 elif self.use_amp:
-                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    with torch.autocast(device_type="cuda", dtype=self.amp_dtype):
                         pred_b = self.model(noisy_b)
                 else:
                     pred_b = self.model(noisy_b)
@@ -774,9 +937,16 @@ class DenoisingEvaluator:
                 )
                 tifffile.imwrite(output_denoised_dir / out_fname, denoised_uint8)
 
+        mean_noisy_mse = float(np.mean(noisy_mses))
+        mean_denoised_mse = float(np.mean(denoised_mses))
+        est_clean_mse, est_clean_psnr = compute_noise_corrected_metrics(
+            mean_denoised_mse, mean_noisy_mse
+        )
         results = {
-            "noisy_mse": float(np.mean(noisy_mses)),
-            "denoised_mse": float(np.mean(denoised_mses)),
+            "noisy_mse": mean_noisy_mse,
+            "denoised_mse": mean_denoised_mse,
+            "est_clean_mse": est_clean_mse,
+            "est_clean_psnr": est_clean_psnr,
             "noisy_psnr": float(np.mean(noisy_psnrs)),
             "denoised_psnr": float(np.mean(denoised_psnrs)),
             "noisy_ssim": float(np.mean(noisy_ssims)),
@@ -823,6 +993,48 @@ def _load_preview_crop(
     return np.clip(crop_f, 0.0, 1.0)
 
 
+def save_comparison_panel(
+    raw_255: np.ndarray,
+    denoised_255: np.ndarray,
+    out_path: Path,
+    denoised_title: str = "Denoised",
+) -> Dict[str, float]:
+    """Save a 3-panel PNG (Raw | Denoised | Residual) and return residual stats."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    raw_f = raw_255.astype(np.float32)
+    den_f = denoised_255.astype(np.float32)
+    residual = raw_f - den_f
+    stats = _compute_residual_stats(raw_f, den_f)
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5), dpi=120)
+    axes[0].imshow(raw_f, cmap="gray", vmin=0.0, vmax=255.0)
+    axes[0].set_title("Raw Input")
+    axes[0].axis("off")
+
+    axes[1].imshow(den_f, cmap="gray", vmin=0.0, vmax=255.0)
+    axes[1].set_title(denoised_title)
+    axes[1].axis("off")
+
+    im_res = axes[2].imshow(residual, cmap="RdBu_r", vmin=-60.0, vmax=60.0)
+    axes[2].set_title(
+        f"Residual (Raw - Denoised)\n"
+        f"mean={stats['mean']:.2f}, std={stats['std']:.2f}, "
+        f"ac_x={stats['ac_x']:.3f}, ac_y={stats['ac_y']:.3f}"
+    )
+    axes[2].axis("off")
+    fig.colorbar(im_res, ax=axes[2], fraction=0.046, pad=0.04)
+
+    plt.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(str(out_path))
+    plt.close(fig)
+    return stats
+
+
 def _save_checkpoint_preview(
     model: nn.Module,
     raw_crop: np.ndarray,
@@ -830,13 +1042,8 @@ def _save_checkpoint_preview(
     epoch: int,
     device: torch.device,
     writer: Optional[Any] = None,
-) -> None:
-    """Denoise a fixed raw crop and save TIFF + side-by-side PNG + TensorBoard image."""
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
+) -> Dict[str, float]:
+    """Denoise a fixed raw crop and save TIFF + 3-panel PNG + TensorBoard images."""
     previews_dir.mkdir(parents=True, exist_ok=True)
     if epoch == 1:
         raw_u8 = np.clip(raw_crop * 255.0, 0, 255).astype(np.uint8)
@@ -859,19 +1066,19 @@ def _save_checkpoint_preview(
     denoised_u8 = np.clip(denoised * 255.0, 0, 255).astype(np.uint8)
     tifffile.imwrite(str(previews_dir / f"epoch_{epoch:03d}.tif"), denoised_u8)
 
-    fig, axes = plt.subplots(1, 2, figsize=(10, 5), dpi=120)
-    axes[0].imshow(raw_crop, cmap="gray", vmin=0.0, vmax=1.0)
-    axes[0].set_title("Raw Input")
-    axes[0].axis("off")
-    axes[1].imshow(denoised, cmap="gray", vmin=0.0, vmax=1.0)
-    axes[1].set_title(f"Denoised (Epoch {epoch:02d})")
-    axes[1].axis("off")
-    plt.tight_layout()
-    fig.savefig(str(previews_dir / f"epoch_{epoch:03d}_comparison.png"))
-    plt.close(fig)
+    stats = save_comparison_panel(
+        raw_255=raw_crop * 255.0,
+        denoised_255=denoised * 255.0,
+        out_path=previews_dir / f"epoch_{epoch:03d}_comparison.png",
+        denoised_title=f"Denoised (Epoch {epoch:02d})",
+    )
 
     if writer is not None:
         writer.add_image("Preview/Denoised", denoised[None, ...], global_step=epoch)
+        writer.add_scalar("Preview/Residual_Std", stats["std"], epoch)
+        writer.add_scalar("Preview/Residual_AC_X", stats["ac_x"], epoch)
+        writer.add_scalar("Preview/Residual_AC_Y", stats["ac_y"], epoch)
+    return stats
 
 
 # -------------------------------------------------------------------------
@@ -998,6 +1205,7 @@ def _build_n2n_duplicate_dataset(
         augment_rot90=cfg.n2n.augment_rot90,
         seed=cfg.n2n.seed,
         align_patches=cfg.n2n.align_patches,
+        align_subpixel=getattr(cfg.n2n, "align_subpixel", False),
         align_max_shift_px=cfg.n2n.align_max_shift_px,
         align_blur_sigma=cfg.n2n.align_blur_sigma,
         patch_sampling=cfg.n2n.patch_sampling,
@@ -1023,6 +1231,11 @@ def main() -> None:
     cfg = PipelineConfig.from_yaml(clean_config_path)
     loaded_path = getattr(cfg, "_loaded_from", clean_config_path)
     logger.info(f"Loaded pipeline configuration from: {loaded_path}")
+
+    seed = getattr(cfg.training, "seed", None)
+    if seed is not None:
+        _set_global_seed(int(seed))
+        logger.info(f"Global RNG seed set to: {seed}")
 
     output_dir = (
         Path(args.output_dir) if args.output_dir else Path(cfg.experiment.output_dir)
@@ -1482,6 +1695,22 @@ def main() -> None:
             trainable_params += crit_params
 
     optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate)
+    lr_scheduler_name = getattr(cfg.training, "lr_scheduler", "none")
+    lr_min = float(getattr(cfg.training, "lr_min", 1e-6))
+    warmup_epochs = int(getattr(cfg.training, "warmup_epochs", 0))
+    scheduler = _build_lr_scheduler(
+        optimizer=optimizer,
+        epochs=epochs,
+        lr_scheduler=lr_scheduler_name,
+        lr_min=lr_min,
+        warmup_epochs=warmup_epochs,
+    )
+    if scheduler is not None:
+        logger.info(
+            f"Initialized LR scheduler: '{lr_scheduler_name}' "
+            f"(lr_min={lr_min}, warmup_epochs={warmup_epochs})"
+        )
+    serialized_cfg = _serialize_config(cfg)
 
     log_dir = run_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -1539,17 +1768,26 @@ def main() -> None:
         best_val_loss = float("inf")
 
         for epoch in range(1, epochs + 1):
+            cur_lr = float(optimizer.param_groups[0]["lr"])
             train_loss, train_metrics = trainer.train_epoch(train_loader, epoch, epochs)
             val_loss, val_psnr, val_ssim, val_metrics = trainer.validate(
                 val_loader, epoch, epochs
             )
+            if scheduler is not None:
+                scheduler.step()
 
             is_best = val_loss < best_val_loss
             if is_best:
                 best_val_loss = val_loss
 
             best_ckpt = trainer.save_checkpoint(
-                epoch, val_loss, val_psnr, val_ssim, is_best=is_best
+                epoch,
+                val_loss,
+                val_psnr,
+                val_ssim,
+                is_best=is_best,
+                scheduler=scheduler,
+                config=serialized_cfg,
             )
             if is_best:
                 best_checkpoint_path = best_ckpt
@@ -1569,12 +1807,30 @@ def main() -> None:
                 writer.add_scalar("Loss/Validation", val_loss, epoch)
                 writer.add_scalar("Metrics/Val_PSNR", val_psnr, epoch)
                 writer.add_scalar("Metrics/Val_SSIM", val_ssim, epoch)
+                writer.add_scalar("Train/LR", cur_lr, epoch)
+                if is_n2n_mode and "est_clean_psnr" in val_metrics:
+                    writer.add_scalar(
+                        "Metrics/Val_EstClean_PSNR",
+                        val_metrics["est_clean_psnr"],
+                        epoch,
+                    )
+                    writer.add_scalar(
+                        "Metrics/Val_EstClean_MSE",
+                        val_metrics["est_clean_mse"],
+                        epoch,
+                    )
                 for k, v in train_metrics.items():
                     writer.add_scalar(f"Train_Metrics/{k}", v, epoch)
                 for k, v in val_metrics.items():
                     writer.add_scalar(f"Val_Metrics/{k}", v, epoch)
 
             best_str = " [BEST]" if is_best else ""
+            est_str = (
+                f" | EstPSNR: {val_metrics['est_clean_psnr']:.2f}dB"
+                if is_n2n_mode and "est_clean_psnr" in val_metrics
+                else ""
+            )
+            lr_str = f" | LR: {cur_lr:.2e}"
             if loss_type == "enhanced":
                 chrb = train_metrics.get("loss_charbonnier", 0.0)
                 lap = train_metrics.get("loss_laplacian", 0.0)
@@ -1583,7 +1839,7 @@ def main() -> None:
                 logger.info(
                     f"Ep [{epoch:02d}/{epochs:02d}] | Tr: {train_loss:.5f} | Val: {val_loss:.5f} | "
                     f"Chrb: {chrb:.4f} | Lap: {lap:.4f} | FFL: {ffl:.4f} | ESPI: {espi:.4f} | "
-                    f"PSNR: {val_psnr:.2f}dB | SSIM: {val_ssim:.4f}{best_str}"
+                    f"PSNR: {val_psnr:.2f}dB{est_str} | SSIM: {val_ssim:.4f}{lr_str}{best_str}"
                 )
             elif loss_type == "dynamic":
                 chrb = train_metrics.get("loss_charbonnier", 0.0)
@@ -1593,13 +1849,13 @@ def main() -> None:
                 logger.info(
                     f"Ep [{epoch:02d}/{epochs:02d}] | Tr: {train_loss:.5f} | Val: {val_loss:.5f} | "
                     f"Chrb: {chrb:.4f} | FFL: {ffl:.4f} | VST: {vst:.4f} | Lap: {lap:.4f} | "
-                    f"PSNR: {val_psnr:.2f}dB | SSIM: {val_ssim:.4f}{best_str}"
+                    f"PSNR: {val_psnr:.2f}dB{est_str} | SSIM: {val_ssim:.4f}{lr_str}{best_str}"
                 )
             else:
                 edge = train_metrics.get("loss_edge", 0.0)
                 logger.info(
                     f"Ep [{epoch:02d}/{epochs:02d}] | Tr: {train_loss:.5f} | Val: {val_loss:.5f} | "
-                    f"Edge: {edge:.4f} | PSNR: {val_psnr:.2f}dB | SSIM: {val_ssim:.4f}{best_str}"
+                    f"Edge: {edge:.4f} | PSNR: {val_psnr:.2f}dB{est_str} | SSIM: {val_ssim:.4f}{lr_str}{best_str}"
                 )
 
             file_handler.flush()
@@ -1747,6 +2003,10 @@ def main() -> None:
         f" Mean PSNR        : Noisy = {results['noisy_psnr']:.2f} dB ==>  Denoised = {results['denoised_psnr']:.2f} dB (Higher is better)",
         f" Mean SSIM        : Noisy = {results['noisy_ssim']:.4f}    ==>  Denoised = {results['denoised_ssim']:.4f}    (Higher is better)",
     ]
+    if is_n2n_mode and results.get("noisy_mse", 0.0) > 0.0:
+        summary_lines.append(
+            f" Est. Clean (N2N) : MSE = {results['est_clean_mse']:.6f} | PSNR = {results['est_clean_psnr']:.2f} dB"
+        )
     if "noisy_charbonnier" in results:
         summary_lines.append(
             f" Mean Charbonnier : Noisy = {results['noisy_charbonnier']:.6f}  ==>  Denoised = {results['denoised_charbonnier']:.6f} (Lower is better)"
