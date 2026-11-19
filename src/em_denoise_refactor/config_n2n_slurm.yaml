@@ -49,6 +49,8 @@ n2n:
   quality_metric: "ncc"
   min_pair_quality: 0.60
   quality_blur_sigma: 1.5
+  streaming: false                # Set true (with max_train_pairs: null) to stream all 2M+ pairs in <2 GB RAM
+  shuffle_buffer_size: 2048
 
 model:
   model_type: "modern_unet"       # "connectomics", "residual_unet", or "modern_unet"
@@ -58,8 +60,9 @@ training:
   batch_size: 32
   epochs: 20
   learning_rate: 0.0004
-  cache_in_ram: true              # Set false if max_train_pairs exceeds ~80k stripes
+  cache_in_ram: true              # Ignored when n2n.streaming=true
   device: "cuda"
+  num_workers: 0                  # Set 4-8 when n2n.streaming=true on SLURM
 
 loss:
   loss_type: "enhanced"

@@ -79,6 +79,7 @@ class TrainingConfig:
     learning_rate: float = 0.0001
     cache_in_ram: bool = False
     device: str = "mps"
+    num_workers: int = 0
 
 
 @dataclass
@@ -189,6 +190,8 @@ class N2NConfig:
     quality_metric: str = "ncc"  # "ncc" (smoothed Pearson correlation) or "ssim"
     min_pair_quality: float = 0.60
     quality_blur_sigma: float = 1.5
+    streaming: bool = False
+    shuffle_buffer_size: int = 2048
 
 
 @dataclass

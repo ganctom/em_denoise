@@ -31,7 +31,7 @@ import numpy as np
 from scipy.ndimage import gaussian_filter
 import tifffile
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, IterableDataset
 from tqdm import tqdm
 
 logger = logging.getLogger("train_and_infer")
@@ -796,32 +796,263 @@ class N2NOverlapPairDataset(Dataset):
             pair_id = f"{pair_id}_y{y0}_x{x0}"
             crop0, crop1 = self._extract_aligned_crops(pair_arr, y0, x0)
 
-        # Select input/target direction
-        if self.pair_direction == "second_to_first":
-            inp_np, tgt_np = crop1, crop0
-        elif self.pair_direction == "first_to_second" or self.is_val_or_test:
+        return _format_pair_tensors(
+            crop0=crop0,
+            crop1=crop1,
+            pair_direction=self.pair_direction,
+            is_val_or_test=self.is_val_or_test,
+            augment=self.augment,
+            augment_rot90=self.augment_rot90,
+        ) + (pair_id,)
+
+
+def _format_pair_tensors(
+    crop0: np.ndarray,
+    crop1: np.ndarray,
+    pair_direction: str,
+    is_val_or_test: bool,
+    augment: bool,
+    augment_rot90: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Select input/target direction, normalize uint8 -> float32 [0, 1], and augment."""
+    if pair_direction == "second_to_first":
+        inp_np, tgt_np = crop1, crop0
+    elif pair_direction == "first_to_second" or is_val_or_test:
+        inp_np, tgt_np = crop0, crop1
+    else:
+        if random.random() < 0.5:
             inp_np, tgt_np = crop0, crop1
         else:
-            # random_swap during training
-            if random.random() < 0.5:
-                inp_np, tgt_np = crop0, crop1
-            else:
-                inp_np, tgt_np = crop1, crop0
+            inp_np, tgt_np = crop1, crop0
 
-        inp_t = torch.from_numpy(inp_np.astype(np.float32) / 255.0).unsqueeze(0)
-        tgt_t = torch.from_numpy(tgt_np.astype(np.float32) / 255.0).unsqueeze(0)
+    inp_t = torch.from_numpy(inp_np.astype(np.float32) / 255.0).unsqueeze(0)
+    tgt_t = torch.from_numpy(tgt_np.astype(np.float32) / 255.0).unsqueeze(0)
 
-        if self.augment:
-            if random.random() < 0.5:
-                inp_t = torch.flip(inp_t, dims=[2])
-                tgt_t = torch.flip(tgt_t, dims=[2])
-            if random.random() < 0.5:
-                inp_t = torch.flip(inp_t, dims=[1])
-                tgt_t = torch.flip(tgt_t, dims=[1])
-            if self.augment_rot90:
-                k = random.randint(0, 3)
-                if k > 0:
-                    inp_t = torch.rot90(inp_t, k, dims=[1, 2])
-                    tgt_t = torch.rot90(tgt_t, k, dims=[1, 2])
+    if augment:
+        if random.random() < 0.5:
+            inp_t = torch.flip(inp_t, dims=[2])
+            tgt_t = torch.flip(tgt_t, dims=[2])
+        if random.random() < 0.5:
+            inp_t = torch.flip(inp_t, dims=[1])
+            tgt_t = torch.flip(tgt_t, dims=[1])
+        if augment_rot90:
+            k = random.randint(0, 3)
+            if k > 0:
+                inp_t = torch.rot90(inp_t, k, dims=[1, 2])
+                tgt_t = torch.rot90(tgt_t, k, dims=[1, 2])
 
-        return inp_t, tgt_t, pair_id
+    return inp_t, tgt_t
+
+
+class N2NStreamingShardDataset(IterableDataset):
+    """
+    Constant-RAM shard-sequential streaming IterableDataset for 2M+ N2N overlap pairs.
+
+    Reads `manifest.parquet` once in `__init__` to partition sections and list shards,
+    then streams each `.tar` shard in ascending byte-offset order through a local
+    shuffle buffer. Safe for multi-worker DataLoaders (`num_workers > 0`).
+    """
+
+    def __init__(
+        self,
+        overlaps_dir: Path | str,
+        split: str = "train",
+        patch_size: int = 128,
+        first_sec: Optional[int] = None,
+        last_sec: Optional[int] = None,
+        split_strategy: str = "block",
+        block_size: int = 100,
+        train_ratio: float = 0.8,
+        val_ratio: float = 0.1,
+        guard_band_size: int = 5,
+        orientation: str = "all",
+        max_pairs: Optional[int] = None,
+        pair_direction: str = "random_swap",
+        augment: bool = False,
+        augment_rot90: bool = False,
+        seed: int = 42,
+        shuffle_buffer_size: int = 2048,
+    ) -> None:
+        super().__init__()
+        self.overlaps_dir = Path(overlaps_dir)
+        self.split = split.lower().strip()
+        self.patch_size = patch_size
+        self.pair_direction = pair_direction.lower().strip()
+        self.augment = augment
+        self.augment_rot90 = augment_rot90
+        self.seed = int(seed)
+        self.shuffle_buffer_size = (
+            0 if self.split in ("val", "test") else int(shuffle_buffer_size)
+        )
+        self.is_val_or_test = self.split in ("val", "test")
+        self._epoch = 0
+
+        self.manifest_path = self.overlaps_dir / "manifest.parquet"
+        if not self.manifest_path.exists():
+            raise FileNotFoundError(
+                f"N2NStreamingShardDataset requires manifest.parquet at: {self.manifest_path}"
+            )
+
+        where_clauses = [
+            f"m.height >= {int(patch_size)}",
+            f"m.width >= {int(patch_size)}",
+        ]
+        if first_sec is not None:
+            where_clauses.append(f"m.section_num >= {int(first_sec)}")
+        if last_sec is not None:
+            where_clauses.append(f"m.section_num <= {int(last_sec)}")
+        if orientation.lower() in ("horizontal", "vertical"):
+            where_clauses.append(f"lower(m.orientation) = '{orientation.lower()}'")
+        self.where_sql = " AND ".join(where_clauses)
+        manifest_str = str(self.manifest_path).replace("'", "''")
+
+        con = duckdb.connect()
+        sec_rows = con.execute(
+            f"SELECT DISTINCT m.section_num FROM read_parquet('{manifest_str}') m "
+            f"WHERE {self.where_sql} ORDER BY m.section_num"
+        ).fetchall()
+        all_sections = [int(r[0]) for r in sec_rows]
+
+        split_map = _build_section_split_filter(
+            sections=all_sections,
+            strategy=split_strategy,
+            block_size=block_size,
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+            guard_band_size=guard_band_size,
+        )
+        self.target_sections = sorted(split_map[self.split])
+        if not self.target_sections:
+            raise ValueError(
+                f"No sections assigned to split '{self.split}' under strategy '{split_strategy}'"
+            )
+
+        con.execute("CREATE TEMP TABLE split_secs (section_num INTEGER)")
+        con.executemany(
+            "INSERT INTO split_secs VALUES (?)", [(s,) for s in self.target_sections]
+        )
+        shard_rows = con.execute(
+            f"SELECT m.shard_relpath, COUNT(*) AS cnt "
+            f"FROM read_parquet('{manifest_str}') m "
+            f"INNER JOIN split_secs s ON m.section_num = s.section_num "
+            f"WHERE {self.where_sql} "
+            f"GROUP BY m.shard_relpath ORDER BY m.shard_relpath"
+        ).fetchall()
+        con.close()
+
+        self.shards: List[Tuple[str, int]] = [
+            (str(r[0]), int(r[1])) for r in shard_rows
+        ]
+        raw_total = sum(cnt for _, cnt in self.shards)
+        self.max_pairs = int(max_pairs) if max_pairs is not None else None
+        self.total_pairs = (
+            min(raw_total, self.max_pairs) if self.max_pairs else raw_total
+        )
+
+        logger.info(
+            f"N2N Streaming '{self.split}': {len(self.shards)} shards, "
+            f"{self.total_pairs} pairs (raw={raw_total}, buffer={self.shuffle_buffer_size})"
+        )
+
+    def __len__(self) -> int:
+        return self.total_pairs
+
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is None:
+            worker_id, num_workers = 0, 1
+        else:
+            worker_id, num_workers = worker_info.id, worker_info.num_workers
+
+        epoch_seed = self.seed + self._epoch
+        self._epoch += 1
+        rng = random.Random(epoch_seed + worker_id * 1009)
+
+        shard_list = [s for s, _ in self.shards]
+        if not self.is_val_or_test:
+            rng.shuffle(shard_list)
+        worker_shards = shard_list[worker_id::num_workers]
+        if not worker_shards:
+            return
+
+        worker_cap: Optional[int] = None
+        if self.max_pairs is not None:
+            worker_cap = self.max_pairs // num_workers + (
+                1 if worker_id < (self.max_pairs % num_workers) else 0
+            )
+
+        manifest_str = str(self.manifest_path).replace("'", "''")
+        con = duckdb.connect()
+        con.execute("CREATE TEMP TABLE split_secs (section_num INTEGER)")
+        con.executemany(
+            "INSERT INTO split_secs VALUES (?)", [(s,) for s in self.target_sections]
+        )
+
+        buf: List[Tuple[torch.Tensor, torch.Tensor, str]] = []
+        yielded = 0
+        ps = self.patch_size
+
+        try:
+            for shard_rel in worker_shards:
+                if worker_cap is not None and yielded >= worker_cap:
+                    break
+                shard_esc = shard_rel.replace("'", "''")
+                rows = con.execute(
+                    f"SELECT m.pair_id, m.tif_byte_offset, m.tif_byte_length "
+                    f"FROM read_parquet('{manifest_str}') m "
+                    f"INNER JOIN split_secs s ON m.section_num = s.section_num "
+                    f"WHERE {self.where_sql} AND m.shard_relpath = '{shard_esc}' "
+                    f"ORDER BY m.tif_byte_offset ASC"
+                ).fetchall()
+
+                shard_path = self.overlaps_dir / shard_rel
+                with open(shard_path, "rb") as f:
+                    for pair_id, offset, length in rows:
+                        if worker_cap is not None and yielded + len(buf) >= worker_cap:
+                            break
+                        f.seek(int(offset))
+                        raw_bytes = f.read(int(length))
+                        arr = tifffile.imread(io.BytesIO(raw_bytes))
+                        _, h, w = arr.shape
+                        if h < ps or w < ps:
+                            continue
+
+                        if self.is_val_or_test:
+                            y0 = (h - ps) // 2
+                            x0 = (w - ps) // 2
+                        else:
+                            y0 = rng.randint(0, h - ps) if h > ps else 0
+                            x0 = rng.randint(0, w - ps) if w > ps else 0
+
+                        crop0 = arr[0, y0 : y0 + ps, x0 : x0 + ps]
+                        crop1 = arr[1, y0 : y0 + ps, x0 : x0 + ps]
+                        inp_t, tgt_t = _format_pair_tensors(
+                            crop0=crop0,
+                            crop1=crop1,
+                            pair_direction=self.pair_direction,
+                            is_val_or_test=self.is_val_or_test,
+                            augment=self.augment,
+                            augment_rot90=self.augment_rot90,
+                        )
+                        item = (inp_t, tgt_t, str(pair_id))
+
+                        if self.shuffle_buffer_size <= 1:
+                            yield item
+                            yielded += 1
+                        else:
+                            buf.append(item)
+                            if len(buf) >= self.shuffle_buffer_size:
+                                pop_i = rng.randrange(len(buf))
+                                buf[pop_i], buf[-1] = buf[-1], buf[pop_i]
+                                yield buf.pop()
+                                yielded += 1
+        finally:
+            con.close()
+
+        if not self.is_val_or_test:
+            rng.shuffle(buf)
+        for item in buf:
+            if worker_cap is not None and yielded >= worker_cap:
+                break
+            yield item
+            yielded += 1

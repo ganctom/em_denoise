@@ -21,7 +21,7 @@ import numpy as np
 import tifffile
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, IterableDataset
 from tqdm import tqdm
 
 from em_denoise_refactor.config import PipelineConfig
@@ -30,7 +30,10 @@ from em_denoise_refactor.data.dataset import (
     EmpiricalNoiseSynthesizer,
 )
 from em_denoise_refactor.data.n2v_dataset import N2VDatasetWrapper
-from em_denoise_refactor.data.n2n_dataset import N2NOverlapPairDataset
+from em_denoise_refactor.data.n2n_dataset import (
+    N2NOverlapPairDataset,
+    N2NStreamingShardDataset,
+)
 from em_denoise_refactor.execution.calibration import run_calibration
 from em_denoise_refactor.models.factory import build_model
 from em_denoise_refactor.models.loss import (
@@ -1081,7 +1084,46 @@ def main() -> None:
 
     if not args.eval_only:
         logger.info("Initializing Train & Validation Datasets...")
-        if is_n2n_mode:
+        if is_n2n_mode and getattr(cfg.n2n, "streaming", False):
+            overlaps_dir = Path(cfg.n2n.overlaps_dir)
+            train_dataset = N2NStreamingShardDataset(
+                overlaps_dir=overlaps_dir,
+                split="train",
+                patch_size=cfg.extraction.patch_size,
+                first_sec=cfg.data.first_sec,
+                last_sec=cfg.data.last_sec,
+                split_strategy=cfg.splitting.strategy,
+                block_size=cfg.splitting.block_size,
+                train_ratio=cfg.splitting.train_ratio,
+                val_ratio=cfg.splitting.val_ratio,
+                guard_band_size=cfg.splitting.guard_band_size,
+                orientation=cfg.n2n.orientation,
+                max_pairs=cfg.n2n.max_train_pairs,
+                pair_direction=cfg.n2n.pair_direction,
+                augment=True,
+                augment_rot90=cfg.n2n.augment_rot90,
+                seed=cfg.n2n.seed,
+                shuffle_buffer_size=getattr(cfg.n2n, "shuffle_buffer_size", 2048),
+            )
+            val_dataset = N2NStreamingShardDataset(
+                overlaps_dir=overlaps_dir,
+                split="val",
+                patch_size=cfg.extraction.patch_size,
+                first_sec=cfg.data.first_sec,
+                last_sec=cfg.data.last_sec,
+                split_strategy=cfg.splitting.strategy,
+                block_size=cfg.splitting.block_size,
+                train_ratio=cfg.splitting.train_ratio,
+                val_ratio=cfg.splitting.val_ratio,
+                guard_band_size=cfg.splitting.guard_band_size,
+                orientation=cfg.n2n.orientation,
+                max_pairs=cfg.n2n.max_val_pairs,
+                pair_direction=cfg.n2n.pair_direction,
+                augment=False,
+                seed=cfg.n2n.seed,
+                shuffle_buffer_size=0,
+            )
+        elif is_n2n_mode:
             overlaps_dir = Path(cfg.n2n.overlaps_dir)
             train_dataset = N2NOverlapPairDataset(
                 overlaps_dir=overlaps_dir,
@@ -1240,11 +1282,24 @@ def main() -> None:
                 augment=False,
             )
 
+        num_workers = int(getattr(cfg.training, "num_workers", 0))
+        use_pin_memory = device_str == "cuda"
+        is_iterable = isinstance(train_dataset, IterableDataset)
         train_loader = DataLoader(
-            train_dataset, batch_size=min(batch_size, len(train_dataset)), shuffle=True
+            train_dataset,
+            batch_size=min(batch_size, len(train_dataset)),
+            shuffle=(not is_iterable),
+            num_workers=num_workers,
+            pin_memory=use_pin_memory,
+            persistent_workers=(num_workers > 0),
         )
         val_loader = DataLoader(
-            val_dataset, batch_size=min(batch_size, len(val_dataset)), shuffle=False
+            val_dataset,
+            batch_size=min(batch_size, len(val_dataset)),
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=use_pin_memory,
+            persistent_workers=(num_workers > 0),
         )
 
         if is_n2v_mode:
@@ -1512,6 +1567,30 @@ def main() -> None:
         )
         test_dataset = CustomTIFFDataset(custom_input_dir, cache_in_ram=True)
         test_denoised_dir = run_dir / "custom_inference" / "denoised"
+    elif is_n2n_mode and getattr(cfg.n2n, "streaming", False):
+        overlaps_dir = Path(cfg.n2n.overlaps_dir)
+        logger.info(
+            f"Loading N2N streaming test pairs from overlaps store: {overlaps_dir}"
+        )
+        test_denoised_dir = run_dir / "test" / "denoised"
+        test_dataset = N2NStreamingShardDataset(
+            overlaps_dir=overlaps_dir,
+            split="test",
+            patch_size=cfg.extraction.patch_size,
+            first_sec=cfg.data.first_sec,
+            last_sec=cfg.data.last_sec,
+            split_strategy=cfg.splitting.strategy,
+            block_size=cfg.splitting.block_size,
+            train_ratio=cfg.splitting.train_ratio,
+            val_ratio=cfg.splitting.val_ratio,
+            guard_band_size=cfg.splitting.guard_band_size,
+            orientation=cfg.n2n.orientation,
+            max_pairs=cfg.n2n.max_test_pairs,
+            pair_direction=cfg.n2n.pair_direction,
+            augment=False,
+            seed=cfg.n2n.seed,
+            shuffle_buffer_size=0,
+        )
     elif is_n2n_mode:
         overlaps_dir = Path(cfg.n2n.overlaps_dir)
         logger.info(f"Loading N2N test pairs from overlaps store: {overlaps_dir}")
