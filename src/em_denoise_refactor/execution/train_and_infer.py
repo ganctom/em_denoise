@@ -1106,6 +1106,19 @@ def main() -> None:
                 align_blur_sigma=cfg.n2n.align_blur_sigma,
                 patch_sampling=cfg.n2n.patch_sampling,
                 tile_stride=cfg.n2n.tile_stride,
+                trim_enabled=cfg.n2n.trim_enabled,
+                v_trim_top_px=cfg.n2n.v_trim_top_px,
+                v_trim_left_px=cfg.n2n.v_trim_left_px,
+                v_trim_bottom_px=cfg.n2n.v_trim_bottom_px,
+                v_trim_right_px=cfg.n2n.v_trim_right_px,
+                h_trim_left_px=cfg.n2n.h_trim_left_px,
+                h_trim_top_px=cfg.n2n.h_trim_top_px,
+                h_trim_bottom_px=cfg.n2n.h_trim_bottom_px,
+                h_trim_right_px=cfg.n2n.h_trim_right_px,
+                quality_filter_enabled=cfg.n2n.quality_filter_enabled,
+                quality_metric=cfg.n2n.quality_metric,
+                min_pair_quality=cfg.n2n.min_pair_quality,
+                quality_blur_sigma=cfg.n2n.quality_blur_sigma,
             )
             val_dataset = N2NOverlapPairDataset(
                 overlaps_dir=overlaps_dir,
@@ -1129,6 +1142,19 @@ def main() -> None:
                 align_blur_sigma=cfg.n2n.align_blur_sigma,
                 patch_sampling=cfg.n2n.patch_sampling,
                 tile_stride=cfg.n2n.tile_stride,
+                trim_enabled=cfg.n2n.trim_enabled,
+                v_trim_top_px=cfg.n2n.v_trim_top_px,
+                v_trim_left_px=cfg.n2n.v_trim_left_px,
+                v_trim_bottom_px=cfg.n2n.v_trim_bottom_px,
+                v_trim_right_px=cfg.n2n.v_trim_right_px,
+                h_trim_left_px=cfg.n2n.h_trim_left_px,
+                h_trim_top_px=cfg.n2n.h_trim_top_px,
+                h_trim_bottom_px=cfg.n2n.h_trim_bottom_px,
+                h_trim_right_px=cfg.n2n.h_trim_right_px,
+                quality_filter_enabled=cfg.n2n.quality_filter_enabled,
+                quality_metric=cfg.n2n.quality_metric,
+                min_pair_quality=cfg.n2n.min_pair_quality,
+                quality_blur_sigma=cfg.n2n.quality_blur_sigma,
             )
         elif data_dir is not None:
             logger.info(f"Loading custom dataset from directory: {data_dir}")
@@ -1311,7 +1337,9 @@ def main() -> None:
             edge_weight=getattr(cfg.loss, "edge_weight", 0.0),
         ).to(device)
         logger.info(
-            "Initialized EnhancedCompositeLoss (Charbonnier + SSIM + Laplacian + FFL + ESPI)"
+            f"Initialized EnhancedCompositeLoss (chrb={criterion.charbonnier_weight}, "
+            f"ssim={criterion.ssim_weight}, lap={criterion.laplacian_weight}, "
+            f"ffl={criterion.ffl_weight}, espi={criterion.espi_weight}, edge={criterion.edge_weight})"
         )
     else:
         criterion = CompositeDenoisingLoss(
@@ -1510,6 +1538,19 @@ def main() -> None:
             align_blur_sigma=cfg.n2n.align_blur_sigma,
             patch_sampling=cfg.n2n.patch_sampling,
             tile_stride=cfg.n2n.tile_stride,
+            trim_enabled=cfg.n2n.trim_enabled,
+            v_trim_top_px=cfg.n2n.v_trim_top_px,
+            v_trim_left_px=cfg.n2n.v_trim_left_px,
+            v_trim_bottom_px=cfg.n2n.v_trim_bottom_px,
+            v_trim_right_px=cfg.n2n.v_trim_right_px,
+            h_trim_left_px=cfg.n2n.h_trim_left_px,
+            h_trim_top_px=cfg.n2n.h_trim_top_px,
+            h_trim_bottom_px=cfg.n2n.h_trim_bottom_px,
+            h_trim_right_px=cfg.n2n.h_trim_right_px,
+            quality_filter_enabled=cfg.n2n.quality_filter_enabled,
+            quality_metric=cfg.n2n.quality_metric,
+            min_pair_quality=cfg.n2n.min_pair_quality,
+            quality_blur_sigma=cfg.n2n.quality_blur_sigma,
         )
     elif test_clean_dir.exists() and len(list(test_clean_dir.glob("*.tif"))) > 0:
         logger.info(f"Loading test set from TIFF directory: {test_clean_dir}")

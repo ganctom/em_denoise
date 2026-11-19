@@ -1,0 +1,76 @@
+# Cluster Pipeline Configuration for SBF-SEM Noise2Noise (N2N) Overlap Training
+
+experiment:
+  name: "01_n2n_modunet_charbonnier_trimmed_ncc06_lr0.0004_20ep"
+  output_dir: "/tachyon/groups/scratch/gmicro_sem/gfriedri/tgan/n2n_runs"
+
+data:
+  sbem_root: "/tachyon/groups/scratch/gmicro_sem/gfriedri/_EM_acquisitions/20260201_RoLi_F1/"
+  grid_num: 0
+  first_sec: 1250
+  last_sec: 8000
+
+splitting:
+  strategy: "block"          # Full stack on cluster: volumetric Z-blocks + guard bands
+  block_size: 100
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+  guard_band_size: 5
+
+extraction:
+  patch_size: 128
+
+n2n:
+  enabled: true
+  overlaps_dir: "/tachyon/groups/scratch/gmicro_sem/gfriedri/_processing/SOFIMA/nextflow/ganctoma/gfriedri-em-alignment-flows/runs/roli-f1/all-01240_22814/_inspect/overlaps/overlaps-n2n-training"
+  pair_direction: "random_swap"
+  orientation: "all"
+  max_train_pairs: 50000
+  max_val_pairs: 10000
+  max_test_pairs: 10000
+  seed: 42
+  augment_rot90: false
+  align_patches: true
+  align_max_shift_px: 16
+  align_blur_sigma: 1.0
+  patch_sampling: "tile"
+  tile_stride: null
+  trim_enabled: true
+  v_trim_top_px: 50
+  v_trim_left_px: 500
+  v_trim_bottom_px: 0
+  v_trim_right_px: 0
+  h_trim_left_px: 32
+  h_trim_top_px: 0
+  h_trim_bottom_px: 0
+  h_trim_right_px: 0
+  quality_filter_enabled: true
+  quality_metric: "ncc"
+  min_pair_quality: 0.60
+  quality_blur_sigma: 1.5
+
+model:
+  model_type: "modern_unet"       # "connectomics", "residual_unet", or "modern_unet"
+  base_dim: 32
+
+training:
+  batch_size: 32
+  epochs: 20
+  learning_rate: 0.0004
+  cache_in_ram: true              # Set false if max_train_pairs exceeds ~80k stripes
+  device: "cuda"
+
+loss:
+  loss_type: "enhanced"
+  charbonnier_weight: 1.0
+  ssim_weight: 0.0
+  laplacian_weight: 0.0
+  ffl_weight: 0.0
+  espi_weight: 0.0
+  edge_weight: 0.0
+
+inference:
+  custom_input_dir: null          # Uses N2N test split; or set to cluster path of test_raw
+  preview_image: null             # Optionally set to a cluster .tif path for per-epoch previews
+  preview_crop_size: 512

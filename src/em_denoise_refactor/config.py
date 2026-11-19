@@ -176,6 +176,19 @@ class N2NConfig:
         "random"  # "random" (1 crop/stripe/epoch) or "tile" (full stripe tiling)
     )
     tile_stride: Optional[int] = None  # Defaults to extraction.patch_size when null
+    trim_enabled: bool = False
+    v_trim_top_px: int = 50
+    v_trim_left_px: int = 500
+    v_trim_bottom_px: int = 0
+    v_trim_right_px: int = 0
+    h_trim_left_px: int = 32
+    h_trim_top_px: int = 0
+    h_trim_bottom_px: int = 0
+    h_trim_right_px: int = 0
+    quality_filter_enabled: bool = False
+    quality_metric: str = "ncc"  # "ncc" (smoothed Pearson correlation) or "ssim"
+    min_pair_quality: float = 0.60
+    quality_blur_sigma: float = 1.5
 
 
 @dataclass

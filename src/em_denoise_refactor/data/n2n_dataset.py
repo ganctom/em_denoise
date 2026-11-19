@@ -74,6 +74,42 @@ def _estimate_integer_shift(
     return int(iy - r), int(ix - r)
 
 
+def _compute_pair_quality(
+    crop0: np.ndarray,
+    crop1: np.ndarray,
+    metric: str = "ncc",
+    blur_sigma: float = 1.5,
+) -> float:
+    """
+    Compute structural alignment score between two noisy crops on smoothed proxies.
+
+    Parameters
+    ----------
+    metric : str
+        "ncc" (zero-mean normalized cross-correlation in [-1, 1]) or
+        "ssim" (structural similarity on smoothed [0, 255] proxies).
+    blur_sigma : float
+        Gaussian smoothing sigma applied before scoring to suppress shot noise.
+    """
+    s0 = crop0.astype(np.float32)
+    s1 = crop1.astype(np.float32)
+    if blur_sigma > 0.0:
+        s0 = gaussian_filter(s0, sigma=blur_sigma)
+        s1 = gaussian_filter(s1, sigma=blur_sigma)
+
+    if metric == "ssim":
+        from skimage.metrics import structural_similarity as ssim
+
+        return float(ssim(s0, s1, data_range=255.0))
+
+    a = s0 - s0.mean()
+    b = s1 - s1.mean()
+    denom = float(np.sqrt(np.sum(a * a) * np.sum(b * b)))
+    if denom < 1e-8:
+        return 0.0
+    return float(np.sum(a * b) / denom)
+
+
 def _build_section_split_filter(
     sections: List[int],
     strategy: str = "block",
@@ -204,6 +240,19 @@ class N2NOverlapPairDataset(Dataset):
         align_blur_sigma: float = 1.0,
         patch_sampling: str = "random",
         tile_stride: Optional[int] = None,
+        trim_enabled: bool = False,
+        v_trim_top_px: int = 50,
+        v_trim_left_px: int = 500,
+        v_trim_bottom_px: int = 0,
+        v_trim_right_px: int = 0,
+        h_trim_left_px: int = 32,
+        h_trim_top_px: int = 0,
+        h_trim_bottom_px: int = 0,
+        h_trim_right_px: int = 0,
+        quality_filter_enabled: bool = False,
+        quality_metric: str = "ncc",
+        min_pair_quality: float = 0.60,
+        quality_blur_sigma: float = 1.5,
     ) -> None:
         self.overlaps_dir = Path(overlaps_dir)
         self.split = split.lower().strip()
@@ -217,7 +266,29 @@ class N2NOverlapPairDataset(Dataset):
         self.align_blur_sigma = align_blur_sigma
         self.patch_sampling = patch_sampling.lower().strip()
         self.tile_stride = tile_stride if tile_stride is not None else patch_size
+        self.trim_enabled = trim_enabled
+        self.v_trim = (
+            int(v_trim_top_px),
+            int(v_trim_bottom_px),
+            int(v_trim_left_px),
+            int(v_trim_right_px),
+        )
+        self.h_trim = (
+            int(h_trim_top_px),
+            int(h_trim_bottom_px),
+            int(h_trim_left_px),
+            int(h_trim_right_px),
+        )
+        self.quality_filter_enabled = quality_filter_enabled
+        self.quality_metric = quality_metric.lower().strip()
+        self.min_pair_quality = float(min_pair_quality)
+        self.quality_blur_sigma = float(quality_blur_sigma)
         self.is_val_or_test = self.split in ("val", "test")
+
+        if self.quality_metric not in ("ncc", "ssim"):
+            raise ValueError(
+                f"quality_metric must be 'ncc' or 'ssim', got '{quality_metric}'"
+            )
 
         if self.split not in ("train", "val", "test"):
             raise ValueError(f"split must be 'train', 'val', or 'test', got '{split}'")
@@ -275,10 +346,19 @@ class N2NOverlapPairDataset(Dataset):
         if self.patch_sampling == "tile":
             self.tile_index = self._build_tile_index()
             total_tiles = len(self.tile_index)
-            if max_pairs is not None and total_tiles > int(max_pairs):
+            if (
+                max_pairs is not None and total_tiles > int(max_pairs)
+            ) or self.quality_filter_enabled:
                 rng = random.Random(seed)
                 rng.shuffle(self.tile_index)
+
+            if self.quality_filter_enabled:
+                self.tile_index = self._filter_tiles_by_quality(
+                    self.tile_index, max_pairs=max_pairs
+                )
+            elif max_pairs is not None and total_tiles > int(max_pairs):
                 self.tile_index = self.tile_index[: int(max_pairs)]
+
             logger.info(
                 f"N2N '{self.split}' tile mode: {len(self.records)} stripes -> "
                 f"{len(self.tile_index)}/{total_tiles} patches ({self.patch_size}x{self.patch_size}, stride={self.tile_stride})"
@@ -301,10 +381,20 @@ class N2NOverlapPairDataset(Dataset):
     ) -> List[Tuple[str, str, int, int, int, int]]:
         """Query manifest.parquet via DuckDB and return byte-offset records."""
         con = duckdb.connect()
-        where_clauses = [
-            f"m.height >= {int(patch_size)}",
-            f"m.width >= {int(patch_size)}",
-        ]
+        if self.trim_enabled:
+            vt, vb, vl, vr = self.v_trim
+            ht, hb, hl, hr = self.h_trim
+            where_clauses = [
+                f"(CASE WHEN lower(m.orientation) = 'vertical' "
+                f"THEN m.height - {vt + vb} ELSE m.height - {ht + hb} END) >= {int(patch_size)}",
+                f"(CASE WHEN lower(m.orientation) = 'vertical' "
+                f"THEN m.width - {vl + vr} ELSE m.width - {hl + hr} END) >= {int(patch_size)}",
+            ]
+        else:
+            where_clauses = [
+                f"m.height >= {int(patch_size)}",
+                f"m.width >= {int(patch_size)}",
+            ]
         if first_sec is not None:
             where_clauses.append(f"m.section_num >= {int(first_sec)}")
         if last_sec is not None:
@@ -461,6 +551,21 @@ class N2NOverlapPairDataset(Dataset):
             filtered = filtered[: int(max_pairs)]
         return filtered
 
+    def _trim_pair(self, arr: np.ndarray, pair_id: str) -> np.ndarray:
+        """Slice off configured distorted margins based on stripe orientation (_h vs _v)."""
+        if not self.trim_enabled:
+            return arr
+        if pair_id.endswith("_v"):
+            top, bottom, left, right = self.v_trim
+        else:
+            top, bottom, left, right = self.h_trim
+        _, h, w = arr.shape
+        y_end = h - bottom if bottom > 0 else h
+        x_end = w - right if right > 0 else w
+        if top >= y_end or left >= x_end:
+            return arr[:, 0:0, 0:0]
+        return arr[:, top:y_end, left:x_end]
+
     def _preload_into_ram(self) -> None:
         """Read selected pairs grouped by shard in ascending byte-offset order."""
         logger.info(
@@ -471,6 +576,9 @@ class N2NOverlapPairDataset(Dataset):
             shard_groups[shard_rel].append((offset, length, idx, pair_id))
 
         cached: List[Optional[Tuple[np.ndarray, str]]] = [None] * len(self.records)
+        kept_counts = {"_h": 0, "_v": 0}
+        dropped_counts = {"_h": 0, "_v": 0}
+        ps = self.patch_size
 
         pbar = tqdm(
             total=len(self.records),
@@ -489,11 +597,32 @@ class N2NOverlapPairDataset(Dataset):
                         raise ValueError(
                             f"Expected (2, H, W) TIFF for {pair_id}, got shape {arr.shape}"
                         )
-                    cached[idx] = (arr, pair_id)
+                    arr = self._trim_pair(arr, pair_id)
+                    orient_key = "_v" if pair_id.endswith("_v") else "_h"
+                    if arr.shape[1] < ps or arr.shape[2] < ps:
+                        dropped_counts[orient_key] += 1
+                    else:
+                        kept_counts[orient_key] += 1
+                        cached[idx] = (arr, pair_id)
                     pbar.update(1)
         pbar.close()
 
-        self.cached_pairs = [c for c in cached if c is not None]
+        valid_pairs = [
+            (rec, c) for rec, c in zip(self.records, cached) if c is not None
+        ]
+        if not valid_pairs:
+            raise ValueError(
+                f"No pairs remained after ROI trimming (patch_size={ps}) for split '{self.split}'"
+            )
+        self.records = [rec for rec, _ in valid_pairs]
+        self.cached_pairs = [c for _, c in valid_pairs]
+
+        if self.trim_enabled:
+            logger.info(
+                f"N2N '{self.split}' ROI trim summary (patch_size={ps}): "
+                f"_h kept={kept_counts['_h']} dropped={dropped_counts['_h']} | "
+                f"_v kept={kept_counts['_v']} dropped={dropped_counts['_v']}"
+            )
 
     def _read_pair_from_disk(self, idx: int) -> Tuple[np.ndarray, str]:
         pair_id, shard_rel, offset, length, _, _ = self.records[idx]
@@ -502,6 +631,7 @@ class N2NOverlapPairDataset(Dataset):
             f.seek(offset)
             raw_bytes = f.read(length)
         arr = tifffile.imread(io.BytesIO(raw_bytes))
+        arr = self._trim_pair(arr, pair_id)
         return arr, pair_id
 
     def _build_tile_index(self) -> List[Tuple[int, int, int]]:
@@ -540,6 +670,79 @@ class N2NOverlapPairDataset(Dataset):
             )
         return tiles
 
+    def _extract_aligned_crops(
+        self, pair_arr: np.ndarray, y0: int, x0: int
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Extract (ps, ps) crops at (y0, x0) and optionally align crop1 via integer shift."""
+        _, h, w = pair_arr.shape
+        ps = self.patch_size
+        crop0 = pair_arr[0, y0 : y0 + ps, x0 : x0 + ps]
+        crop1 = pair_arr[1, y0 : y0 + ps, x0 : x0 + ps]
+
+        if self.align_patches:
+            dy, dx = _estimate_integer_shift(
+                crop0,
+                crop1,
+                max_shift=self.align_max_shift_px,
+                blur_sigma=self.align_blur_sigma,
+            )
+            if dy != 0 or dx != 0:
+                y1 = min(max(0, y0 - dy), h - ps)
+                x1 = min(max(0, x0 - dx), w - ps)
+                crop1 = pair_arr[1, y1 : y1 + ps, x1 : x1 + ps]
+        return crop0, crop1
+
+    def _filter_tiles_by_quality(
+        self,
+        candidates: List[Tuple[int, int, int]],
+        max_pairs: Optional[int] = None,
+    ) -> List[Tuple[int, int, int]]:
+        """Filter candidate tiles by smoothed NCC/SSIM, stopping once max_pairs is reached."""
+        kept: List[Tuple[int, int, int]] = []
+        rejected = 0
+        scores_kept: List[float] = []
+        target_cap = int(max_pairs) if max_pairs is not None else len(candidates)
+
+        pbar = tqdm(
+            candidates,
+            desc=f"N2N Quality Filter ({self.split}, {self.quality_metric}>={self.min_pair_quality:.2f})",
+            bar_format="{desc}: {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
+        )
+        for pair_idx, y0, x0 in pbar:
+            if self.cached_pairs is not None:
+                pair_arr, _ = self.cached_pairs[pair_idx]
+            else:
+                pair_arr, _ = self._read_pair_from_disk(pair_idx)
+
+            crop0, crop1 = self._extract_aligned_crops(pair_arr, y0, x0)
+            score = _compute_pair_quality(
+                crop0,
+                crop1,
+                metric=self.quality_metric,
+                blur_sigma=self.quality_blur_sigma,
+            )
+            if score >= self.min_pair_quality:
+                kept.append((pair_idx, y0, x0))
+                scores_kept.append(score)
+                if len(kept) >= target_cap:
+                    break
+            else:
+                rejected += 1
+        pbar.close()
+
+        if not kept:
+            raise ValueError(
+                f"No tiles passed quality filter ({self.quality_metric} >= {self.min_pair_quality}) "
+                f"for split '{self.split}' (rejected {rejected} tiles)."
+            )
+
+        logger.info(
+            f"N2N '{self.split}' quality filter ({self.quality_metric} >= {self.min_pair_quality:.2f}, "
+            f"sigma={self.quality_blur_sigma}): kept={len(kept)}, rejected={rejected}, "
+            f"mean_score={np.mean(scores_kept):.3f}"
+        )
+        return kept
+
     def __len__(self) -> int:
         if self.tile_index is not None:
             return len(self.tile_index)
@@ -564,26 +767,34 @@ class N2NOverlapPairDataset(Dataset):
             if self.is_val_or_test:
                 y0 = (h - ps) // 2
                 x0 = (w - ps) // 2
+                crop0, crop1 = self._extract_aligned_crops(pair_arr, y0, x0)
+            elif self.quality_filter_enabled:
+                best_score = -float("inf")
+                best_crops: Optional[Tuple[np.ndarray, np.ndarray]] = None
+                for _ in range(8):
+                    cy0 = random.randint(0, h - ps) if h > ps else 0
+                    cx0 = random.randint(0, w - ps) if w > ps else 0
+                    c0, c1 = self._extract_aligned_crops(pair_arr, cy0, cx0)
+                    score = _compute_pair_quality(
+                        c0,
+                        c1,
+                        metric=self.quality_metric,
+                        blur_sigma=self.quality_blur_sigma,
+                    )
+                    if score >= self.min_pair_quality:
+                        best_crops = (c0, c1)
+                        break
+                    if score > best_score:
+                        best_score = score
+                        best_crops = (c0, c1)
+                crop0, crop1 = best_crops  # type: ignore[misc]
             else:
                 y0 = random.randint(0, h - ps) if h > ps else 0
                 x0 = random.randint(0, w - ps) if w > ps else 0
+                crop0, crop1 = self._extract_aligned_crops(pair_arr, y0, x0)
         else:
             pair_id = f"{pair_id}_y{y0}_x{x0}"
-
-        crop0 = pair_arr[0, y0 : y0 + ps, x0 : x0 + ps]
-        crop1 = pair_arr[1, y0 : y0 + ps, x0 : x0 + ps]
-
-        if self.align_patches:
-            dy, dx = _estimate_integer_shift(
-                crop0,
-                crop1,
-                max_shift=self.align_max_shift_px,
-                blur_sigma=self.align_blur_sigma,
-            )
-            if dy != 0 or dx != 0:
-                y1 = min(max(0, y0 - dy), h - ps)
-                x1 = min(max(0, x0 - dx), w - ps)
-                crop1 = pair_arr[1, y1 : y1 + ps, x1 : x1 + ps]
+            crop0, crop1 = self._extract_aligned_crops(pair_arr, y0, x0)
 
         # Select input/target direction
         if self.pair_direction == "second_to_first":

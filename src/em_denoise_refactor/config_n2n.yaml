@@ -1,7 +1,7 @@
 # Pipeline Configuration for SBF-SEM Noise2Noise (N2N) Overlap Training
 
 experiment:
-  name: "04_n2n_resunet_charbonnier_aligned_lr0.0004_10ep_50k_patches"
+  name: "14_n2n_modunet_char_095_ssim_005_lr0.00005_10ep_5k_patches_reg_edge_trim_d_first_to_second_rot_90_qual_filter_ssim"
   output_dir: "/Users/ganctoma/SW/sort/N2V/run_43_n2n"
 
 data:
@@ -19,42 +19,56 @@ splitting:
   guard_band_size: 5
 
 extraction:
-  patch_size: 128            # Square crop size sampled from each (H_ov, W_ov) overlap pair
+  patch_size: 128           # Square crop size sampled from each (H_ov, W_ov) overlap pair
 
 n2n:
   enabled: true
   overlaps_dir: "/Users/ganctoma/SW/sort/N2V/run_43_n2n/0x_overlaps"
-  pair_direction: "random_swap"   # "random_swap", "first_to_second", or "second_to_first"
+  pair_direction: "first_to_second"   # "random_swap", "first_to_second", or "second_to_first"
   orientation: "all"              # "all", "horizontal", or "vertical"
-  max_train_pairs: 50000           # Use all available train pairs in local shards
-  max_val_pairs: 10000
-  max_test_pairs: 10000
+  max_train_pairs: 5000          # Use all available train pairs in local shards
+  max_val_pairs: 1000
+  max_test_pairs: 1000
   seed: 42
-  augment_rot90: false            # Keep false to preserve fast/slow scan noise anisotropy
-  align_patches: false            # Toggle cross-correlation patch registration ON/OFF
+  augment_rot90: true            # Keep false to preserve fast/slow scan noise anisotropy
+  align_patches: true            # Toggle cross-correlation patch registration ON/OFF
   align_max_shift_px: 16          # Max integer shift (px) searched in each axis
   align_blur_sigma: 1.0           # Gaussian smoothing sigma used only for shift estimation
   patch_sampling: "tile"          # "tile" (full stripe tiling) or "random" (1 crop/stripe/epoch)
   tile_stride: null               # null = patch_size (non-overlapping grid + flush edge tiles)
+  trim_enabled: true              # Trim distorted margins per orientation before patch extraction
+  v_trim_top_px: 25               # _v (vertical tile-pair / horizontal stripe): trim top 50 px
+  v_trim_left_px: 1500             # _v: trim left 500 px
+  v_trim_bottom_px: 0
+  v_trim_right_px: 0
+  h_trim_left_px: 90              # _h (horizontal tile-pair / vertical stripe): trim left N columns
+  h_trim_top_px: 0
+  h_trim_bottom_px: 0
+  h_trim_right_px: 0
+  quality_filter_enabled: true    # Filter out elastically distorted patches by smoothed NCC/SSIM
+  quality_metric: "ssim"           # "ncc" (recommended, sharper separation) or "ssim"
+  min_pair_quality: 0.80         # Reject patches scoring below this threshold
+  quality_blur_sigma: 1.5         # Gaussian smoothing sigma before scoring
 
 model:
-  model_type: "residual_unet"     # "connectomics", "residual_unet", or "modern_unet"
+  model_type: "modern_unet"     # "connectomics", "residual_unet", or "modern_unet"
   base_dim: 32
 
 training:
   batch_size: 32
   epochs: 10
-  learning_rate: 0.0004
+  learning_rate: 0.00005
   cache_in_ram: true              # Shard-grouped sequential pre-load into RAM
   device: "mps"                   # "mps", "cuda", or "cpu"
 
 loss:
   loss_type: "enhanced"
-  charbonnier_weight: 1.0         # Unbiased pseudo-L1 loss for N2N
-  ssim_weight: 0.0
+  charbonnier_weight: 0.95         # Unbiased pseudo-L1 loss for N2N
+  ssim_weight: 0.05
   laplacian_weight: 0.0
   ffl_weight: 0.0
   espi_weight: 0.0
+  edge_weight: 0.0                # Must be 0.0 for N2N (SobelEdgeLoss matches noisy gradient magnitude!)
 
 inference:
   # Same test tiles as run_42 N2V2 / COSDD runs for direct visual comparison
