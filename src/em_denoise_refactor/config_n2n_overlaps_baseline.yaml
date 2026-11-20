@@ -1,0 +1,68 @@
+experiment:
+  name: "15_n2n_overlaps_resunet_mse_cosinelr_30ep"
+  output_dir: "/Users/ganctoma/SW/sort/N2V/run_43_n2n"
+
+splitting:
+  strategy: "mod10"
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+
+extraction:
+  patch_size: 128
+
+n2n:
+  enabled: true
+  source: "overlaps"
+  overlaps_dir: "/Users/ganctoma/SW/sort/N2V/run_43_n2n/0x_overlaps"
+  pair_direction: "first_to_second"   # "random_swap", "first_to_second", or "second_to_first"
+  orientation: "all"              # "all", "horizontal", or "vertical"
+  max_train_pairs: 5000          # Use all available train pairs in local shards
+  max_val_pairs: 1000
+  max_test_pairs: 1000
+  seed: 42
+  augment_rot90: true            # Keep false to preserve fast/slow scan noise anisotropy
+  align_patches: true            # Toggle cross-correlation patch registration ON/OFF
+  align_max_shift_px: 16          # Max integer shift (px) searched in each axis
+  align_blur_sigma: 1.0           # Gaussian smoothing sigma used only for shift estimation
+  patch_sampling: "tile"          # "tile" (full stripe tiling) or "random" (1 crop/stripe/epoch)
+  tile_stride: null               # null = patch_size (non-overlapping grid + flush edge tiles)
+  trim_enabled: true              # Trim distorted margins per orientation before patch extraction
+  v_trim_top_px: 25               # _v (vertical tile-pair / horizontal stripe): trim top 50 px
+  v_trim_left_px: 1500             # _v: trim left 500 px
+  v_trim_bottom_px: 0
+  v_trim_right_px: 0
+  h_trim_left_px: 90              # _h (horizontal tile-pair / vertical stripe): trim left N columns
+  h_trim_top_px: 0
+  h_trim_bottom_px: 0
+  h_trim_right_px: 0
+  quality_filter_enabled: true    # Filter out elastically distorted patches by smoothed NCC/SSIM
+  quality_metric: "ssim"           # "ncc" (recommended, sharper separation) or "ssim"
+  min_pair_quality: 0.80         # Reject patches scoring below this threshold
+  quality_blur_sigma: 1.5         # Gaussian smoothing sigma before scoring
+
+model:
+  model_type: "residual_unet"
+  base_dim: 32
+
+training:
+  batch_size: 32
+  epochs: 30
+  learning_rate: 0.0003
+  lr_scheduler: "cosine"
+  lr_min: 0.000001
+  warmup_epochs: 2
+  seed: 42
+  cache_in_ram: true
+  device: "mps"
+
+loss:
+  loss_type: "composite"
+  mse_weight: 1.0
+  edge_weight: 0.0
+  ssim_weight: 0.0
+
+inference:
+  custom_input_dir: "/Users/ganctoma/SW/sort/N2V/test_raw"
+  preview_image: "/Users/ganctoma/SW/sort/N2V/test_raw/20260201_RoLi_F1_g0000_t0436_s05329.tif"
+  preview_crop_size: 512
