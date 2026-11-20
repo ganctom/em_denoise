@@ -17,6 +17,7 @@ Invariants
 
 from __future__ import annotations
 
+import gc
 import io
 import logging
 import random
@@ -394,6 +395,8 @@ class N2NOverlapPairDataset(Dataset):
             self._preload_into_ram()
 
         self.tile_index: Optional[List[Tuple[int, int, int]]] = None
+        self.cached_tile_crops: Optional[np.ndarray] = None
+        self.cached_tile_ids: Optional[List[str]] = None
         if self.patch_sampling == "tile":
             self.tile_index = self._build_tile_index()
             total_tiles = len(self.tile_index)
@@ -409,6 +412,9 @@ class N2NOverlapPairDataset(Dataset):
                 )
             elif max_pairs is not None and total_tiles > int(max_pairs):
                 self.tile_index = self.tile_index[: int(max_pairs)]
+
+            if self.cache_in_ram and self.cached_tile_crops is None:
+                self._materialize_tile_crops(self.tile_index)
 
             logger.info(
                 f"N2N '{self.split}' tile mode: {len(self.records)} stripes -> "
@@ -743,6 +749,39 @@ class N2NOverlapPairDataset(Dataset):
                 crop1 = pair_arr[1, y1 : y1 + ps, x1 : x1 + ps]
         return crop0, crop1
 
+    def _store_materialized_crops(
+        self, crops: List[Tuple[np.ndarray, np.ndarray, str]]
+    ) -> None:
+        """Pack pre-aligned (ps, ps) uint8 crop pairs into a compact array and drop full stripes."""
+        n = len(crops)
+        ps = self.patch_size
+        buf = np.empty((n, 2, ps, ps), dtype=np.uint8)
+        ids: List[str] = []
+        for i, (c0, c1, pid) in enumerate(crops):
+            buf[i, 0] = c0
+            buf[i, 1] = c1
+            ids.append(pid)
+        self.cached_tile_crops = buf
+        self.cached_tile_ids = ids
+        self.cached_pairs = None
+        gc.collect()
+        logger.info(
+            f"N2N '{self.split}' materialized {n} aligned ({ps}x{ps}) tile crops "
+            f"({buf.nbytes / 1e6:.1f} MB) and freed full stripe cache."
+        )
+
+    def _materialize_tile_crops(self, tiles: List[Tuple[int, int, int]]) -> None:
+        """Extract and align crops once for all selected tiles, then free full stripes."""
+        crops: List[Tuple[np.ndarray, np.ndarray, str]] = []
+        for pair_idx, y0, x0 in tiles:
+            if self.cached_pairs is not None:
+                pair_arr, pair_id = self.cached_pairs[pair_idx]
+            else:
+                pair_arr, pair_id = self._read_pair_from_disk(pair_idx)
+            crop0, crop1 = self._extract_aligned_crops(pair_arr, y0, x0)
+            crops.append((crop0, crop1, f"{pair_id}_y{y0}_x{x0}"))
+        self._store_materialized_crops(crops)
+
     def _filter_tiles_by_quality(
         self,
         candidates: List[Tuple[int, int, int]],
@@ -750,6 +789,7 @@ class N2NOverlapPairDataset(Dataset):
     ) -> List[Tuple[int, int, int]]:
         """Filter candidate tiles by smoothed NCC/SSIM, stopping once max_pairs is reached."""
         kept: List[Tuple[int, int, int]] = []
+        kept_crops: List[Tuple[np.ndarray, np.ndarray, str]] = []
         rejected = 0
         scores_kept: List[float] = []
         target_cap = int(max_pairs) if max_pairs is not None else len(candidates)
@@ -761,9 +801,9 @@ class N2NOverlapPairDataset(Dataset):
         )
         for pair_idx, y0, x0 in pbar:
             if self.cached_pairs is not None:
-                pair_arr, _ = self.cached_pairs[pair_idx]
+                pair_arr, pair_id = self.cached_pairs[pair_idx]
             else:
-                pair_arr, _ = self._read_pair_from_disk(pair_idx)
+                pair_arr, pair_id = self._read_pair_from_disk(pair_idx)
 
             crop0, crop1 = self._extract_aligned_crops(pair_arr, y0, x0)
             score = _compute_pair_quality(
@@ -774,6 +814,8 @@ class N2NOverlapPairDataset(Dataset):
             )
             if score >= self.min_pair_quality:
                 kept.append((pair_idx, y0, x0))
+                if self.cache_in_ram:
+                    kept_crops.append((crop0, crop1, f"{pair_id}_y{y0}_x{x0}"))
                 scores_kept.append(score)
                 if len(kept) >= target_cap:
                     break
@@ -792,14 +834,28 @@ class N2NOverlapPairDataset(Dataset):
             f"sigma={self.quality_blur_sigma}): kept={len(kept)}, rejected={rejected}, "
             f"mean_score={np.mean(scores_kept):.3f}"
         )
+        if self.cache_in_ram:
+            self._store_materialized_crops(kept_crops)
         return kept
 
     def __len__(self) -> int:
+        if self.cached_tile_ids is not None:
+            return len(self.cached_tile_ids)
         if self.tile_index is not None:
             return len(self.tile_index)
         return len(self.records)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, str]:
+        if self.cached_tile_crops is not None and self.cached_tile_ids is not None:
+            return _format_pair_tensors(
+                crop0=self.cached_tile_crops[idx, 0],
+                crop1=self.cached_tile_crops[idx, 1],
+                pair_direction=self.pair_direction,
+                is_val_or_test=self.is_val_or_test,
+                augment=self.augment,
+                augment_rot90=self.augment_rot90,
+            ) + (self.cached_tile_ids[idx],)
+
         if self.tile_index is not None:
             pair_idx, y0, x0 = self.tile_index[idx]
         else:

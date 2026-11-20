@@ -385,3 +385,70 @@ loss:
     assert ckpt2.exists()
     loaded2 = torch.load(ckpt2, map_location="cpu", weights_only=False)
     assert loaded2["epoch"] == 2
+
+
+def test_overlap_dataset_materializes_compact_tile_crops(tmp_path: Path):
+    import tarfile
+
+    from em_denoise_refactor.data.n2n_dataset import N2NOverlapPairDataset
+
+    ov_dir = tmp_path / "overlaps"
+    shards_dir = ov_dir / "shards"
+    shards_dir.mkdir(parents=True)
+
+    # Create 20 sections (so mod10 gives 16 train, 2 val, 2 test) of (2, 192, 192) TIFFs
+    tar_path = shards_dir / "shard_0000.tar"
+    with tarfile.open(tar_path, "w") as tf:
+        for sec in range(20):
+            base = _make_structured_base(192, 192, seed=sec)
+            pair = np.stack([base, base], axis=0).astype(np.uint8)
+            tif_bytes_path = tmp_path / f"s{sec:05d}_g0000_t0000_t0001_h.tif"
+            tifffile.imwrite(tif_bytes_path, pair)
+            tf.add(tif_bytes_path, arcname=tif_bytes_path.name)
+
+    ds = N2NOverlapPairDataset(
+        overlaps_dir=ov_dir,
+        split="train",
+        patch_size=64,
+        split_strategy="mod10",
+        cache_in_ram=True,
+        patch_sampling="tile",
+        align_patches=True,
+        quality_filter_enabled=True,
+        quality_metric="ssim",
+        min_pair_quality=0.50,
+        max_pairs=10,
+    )
+    assert ds.cached_pairs is None
+    assert ds.cached_tile_crops is not None
+    assert ds.cached_tile_crops.shape == (10, 2, 64, 64)
+    assert ds.cached_tile_crops.dtype == np.uint8
+    assert len(ds) == 10
+    inp, tgt, pid = ds[0]
+    assert inp.shape == (1, 64, 64)
+    assert tgt.shape == (1, 64, 64)
+
+
+def test_save_all_epochs_false_writes_checkpoint_last(tmp_path: Path):
+    model = ModernUNet(in_channels=1, out_channels=1, base_dim=8)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    ckpt_dir = tmp_path / "ckpts"
+    ckpt_dir.mkdir()
+    trainer = train_and_infer.DenoisingTrainer(
+        model=model,
+        optimizer=opt,
+        criterion=torch.nn.MSELoss(),
+        device=torch.device("cpu"),
+        checkpoints_dir=ckpt_dir,
+    )
+    trainer.save_checkpoint(
+        epoch=1,
+        val_loss=0.2,
+        val_psnr=20.0,
+        val_ssim=0.5,
+        is_best=True,
+        save_all_epochs=False,
+    )
+    assert (ckpt_dir / "checkpoint_last.pt").exists()
+    assert (ckpt_dir / "checkpoint_best.pt").exists()
+    assert not (ckpt_dir / "checkpoint_epoch_001.pt").exists()

@@ -49,6 +49,7 @@ from em_denoise_refactor.models.loss import (
     FocalFrequencyLoss,
     ESPILoss,
     SobelEdgeLoss,
+    SSIMLoss,
 )
 from em_denoise_refactor.data.interfaces import NoiseSynthesizer
 
@@ -530,6 +531,8 @@ class DenoisingTrainer:
         self.checkpoints_dir = checkpoints_dir
         self.use_amp = use_amp
         self.writer = writer
+        self.non_blocking = device.type == "cuda"
+        self.val_ssim_fn = SSIMLoss(window_size=11, in_channels=1).to(device)
         self.amp_dtype = (
             torch.bfloat16
             if (
@@ -582,9 +585,9 @@ class DenoisingTrainer:
             if is_n2v:
                 # N2V batch: (masked_input, original_noisy, mask, fname)
                 masked_b, original_b, mask_b, _ = batch
-                masked_b = masked_b.to(self.device)
-                original_b = original_b.to(self.device)
-                mask_b = mask_b.to(self.device).float()
+                masked_b = masked_b.to(self.device, non_blocking=self.non_blocking)
+                original_b = original_b.to(self.device, non_blocking=self.non_blocking)
+                mask_b = mask_b.to(self.device, non_blocking=self.non_blocking).float()
 
                 self.optimizer.zero_grad()
                 pred_b = self.model(masked_b)
@@ -597,7 +600,8 @@ class DenoisingTrainer:
             else:
                 # Supervised batch: (noisy, clean, fname)
                 noisy_b, clean_b, _ = batch
-                noisy_b, clean_b = noisy_b.to(self.device), clean_b.to(self.device)
+                noisy_b = noisy_b.to(self.device, non_blocking=self.non_blocking)
+                clean_b = clean_b.to(self.device, non_blocking=self.non_blocking)
 
                 self.optimizer.zero_grad()
                 if hasattr(self.model, "ar_decoder"):
@@ -659,8 +663,8 @@ class DenoisingTrainer:
         total_samples = 0
         total_raw_pair_mse = 0.0
         total_pred_mse = 0.0
-        val_psnrs: List[float] = []
-        val_ssims: List[float] = []
+        total_val_psnr_sum = 0.0
+        total_val_ssim_sum = 0.0
         total_val_metrics: Dict[str, float] = {}
         is_n2v = getattr(self.model, "is_n2v", False)
 
@@ -676,9 +680,13 @@ class DenoisingTrainer:
                 if is_n2v:
                     # N2V val batch: (masked_input, original_noisy, mask, fname)
                     masked_b, original_b, mask_b, _ = batch
-                    masked_b = masked_b.to(self.device)
-                    original_b = original_b.to(self.device)
-                    mask_b = mask_b.to(self.device).float()
+                    masked_b = masked_b.to(self.device, non_blocking=self.non_blocking)
+                    original_b = original_b.to(
+                        self.device, non_blocking=self.non_blocking
+                    )
+                    mask_b = mask_b.to(
+                        self.device, non_blocking=self.non_blocking
+                    ).float()
 
                     pred_b = self.model(masked_b)
                     # Blind-spot loss at masked positions only
@@ -692,7 +700,8 @@ class DenoisingTrainer:
                 else:
                     # Supervised / N2N val batch: (noisy, target, fname)
                     noisy_b, clean_b, _ = batch
-                    noisy_b, clean_b = noisy_b.to(self.device), clean_b.to(self.device)
+                    noisy_b = noisy_b.to(self.device, non_blocking=self.non_blocking)
+                    clean_b = clean_b.to(self.device, non_blocking=self.non_blocking)
 
                     if hasattr(self.model, "ar_decoder"):
                         pred_b, loss_out = self.model(noisy_b)
@@ -712,20 +721,27 @@ class DenoisingTrainer:
 
                     batch_size = noisy_b.size(0)
                     pred_clamp = torch.clamp(pred_b.float(), 0.0, 1.0)
+                    clean_f = clean_b.float()
                     raw_pair_mse = float(
-                        torch.mean((noisy_b.float() - clean_b.float()) ** 2).item()
+                        torch.mean((noisy_b.float() - clean_f) ** 2).item()
                     )
-                    pred_mse = float(
-                        torch.mean((pred_clamp - clean_b.float()) ** 2).item()
+                    mse_per_sample = torch.mean(
+                        (pred_clamp - clean_f) ** 2, dim=(1, 2, 3)
                     )
+                    pred_mse = float(mse_per_sample.mean().item())
                     total_raw_pair_mse += raw_pair_mse * batch_size
                     total_pred_mse += pred_mse * batch_size
 
-                    for i in range(pred_b.size(0)):
-                        c_np = clean_b[i, 0].cpu().numpy()
-                        p_np = pred_clamp[i, 0].cpu().numpy()
-                        val_psnrs.append(EvaluationMetrics.compute_psnr(p_np, c_np))
-                        val_ssims.append(EvaluationMetrics.compute_ssim(p_np, c_np))
+                    psnr_per_sample = torch.where(
+                        mse_per_sample < 1e-10,
+                        torch.full_like(mse_per_sample, 100.0),
+                        -10.0 * torch.log10(mse_per_sample),
+                    )
+                    batch_ssim = float(
+                        1.0 - self.val_ssim_fn(pred_clamp, clean_f).item()
+                    )
+                    total_val_psnr_sum += float(psnr_per_sample.sum().item())
+                    total_val_ssim_sum += batch_ssim * batch_size
 
                 total_val_loss += float(loss.item()) * batch_size
                 total_samples += batch_size
@@ -737,8 +753,12 @@ class DenoisingTrainer:
         self._purge_memory()
         denom = total_samples if total_samples > 0 else len(dataloader.dataset)
         mean_val_loss = total_val_loss / denom
-        mean_val_psnr = float(np.mean(val_psnrs)) if val_psnrs else 0.0
-        mean_val_ssim = float(np.mean(val_ssims)) if val_ssims else 0.0
+        mean_val_psnr = (
+            total_val_psnr_sum / denom if (not is_n2v and denom > 0) else 0.0
+        )
+        mean_val_ssim = (
+            total_val_ssim_sum / denom if (not is_n2v and denom > 0) else 0.0
+        )
         avg_val_metrics = {k: v / denom for k, v in total_val_metrics.items()}
         if not is_n2v and denom > 0:
             mean_raw_pair_mse = total_raw_pair_mse / denom
@@ -762,12 +782,12 @@ class DenoisingTrainer:
         is_best: bool = False,
         scheduler: Optional[Any] = None,
         config: Optional[Dict[str, Any]] = None,
+        save_all_epochs: bool = True,
     ) -> Path:
+        raw_model = getattr(self.model, "_orig_mod", self.model)
         state = {
             "epoch": epoch,
-            "model_state_dict": {
-                k: v.cpu() for k, v in self.model.state_dict().items()
-            },
+            "model_state_dict": {k: v.cpu() for k, v in raw_model.state_dict().items()},
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": (
                 scheduler.state_dict() if scheduler is not None else None
@@ -778,14 +798,17 @@ class DenoisingTrainer:
             "val_ssim": val_ssim,
         }
 
-        epoch_path = self.checkpoints_dir / f"checkpoint_epoch_{epoch:03d}.pt"
-        torch.save(state, epoch_path)
+        if save_all_epochs:
+            ckpt_path = self.checkpoints_dir / f"checkpoint_epoch_{epoch:03d}.pt"
+        else:
+            ckpt_path = self.checkpoints_dir / "checkpoint_last.pt"
+        torch.save(state, ckpt_path)
 
         if is_best:
             best_path = self.checkpoints_dir / "checkpoint_best.pt"
             torch.save(state, best_path)
             return best_path
-        return epoch_path
+        return ckpt_path
 
 
 class DenoisingEvaluator:
@@ -1635,6 +1658,9 @@ def main() -> None:
 
     logger.info(f"Using target device: {device}")
     use_amp = device.type == "cuda"
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
 
     # model_type resolved early (before dataset construction) as `model_type` and `is_n2v_mode`
     base_dim = cfg.model.base_dim if hasattr(cfg, "model") and cfg.model else 32
@@ -1664,6 +1690,13 @@ def main() -> None:
     logger.info(
         f"Initialized neural network architecture: '{model_type}' (base_dim={base_dim})"
     )
+    if (
+        device.type == "cuda"
+        and getattr(cfg.training, "compile_model", False)
+        and hasattr(torch, "compile")
+    ):
+        model = torch.compile(model)
+        logger.info("Compiled model with torch.compile() for CUDA acceleration.")
     loss_type = getattr(cfg.loss, "loss_type", "composite").lower()
     if loss_type == "dynamic":
         criterion = DynamicEMLoss(
@@ -1783,7 +1816,9 @@ def main() -> None:
             resume_ckpt = torch.load(
                 resume_path, map_location=device, weights_only=False
             )
-            model.load_state_dict(resume_ckpt["model_state_dict"])
+            getattr(model, "_orig_mod", model).load_state_dict(
+                resume_ckpt["model_state_dict"]
+            )
             if (
                 "optimizer_state_dict" in resume_ckpt
                 and resume_ckpt["optimizer_state_dict"] is not None
@@ -1837,6 +1872,7 @@ def main() -> None:
                 is_best=is_best,
                 scheduler=scheduler,
                 config=serialized_cfg,
+                save_all_epochs=getattr(cfg.training, "save_all_epochs", True),
             )
             if is_best:
                 best_checkpoint_path = best_ckpt
@@ -1921,8 +1957,10 @@ def main() -> None:
         raise FileNotFoundError(f"Checkpoint not found at: {best_checkpoint_path}")
 
     logger.info(f"Loading checkpoint for testing: {best_checkpoint_path.name}")
-    checkpoint = torch.load(best_checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    checkpoint = torch.load(
+        best_checkpoint_path, map_location=device, weights_only=False
+    )
+    getattr(model, "_orig_mod", model).load_state_dict(checkpoint["model_state_dict"])
 
     custom_input_dir = (
         Path(args.input_dir)

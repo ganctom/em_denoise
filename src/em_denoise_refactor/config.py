@@ -84,6 +84,8 @@ class TrainingConfig:
     cache_in_ram: bool = False
     device: str = "mps"
     num_workers: int = 0
+    save_all_epochs: bool = True
+    compile_model: bool = False
 
 
 @dataclass

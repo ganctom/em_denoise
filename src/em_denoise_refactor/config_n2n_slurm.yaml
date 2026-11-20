@@ -53,25 +53,27 @@ n2n:
   shuffle_buffer_size: 2048
 
 model:
-  model_type: "modern_unet"       # "connectomics", "residual_unet", or "modern_unet"
+  model_type: "residual_unet"     # "connectomics", "residual_unet", or "modern_unet"
   base_dim: 32
 
 training:
-  batch_size: 32
-  epochs: 20
-  learning_rate: 0.0004
-  cache_in_ram: true              # Ignored when n2n.streaming=true
+  batch_size: 128
+  epochs: 30
+  learning_rate: 0.0005
+  lr_scheduler: "cosine"
+  lr_min: 0.000001
+  warmup_epochs: 2
+  seed: 42
+  cache_in_ram: true              # Materializes compact aligned patches and frees full stripes
   device: "cuda"
-  num_workers: 0                  # Set 4-8 when n2n.streaming=true on SLURM
+  num_workers: 4
+  save_all_epochs: false          # Keep checkpoint_last.pt + checkpoint_best.pt (fast on network FS)
 
 loss:
-  loss_type: "enhanced"
-  charbonnier_weight: 1.0
-  ssim_weight: 0.0
-  laplacian_weight: 0.0
-  ffl_weight: 0.0
-  espi_weight: 0.0
+  loss_type: "composite"
+  mse_weight: 1.0
   edge_weight: 0.0
+  ssim_weight: 0.0
 
 inference:
   custom_input_dir: null          # Uses N2N test split; or set to cluster path of test_raw
