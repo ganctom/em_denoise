@@ -1157,6 +1157,12 @@ def parse_args() -> argparse.Namespace:
         help="Path to specific checkpoint file for evaluation (default: checkpoint_best.pt in checkpoints_dir).",
     )
     parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Path to checkpoint (.pt) to resume training from (restores model, optimizer, scheduler, and epoch).",
+    )
+    parser.add_argument(
         "-i",
         "--input-dir",
         type=str,
@@ -1765,9 +1771,52 @@ def main() -> None:
 
         logger.info(f"Starting Network Training ({epochs} epochs)...")
         start_time = time.time()
+        start_epoch = 1
         best_val_loss = float("inf")
 
-        for epoch in range(1, epochs + 1):
+        if args.resume:
+            resume_path = Path(args.resume)
+            if not resume_path.exists():
+                raise FileNotFoundError(
+                    f"Resume checkpoint not found at: {resume_path}"
+                )
+            resume_ckpt = torch.load(
+                resume_path, map_location=device, weights_only=False
+            )
+            model.load_state_dict(resume_ckpt["model_state_dict"])
+            if (
+                "optimizer_state_dict" in resume_ckpt
+                and resume_ckpt["optimizer_state_dict"] is not None
+            ):
+                optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
+            if (
+                scheduler is not None
+                and resume_ckpt.get("scheduler_state_dict") is not None
+            ):
+                scheduler.load_state_dict(resume_ckpt["scheduler_state_dict"])
+            start_epoch = int(resume_ckpt.get("epoch", 0)) + 1
+            best_val_loss = float(resume_ckpt.get("val_loss", float("inf")))
+            existing_best = checkpoints_dir / "checkpoint_best.pt"
+            if existing_best.exists():
+                try:
+                    best_meta = torch.load(
+                        existing_best, map_location="cpu", weights_only=False
+                    )
+                    best_val_loss = min(
+                        best_val_loss, float(best_meta.get("val_loss", float("inf")))
+                    )
+                except Exception:
+                    pass
+            logger.info(
+                f"Resuming training from {resume_path} at epoch {start_epoch}/{epochs} "
+                f"(best_val_loss={best_val_loss:.6f})"
+            )
+            if start_epoch > epochs:
+                logger.info(
+                    f"Checkpoint epoch ({start_epoch - 1}) >= target epochs ({epochs}); skipping training loop."
+                )
+
+        for epoch in range(start_epoch, epochs + 1):
             cur_lr = float(optimizer.param_groups[0]["lr"])
             train_loss, train_metrics = trainer.train_epoch(train_loader, epoch, epochs)
             val_loss, val_psnr, val_ssim, val_metrics = trainer.validate(

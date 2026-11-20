@@ -316,3 +316,72 @@ inference:
     assert (run_dir / "custom_inference" / "denoised" / "sample_01.tif").exists()
     summary = json.loads((run_dir / "summary.json").read_text())
     assert "est_clean_psnr" in summary["metrics"]
+
+
+def test_resume_training_from_checkpoint(tmp_path: Path, monkeypatch):
+    dupl_dir = _create_duplicate_fixture(
+        tmp_path / "dupl", num_tiles=10, clusters=([100, 101],), h=128, w=128
+    )
+    out_dir = tmp_path / "runs"
+    cfg_path = tmp_path / "resume_cfg.yaml"
+    cfg_path.write_text(
+        f"""
+experiment:
+  name: "resume_test"
+  output_dir: "{out_dir}"
+splitting:
+  strategy: "random"
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+extraction:
+  patch_size: 64
+n2n:
+  enabled: true
+  source: "duplicates"
+  duplicates_dir: "{dupl_dir}"
+  align_patches: false
+  quality_filter_enabled: false
+model:
+  model_type: "modern_unet"
+  base_dim: 8
+training:
+  batch_size: 4
+  epochs: 1
+  learning_rate: 0.0003
+  lr_scheduler: "cosine"
+  lr_min: 0.000001
+  warmup_epochs: 1
+  seed: 42
+  device: "cpu"
+loss:
+  loss_type: "composite"
+  mse_weight: 1.0
+  edge_weight: 0.0
+  ssim_weight: 0.0
+""",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(sys, "argv", ["train_and_infer", "--config", str(cfg_path)])
+    train_and_infer.main()
+
+    run_dir = out_dir / "resume_test"
+    ckpt1 = run_dir / "checkpoints" / "checkpoint_epoch_001.pt"
+    assert ckpt1.exists()
+
+    # Resume up to epoch 2
+    cfg_path.write_text(
+        cfg_path.read_text().replace("epochs: 1", "epochs: 2"), encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["train_and_infer", "--config", str(cfg_path), "--resume", str(ckpt1)],
+    )
+    train_and_infer.main()
+
+    ckpt2 = run_dir / "checkpoints" / "checkpoint_epoch_002.pt"
+    assert ckpt2.exists()
+    loaded2 = torch.load(ckpt2, map_location="cpu", weights_only=False)
+    assert loaded2["epoch"] == 2
