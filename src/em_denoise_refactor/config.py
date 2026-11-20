@@ -206,6 +206,9 @@ class N2NConfig:
     quality_metric: str = "ncc"  # "ncc" (smoothed Pearson correlation) or "ssim"
     min_pair_quality: float = 0.60
     quality_blur_sigma: float = 1.5
+    min_patch_std: float = (
+        0.0  # Optional min smoothed std (0-255 space) to drop flat/empty patches
+    )
     streaming: bool = False
     shuffle_buffer_size: int = 2048
 

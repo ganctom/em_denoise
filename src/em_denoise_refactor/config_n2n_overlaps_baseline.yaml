@@ -1,5 +1,5 @@
 experiment:
-  name: "15_n2n_overlaps_resunet_mse_cosinelr_30ep"
+  name: "16_n2n_overlaps_resunet_mse_cosinelr_30ep_QA1_TRM1_XCORR0"
   output_dir: "/Users/ganctoma/SW/sort/N2V/run_43_n2n"
 
 splitting:
@@ -21,9 +21,10 @@ n2n:
   max_val_pairs: 1000
   max_test_pairs: 1000
   seed: 42
-  augment_rot90: true            # Keep false to preserve fast/slow scan noise anisotropy
-  align_patches: true            # Toggle cross-correlation patch registration ON/OFF
-  align_max_shift_px: 16          # Max integer shift (px) searched in each axis
+  augment_rot90: true             # Keep false to preserve fast/slow scan noise anisotropy
+  align_patches: true             # Toggle cross-correlation patch registration ON/OFF
+  align_subpixel: false           # true = two-stage sub-pixel phase cross-correlation + cubic spline shift (recommended with pair_direction: "first_to_second")
+  align_max_shift_px: 16          # Max shift (px) searched in each axis (6-8 is safer when real shifts are +-2 px)
   align_blur_sigma: 1.0           # Gaussian smoothing sigma used only for shift estimation
   patch_sampling: "tile"          # "tile" (full stripe tiling) or "random" (1 crop/stripe/epoch)
   tile_stride: null               # null = patch_size (non-overlapping grid + flush edge tiles)
@@ -40,6 +41,7 @@ n2n:
   quality_metric: "ssim"           # "ncc" (recommended, sharper separation) or "ssim"
   min_pair_quality: 0.80         # Reject patches scoring below this threshold
   quality_blur_sigma: 1.5         # Gaussian smoothing sigma before scoring
+  min_patch_std: 0.0              # Optional min std on smoothed crop0 (e.g. 5.0) to drop flat/empty epoxy patches
 
 model:
   model_type: "residual_unet"
@@ -65,4 +67,4 @@ loss:
 inference:
   custom_input_dir: "/Users/ganctoma/SW/sort/N2V/test_raw"
   preview_image: "/Users/ganctoma/SW/sort/N2V/test_raw/20260201_RoLi_F1_g0000_t0436_s05329.tif"
-  preview_crop_size: 512
+  preview_crop_size: 2048

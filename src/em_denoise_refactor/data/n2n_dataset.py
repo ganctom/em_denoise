@@ -20,6 +20,7 @@ from __future__ import annotations
 import gc
 import io
 import logging
+import math
 import random
 import re
 import tarfile
@@ -29,7 +30,7 @@ from typing import Dict, List, Optional, Tuple
 
 import duckdb
 import numpy as np
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, shift as ndi_shift
 from skimage.registration import phase_cross_correlation
 import tifffile
 import torch
@@ -288,6 +289,7 @@ class N2NOverlapPairDataset(Dataset):
         augment_rot90: bool = False,
         seed: int = 42,
         align_patches: bool = False,
+        align_subpixel: bool = False,
         align_max_shift_px: int = 16,
         align_blur_sigma: float = 1.0,
         patch_sampling: str = "random",
@@ -305,6 +307,7 @@ class N2NOverlapPairDataset(Dataset):
         quality_metric: str = "ncc",
         min_pair_quality: float = 0.60,
         quality_blur_sigma: float = 1.5,
+        min_patch_std: float = 0.0,
     ) -> None:
         self.overlaps_dir = Path(overlaps_dir)
         self.split = split.lower().strip()
@@ -314,6 +317,7 @@ class N2NOverlapPairDataset(Dataset):
         self.augment = augment
         self.augment_rot90 = augment_rot90
         self.align_patches = align_patches
+        self.align_subpixel = bool(align_subpixel)
         self.align_max_shift_px = align_max_shift_px
         self.align_blur_sigma = align_blur_sigma
         self.patch_sampling = patch_sampling.lower().strip()
@@ -335,7 +339,22 @@ class N2NOverlapPairDataset(Dataset):
         self.quality_metric = quality_metric.lower().strip()
         self.min_pair_quality = float(min_pair_quality)
         self.quality_blur_sigma = float(quality_blur_sigma)
+        self.min_patch_std = float(min_patch_std)
         self.is_val_or_test = self.split in ("val", "test")
+        self.rejected_oob_count: int = 0
+        self.rejected_flat_count: int = 0
+
+        if (
+            self.align_patches
+            and self.align_subpixel
+            and self.pair_direction != "first_to_second"
+        ):
+            logger.warning(
+                f"align_subpixel=True with pair_direction='{self.pair_direction}' "
+                "feeds cubic-interpolated noise as input in some/all samples, which can "
+                "introduce a mild noise-smoothing mismatch vs raw inference images "
+                "(pair_direction='first_to_second' is recommended)."
+            )
 
         if self.quality_metric not in ("ncc", "ssim"):
             raise ValueError(
@@ -414,7 +433,7 @@ class N2NOverlapPairDataset(Dataset):
                 self.tile_index = self.tile_index[: int(max_pairs)]
 
             if self.cache_in_ram and self.cached_tile_crops is None:
-                self._materialize_tile_crops(self.tile_index)
+                self.tile_index = self._materialize_tile_crops(self.tile_index)
 
             logger.info(
                 f"N2N '{self.split}' tile mode: {len(self.records)} stripes -> "
@@ -691,10 +710,30 @@ class N2NOverlapPairDataset(Dataset):
         arr = self._trim_pair(arr, pair_id)
         return arr, pair_id
 
+    @staticmethod
+    def _axis_tile_coords(length: int, ps: int, stride: int, margin: int) -> List[int]:
+        """Compute tile start coordinates along one axis, inset by `margin` when possible."""
+        if margin <= 0:
+            coords = list(range(0, length - ps + 1, stride))
+            if coords[-1] != length - ps:
+                coords.append(length - ps)
+            return coords
+
+        m = min(margin, (length - ps) // 2)
+        lo = m
+        hi = length - ps - m
+        if hi - lo < stride:
+            return [(length - ps) // 2]
+        coords = list(range(lo, hi + 1, stride))
+        if coords[-1] != hi:
+            coords.append(hi)
+        return coords
+
     def _build_tile_index(self) -> List[Tuple[int, int, int]]:
-        """Generate (pair_idx, y0, x0) grid coordinates covering 100% of each stripe."""
+        """Generate (pair_idx, y0, x0) grid coordinates for each stripe."""
         ps = self.patch_size
         stride = self.tile_stride
+        tile_margin = 0 if not self.align_patches else (6 if self.align_subpixel else 2)
         tiles: List[Tuple[int, int, int]] = []
 
         for pair_idx in range(len(self.records)):
@@ -709,13 +748,8 @@ class N2NOverlapPairDataset(Dataset):
             if h < ps or w < ps:
                 continue
 
-            ys = list(range(0, h - ps + 1, stride))
-            if ys[-1] != h - ps:
-                ys.append(h - ps)
-
-            xs = list(range(0, w - ps + 1, stride))
-            if xs[-1] != w - ps:
-                xs.append(w - ps)
+            ys = self._axis_tile_coords(h, ps, stride, tile_margin)
+            xs = self._axis_tile_coords(w, ps, stride, tile_margin)
 
             for y0 in ys:
                 for x0 in xs:
@@ -727,27 +761,66 @@ class N2NOverlapPairDataset(Dataset):
             )
         return tiles
 
+    def _passes_flat_filter(self, crop0: np.ndarray) -> bool:
+        """Return True if crop0 meets the optional min_patch_std texture threshold."""
+        if self.min_patch_std <= 0.0:
+            return True
+        arr = crop0.astype(np.float32)
+        if self.quality_blur_sigma > 0.0:
+            arr = gaussian_filter(arr, sigma=self.quality_blur_sigma)
+        return float(arr.std()) >= self.min_patch_std
+
     def _extract_aligned_crops(
         self, pair_arr: np.ndarray, y0: int, x0: int
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """Extract (ps, ps) crops at (y0, x0) and optionally align crop1 via integer shift."""
+    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """
+        Extract (ps, ps) crops at (y0, x0) and optionally align crop1.
+
+        Returns `None` (incrementing `self.rejected_oob_count`) if the estimated shift
+        or sub-pixel padding would exceed the stripe boundary — never clamps.
+        """
         _, h, w = pair_arr.shape
         ps = self.patch_size
         crop0 = pair_arr[0, y0 : y0 + ps, x0 : x0 + ps]
         crop1 = pair_arr[1, y0 : y0 + ps, x0 : x0 + ps]
 
-        if self.align_patches:
-            dy, dx = _estimate_integer_shift(
+        if not self.align_patches:
+            return crop0, crop1
+
+        if self.align_subpixel:
+            dy_f, dx_f = _estimate_subpixel_shift(
                 crop0,
                 crop1,
                 max_shift=self.align_max_shift_px,
                 blur_sigma=self.align_blur_sigma,
             )
-            if dy != 0 or dx != 0:
-                y1 = min(max(0, y0 - dy), h - ps)
-                x1 = min(max(0, x0 - dx), w - ps)
-                crop1 = pair_arr[1, y1 : y1 + ps, x1 : x1 + ps]
-        return crop0, crop1
+            pad = math.ceil(max(abs(dy_f), abs(dx_f))) + 3
+            y_lo, y_hi = y0 - pad, y0 + ps + pad
+            x_lo, x_hi = x0 - pad, x0 + ps + pad
+            if y_lo < 0 or y_hi > h or x_lo < 0 or x_hi > w:
+                self.rejected_oob_count += 1
+                return None
+            img1_pad = pair_arr[1, y_lo:y_hi, x_lo:x_hi].astype(np.float32)
+            shifted_pad = ndi_shift(
+                img1_pad, shift=(dy_f, dx_f), order=3, mode="nearest"
+            )
+            crop1_shifted = np.clip(
+                shifted_pad[pad : pad + ps, pad : pad + ps], 0.0, 255.0
+            )
+            return crop0, crop1_shifted
+
+        dy, dx = _estimate_integer_shift(
+            crop0,
+            crop1,
+            max_shift=self.align_max_shift_px,
+            blur_sigma=self.align_blur_sigma,
+        )
+        y1 = y0 - dy
+        x1 = x0 - dx
+        if y1 < 0 or y1 + ps > h or x1 < 0 or x1 + ps > w:
+            self.rejected_oob_count += 1
+            return None
+        return crop0, pair_arr[1, y1 : y1 + ps, x1 : x1 + ps]
 
     def _store_materialized_crops(
         self, crops: List[Tuple[np.ndarray, np.ndarray, str]]
@@ -758,8 +831,8 @@ class N2NOverlapPairDataset(Dataset):
         buf = np.empty((n, 2, ps, ps), dtype=np.uint8)
         ids: List[str] = []
         for i, (c0, c1, pid) in enumerate(crops):
-            buf[i, 0] = c0
-            buf[i, 1] = c1
+            buf[i, 0] = np.rint(np.clip(c0, 0.0, 255.0)).astype(np.uint8)
+            buf[i, 1] = np.rint(np.clip(c1, 0.0, 255.0)).astype(np.uint8)
             ids.append(pid)
         self.cached_tile_crops = buf
         self.cached_tile_ids = ids
@@ -770,17 +843,42 @@ class N2NOverlapPairDataset(Dataset):
             f"({buf.nbytes / 1e6:.1f} MB) and freed full stripe cache."
         )
 
-    def _materialize_tile_crops(self, tiles: List[Tuple[int, int, int]]) -> None:
+    def _materialize_tile_crops(
+        self, tiles: List[Tuple[int, int, int]]
+    ) -> List[Tuple[int, int, int]]:
         """Extract and align crops once for all selected tiles, then free full stripes."""
         crops: List[Tuple[np.ndarray, np.ndarray, str]] = []
+        kept_tiles: List[Tuple[int, int, int]] = []
+        rejected_oob = 0
+        rejected_flat = 0
         for pair_idx, y0, x0 in tiles:
             if self.cached_pairs is not None:
                 pair_arr, pair_id = self.cached_pairs[pair_idx]
             else:
                 pair_arr, pair_id = self._read_pair_from_disk(pair_idx)
-            crop0, crop1 = self._extract_aligned_crops(pair_arr, y0, x0)
+            res = self._extract_aligned_crops(pair_arr, y0, x0)
+            if res is None:
+                rejected_oob += 1
+                continue
+            crop0, crop1 = res
+            if not self._passes_flat_filter(crop0):
+                self.rejected_flat_count += 1
+                rejected_flat += 1
+                continue
+            kept_tiles.append((pair_idx, y0, x0))
             crops.append((crop0, crop1, f"{pair_id}_y{y0}_x{x0}"))
+        if not crops:
+            raise ValueError(
+                f"No valid {self.patch_size}x{self.patch_size} crops survived alignment/flat "
+                f"filtering for split '{self.split}' (rejected_oob={rejected_oob}, rejected_flat={rejected_flat})."
+            )
+        if rejected_oob > 0 or rejected_flat > 0:
+            logger.info(
+                f"N2N '{self.split}' tile extraction filtered: kept={len(crops)}, "
+                f"rejected_oob={rejected_oob}, rejected_flat={rejected_flat}"
+            )
         self._store_materialized_crops(crops)
+        return kept_tiles
 
     def _filter_tiles_by_quality(
         self,
@@ -791,6 +889,8 @@ class N2NOverlapPairDataset(Dataset):
         kept: List[Tuple[int, int, int]] = []
         kept_crops: List[Tuple[np.ndarray, np.ndarray, str]] = []
         rejected = 0
+        rejected_oob = 0
+        rejected_flat = 0
         scores_kept: List[float] = []
         target_cap = int(max_pairs) if max_pairs is not None else len(candidates)
 
@@ -805,7 +905,16 @@ class N2NOverlapPairDataset(Dataset):
             else:
                 pair_arr, pair_id = self._read_pair_from_disk(pair_idx)
 
-            crop0, crop1 = self._extract_aligned_crops(pair_arr, y0, x0)
+            res = self._extract_aligned_crops(pair_arr, y0, x0)
+            if res is None:
+                rejected_oob += 1
+                continue
+            crop0, crop1 = res
+            if not self._passes_flat_filter(crop0):
+                self.rejected_flat_count += 1
+                rejected_flat += 1
+                continue
+
             score = _compute_pair_quality(
                 crop0,
                 crop1,
@@ -825,13 +934,15 @@ class N2NOverlapPairDataset(Dataset):
 
         if not kept:
             raise ValueError(
-                f"No tiles passed quality filter ({self.quality_metric} >= {self.min_pair_quality}) "
-                f"for split '{self.split}' (rejected {rejected} tiles)."
+                f"No tiles passed quality filter ({self.quality_metric} >= {self.min_pair_quality}, "
+                f"min_patch_std={self.min_patch_std}) for split '{self.split}' "
+                f"(rejected_quality={rejected}, rejected_oob={rejected_oob}, rejected_flat={rejected_flat})."
             )
 
         logger.info(
             f"N2N '{self.split}' quality filter ({self.quality_metric} >= {self.min_pair_quality:.2f}, "
-            f"sigma={self.quality_blur_sigma}): kept={len(kept)}, rejected={rejected}, "
+            f"sigma={self.quality_blur_sigma}): kept={len(kept)}, rejected_quality={rejected}, "
+            f"rejected_oob={rejected_oob}, rejected_flat={rejected_flat}, "
             f"mean_score={np.mean(scores_kept):.3f}"
         )
         if self.cache_in_ram:
@@ -856,32 +967,78 @@ class N2NOverlapPairDataset(Dataset):
                 augment_rot90=self.augment_rot90,
             ) + (self.cached_tile_ids[idx],)
 
-        if self.tile_index is not None:
-            pair_idx, y0, x0 = self.tile_index[idx]
-        else:
-            pair_idx = idx
-            y0, x0 = -1, -1
-
-        if self.cached_pairs is not None:
-            pair_arr, pair_id = self.cached_pairs[pair_idx]
-        else:
-            pair_arr, pair_id = self._read_pair_from_disk(pair_idx)
-
-        _, h, w = pair_arr.shape
         ps = self.patch_size
 
-        if self.tile_index is None:
+        if self.tile_index is not None:
+            n_tiles = len(self.tile_index)
+            max_tile_tries = min(n_tiles, 256)
+            for offset in range(max_tile_tries):
+                pair_idx, y0, x0 = self.tile_index[(idx + offset) % n_tiles]
+                if self.cached_pairs is not None:
+                    pair_arr, pair_id = self.cached_pairs[pair_idx]
+                else:
+                    pair_arr, pair_id = self._read_pair_from_disk(pair_idx)
+                res = self._extract_aligned_crops(pair_arr, y0, x0)
+                if res is None:
+                    continue
+                crop0, crop1 = res
+                if not self._passes_flat_filter(crop0):
+                    self.rejected_flat_count += 1
+                    continue
+                return _format_pair_tensors(
+                    crop0=crop0,
+                    crop1=crop1,
+                    pair_direction=self.pair_direction,
+                    is_val_or_test=self.is_val_or_test,
+                    augment=self.augment,
+                    augment_rot90=self.augment_rot90,
+                ) + (f"{pair_id}_y{y0}_x{x0}",)
+            raise RuntimeError(
+                f"Failed to sample a valid in-bounds tile for split '{self.split}' after {max_tile_tries} attempts."
+            )
+
+        # Random mode (tile_index is None)
+        n_records = len(self.records)
+        for pair_offset in range(min(n_records, 32)):
+            pair_idx = (idx + pair_offset) % n_records
+            if self.cached_pairs is not None:
+                pair_arr, pair_id = self.cached_pairs[pair_idx]
+            else:
+                pair_arr, pair_id = self._read_pair_from_disk(pair_idx)
+
+            _, h, w = pair_arr.shape
             if self.is_val_or_test:
                 y0 = (h - ps) // 2
                 x0 = (w - ps) // 2
-                crop0, crop1 = self._extract_aligned_crops(pair_arr, y0, x0)
-            elif self.quality_filter_enabled:
+                res = self._extract_aligned_crops(pair_arr, y0, x0)
+                if res is None:
+                    continue
+                crop0, crop1 = res
+                if not self._passes_flat_filter(crop0):
+                    self.rejected_flat_count += 1
+                    continue
+                return _format_pair_tensors(
+                    crop0=crop0,
+                    crop1=crop1,
+                    pair_direction=self.pair_direction,
+                    is_val_or_test=self.is_val_or_test,
+                    augment=self.augment,
+                    augment_rot90=self.augment_rot90,
+                ) + (pair_id,)
+
+            if self.quality_filter_enabled:
                 best_score = -float("inf")
                 best_crops: Optional[Tuple[np.ndarray, np.ndarray]] = None
-                for _ in range(8):
+                for _ in range(16):
                     cy0 = random.randint(0, h - ps) if h > ps else 0
                     cx0 = random.randint(0, w - ps) if w > ps else 0
-                    c0, c1 = self._extract_aligned_crops(pair_arr, cy0, cx0)
+                    res = self._extract_aligned_crops(pair_arr, cy0, cx0)
+                    if res is None:
+                        continue
+                    c0, c1 = res
+                    if not self._passes_flat_filter(c0):
+                        self.rejected_flat_count += 1
+                        continue
                     score = _compute_pair_quality(
                         c0,
                         c1,
@@ -894,23 +1051,39 @@ class N2NOverlapPairDataset(Dataset):
                     if score > best_score:
                         best_score = score
                         best_crops = (c0, c1)
-                crop0, crop1 = best_crops  # type: ignore[misc]
+                if best_crops is not None:
+                    crop0, crop1 = best_crops
+                    return _format_pair_tensors(
+                        crop0=crop0,
+                        crop1=crop1,
+                        pair_direction=self.pair_direction,
+                        is_val_or_test=self.is_val_or_test,
+                        augment=self.augment,
+                        augment_rot90=self.augment_rot90,
+                    ) + (pair_id,)
             else:
-                y0 = random.randint(0, h - ps) if h > ps else 0
-                x0 = random.randint(0, w - ps) if w > ps else 0
-                crop0, crop1 = self._extract_aligned_crops(pair_arr, y0, x0)
-        else:
-            pair_id = f"{pair_id}_y{y0}_x{x0}"
-            crop0, crop1 = self._extract_aligned_crops(pair_arr, y0, x0)
+                for _ in range(16):
+                    y0 = random.randint(0, h - ps) if h > ps else 0
+                    x0 = random.randint(0, w - ps) if w > ps else 0
+                    res = self._extract_aligned_crops(pair_arr, y0, x0)
+                    if res is None:
+                        continue
+                    crop0, crop1 = res
+                    if not self._passes_flat_filter(crop0):
+                        self.rejected_flat_count += 1
+                        continue
+                    return _format_pair_tensors(
+                        crop0=crop0,
+                        crop1=crop1,
+                        pair_direction=self.pair_direction,
+                        is_val_or_test=self.is_val_or_test,
+                        augment=self.augment,
+                        augment_rot90=self.augment_rot90,
+                    ) + (pair_id,)
 
-        return _format_pair_tensors(
-            crop0=crop0,
-            crop1=crop1,
-            pair_direction=self.pair_direction,
-            is_val_or_test=self.is_val_or_test,
-            augment=self.augment,
-            augment_rot90=self.augment_rot90,
-        ) + (pair_id,)
+        raise RuntimeError(
+            f"Failed to sample a valid aligned patch for split '{self.split}'."
+        )
 
 
 def _format_pair_tensors(

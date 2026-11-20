@@ -452,3 +452,167 @@ def test_save_all_epochs_false_writes_checkpoint_last(tmp_path: Path):
     assert (ckpt_dir / "checkpoint_last.pt").exists()
     assert (ckpt_dir / "checkpoint_best.pt").exists()
     assert not (ckpt_dir / "checkpoint_epoch_001.pt").exists()
+
+
+def _write_overlap_tar(
+    tmp_path: Path,
+    pairs: list[tuple[str, np.ndarray]],
+) -> Path:
+    import tarfile
+
+    ov_dir = tmp_path / "overlaps"
+    shards_dir = ov_dir / "shards"
+    shards_dir.mkdir(parents=True, exist_ok=True)
+    tar_path = shards_dir / "shard_0000.tar"
+    staging = tmp_path / "tif_staging"
+    staging.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(tar_path, "w") as tf:
+        for fname, pair in pairs:
+            tif_path = staging / fname
+            tifffile.imwrite(tif_path, pair.astype(np.uint8))
+            tf.add(tif_path, arcname=fname)
+    return ov_dir
+
+
+def test_overlap_integer_alignment_rejects_oob_without_clamping(tmp_path: Path):
+    from em_denoise_refactor.data.n2n_dataset import N2NOverlapPairDataset
+
+    base = _make_structured_base(192, 192, seed=5)
+    # Shift page 1 by (-4, 0): feature at y in base is at y - 4 in page 1, so dy = +4 -> y1 = y0 - 4
+    shifted = ndi_shift(base, shift=(-4.0, 0.0), order=1, mode="nearest")
+    pair = np.stack([base, np.clip(shifted, 0, 255)], axis=0).astype(np.uint8)
+    ov_dir = _write_overlap_tar(
+        tmp_path,
+        [(f"s{sec:05d}_g0000_t0000_t0001_v.tif", pair) for sec in range(20)],
+    )
+
+    ds = N2NOverlapPairDataset(
+        overlaps_dir=ov_dir,
+        split="train",
+        patch_size=128,
+        split_strategy="mod10",
+        cache_in_ram=False,
+        patch_sampling="random",
+        align_patches=True,
+        align_subpixel=False,
+        align_max_shift_px=16,
+    )
+    res = ds._extract_aligned_crops(pair, y0=0, x0=16)
+    assert res is None
+    assert ds.rejected_oob_count == 1
+
+
+def test_overlap_subpixel_alignment_beats_integer_on_narrow_v_stripes(tmp_path: Path):
+    from em_denoise_refactor.data.n2n_dataset import N2NOverlapPairDataset
+
+    pairs = []
+    for sec in range(20):
+        base = _make_structured_base(156, 320, seed=sec + 20)
+        shifted = ndi_shift(base, shift=(1.4, -1.6), order=3, mode="nearest")
+        pair = np.stack([base, np.clip(shifted, 0, 255)], axis=0).astype(np.uint8)
+        pairs.append((f"s{sec:05d}_g0000_t0000_t0001_v.tif", pair))
+    ov_dir = _write_overlap_tar(tmp_path, pairs)
+
+    ds_int = N2NOverlapPairDataset(
+        overlaps_dir=ov_dir,
+        split="train",
+        patch_size=128,
+        split_strategy="mod10",
+        cache_in_ram=True,
+        patch_sampling="tile",
+        align_patches=True,
+        align_subpixel=False,
+        align_max_shift_px=8,
+        pair_direction="first_to_second",
+    )
+    ds_sub = N2NOverlapPairDataset(
+        overlaps_dir=ov_dir,
+        split="train",
+        patch_size=128,
+        split_strategy="mod10",
+        cache_in_ram=True,
+        patch_sampling="tile",
+        align_patches=True,
+        align_subpixel=True,
+        align_max_shift_px=8,
+        pair_direction="first_to_second",
+    )
+    assert len(ds_sub) > 0
+    mse_int = float(
+        np.mean(
+            [
+                ((ds_int[i][0] - ds_int[i][1]) ** 2).mean().item()
+                for i in range(len(ds_int))
+            ]
+        )
+    )
+    mse_sub = float(
+        np.mean(
+            [
+                ((ds_sub[i][0] - ds_sub[i][1]) ** 2).mean().item()
+                for i in range(len(ds_sub))
+            ]
+        )
+    )
+    assert mse_sub < mse_int
+
+
+def test_overlap_min_patch_std_filters_flat_patches(tmp_path: Path):
+    from em_denoise_refactor.data.n2n_dataset import N2NOverlapPairDataset
+
+    flat = np.full((192, 192), 128.0, dtype=np.float32)
+    flat_pair = np.stack([flat, flat], axis=0).astype(np.uint8)
+    struct = _make_structured_base(192, 192, seed=7)
+    struct_pair = np.stack([struct, struct], axis=0).astype(np.uint8)
+
+    pairs = []
+    for sec in range(20):
+        # Alternating flat and structured pairs across train sections
+        pair = flat_pair if sec % 2 == 0 else struct_pair
+        pairs.append((f"s{sec:05d}_g0000_t0000_t0001_v.tif", pair))
+    ov_dir = _write_overlap_tar(tmp_path, pairs)
+
+    ds = N2NOverlapPairDataset(
+        overlaps_dir=ov_dir,
+        split="train",
+        patch_size=64,
+        split_strategy="mod10",
+        cache_in_ram=True,
+        patch_sampling="tile",
+        align_patches=False,
+        quality_filter_enabled=True,
+        quality_metric="ssim",
+        min_pair_quality=0.80,
+        min_patch_std=5.0,
+    )
+    assert ds.rejected_flat_count > 0
+    assert len(ds) > 0
+    # Every surviving patch should have non-trivial structure
+    for i in range(len(ds)):
+        inp, _, _ = ds[i]
+        assert float(inp.std()) > 0.01
+
+
+def test_overlap_subpixel_warns_when_not_first_to_second(tmp_path: Path, caplog):
+    import logging
+    from em_denoise_refactor.data.n2n_dataset import N2NOverlapPairDataset
+
+    base = _make_structured_base(192, 192, seed=3)
+    pair = np.stack([base, base], axis=0).astype(np.uint8)
+    ov_dir = _write_overlap_tar(
+        tmp_path,
+        [(f"s{sec:05d}_g0000_t0000_t0001_v.tif", pair) for sec in range(20)],
+    )
+    with caplog.at_level(logging.WARNING, logger="train_and_infer"):
+        N2NOverlapPairDataset(
+            overlaps_dir=ov_dir,
+            split="train",
+            patch_size=64,
+            split_strategy="mod10",
+            cache_in_ram=False,
+            patch_sampling="random",
+            align_patches=True,
+            align_subpixel=True,
+            pair_direction="random_swap",
+        )
+    assert any("first_to_second" in r.message for r in caplog.records)
