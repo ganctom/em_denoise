@@ -17,16 +17,22 @@ Invariants
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import gc
+import hashlib
 import io
+import json
 import logging
 import math
+import os
 import random
 import re
+import shutil
+import struct
 import tarfile
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import duckdb
 import numpy as np
@@ -222,6 +228,95 @@ def _build_section_split_filter(
     return splits
 
 
+class _NpyChunkWriter:
+    """Constant-RAM sequential writer for standard NumPy .npy v1.0 (N, 2, ps, ps) uint8 files."""
+
+    HEADER_LEN = 128
+
+    def __init__(self, path: Path, patch_size: int) -> None:
+        self.path = Path(path)
+        self.patch_size = int(patch_size)
+        self.count = 0
+        self._fh = open(self.path, "wb")
+        self._fh.write(b"\x00" * self.HEADER_LEN)
+
+    def append(self, chunk: np.ndarray) -> None:
+        arr = np.ascontiguousarray(chunk, dtype=np.uint8)
+        if arr.ndim != 4 or arr.shape[1:] != (2, self.patch_size, self.patch_size):
+            raise ValueError(
+                f"Expected chunk shape (N, 2, {self.patch_size}, {self.patch_size}), "
+                f"got {arr.shape}"
+            )
+        if arr.shape[0] == 0:
+            return
+        self._fh.write(arr.tobytes())
+        self.count += int(arr.shape[0])
+
+    def finalize(self) -> None:
+        try:
+            header_dict = (
+                f"{{'descr': '|u1', 'fortran_order': False, "
+                f"'shape': ({self.count}, 2, {self.patch_size}, {self.patch_size}), }}"
+            ).encode("latin1")
+            dict_target_len = self.HEADER_LEN - 10
+            pad_len = dict_target_len - len(header_dict) - 1
+            if pad_len < 0:
+                raise ValueError(
+                    f"NPY header exceeded {self.HEADER_LEN} bytes ({len(header_dict)})"
+                )
+            dict_block = header_dict + (b" " * pad_len) + b"\n"
+            header = (
+                b"\x93NUMPY\x01\x00" + struct.pack("<H", len(dict_block)) + dict_block
+            )
+            assert len(header) == self.HEADER_LEN
+            self._fh.seek(0)
+            self._fh.write(header)
+            self._fh.flush()
+        finally:
+            self._fh.close()
+
+    def abort(self) -> None:
+        try:
+            if not self._fh.closed:
+                self._fh.close()
+        except OSError:
+            pass
+
+
+def _compute_source_signature(overlaps_dir: Path) -> Dict[str, Any]:
+    """Return a lightweight fingerprint of manifest.parquet (or .tar shards) without heavy I/O."""
+    manifest_path = overlaps_dir / "manifest.parquet"
+    if manifest_path.exists():
+        st = manifest_path.stat()
+        return {
+            "kind": "manifest",
+            "size": int(st.st_size),
+            "mtime_ns": int(st.st_mtime_ns),
+        }
+    tar_files = sorted(overlaps_dir.glob("*.tar"))
+    if not tar_files and (overlaps_dir / "shards").is_dir():
+        tar_files = sorted((overlaps_dir / "shards").glob("*.tar"))
+    if not tar_files:
+        return {"kind": "missing"}
+    return {
+        "kind": "tar_list",
+        "files": [
+            [
+                str(p.relative_to(overlaps_dir)),
+                int(p.stat().st_size),
+                int(p.stat().st_mtime_ns),
+            ]
+            for p in tar_files
+        ],
+    }
+
+
+def _hash_payload(payload: Dict[str, Any]) -> str:
+    """Compute short deterministic SHA-256 hex digest for cache metadata."""
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
 class N2NOverlapPairDataset(Dataset):
     """
     PyTorch Dataset for Noise2Noise training on `sbem-n2n-overlaps` `.tar` shards.
@@ -308,6 +403,9 @@ class N2NOverlapPairDataset(Dataset):
         min_pair_quality: float = 0.60,
         quality_blur_sigma: float = 1.5,
         min_patch_std: float = 0.0,
+        crop_cache_dir: Optional[Path | str] = None,
+        max_tiles_per_stripe: Optional[int] = None,
+        prep_workers: int = 1,
     ) -> None:
         self.overlaps_dir = Path(overlaps_dir)
         self.split = split.lower().strip()
@@ -340,9 +438,26 @@ class N2NOverlapPairDataset(Dataset):
         self.min_pair_quality = float(min_pair_quality)
         self.quality_blur_sigma = float(quality_blur_sigma)
         self.min_patch_std = float(min_patch_std)
+        self.crop_cache_dir = (
+            Path(crop_cache_dir)
+            if crop_cache_dir is not None and str(crop_cache_dir).strip() != ""
+            else None
+        )
+        self.max_tiles_per_stripe = (
+            int(max_tiles_per_stripe) if max_tiles_per_stripe is not None else None
+        )
+        self.prep_workers = max(1, int(prep_workers))
         self.is_val_or_test = self.split in ("val", "test")
         self.rejected_oob_count: int = 0
         self.rejected_flat_count: int = 0
+        self.cached_pairs: Optional[List[Tuple[np.ndarray, str]]] = None
+        self.tile_index: Optional[List[Tuple[int, int, int]]] = None
+        self.cached_tile_crops: Optional[np.ndarray] = None
+        self.cached_tile_ids: Optional[List[str]] = None
+        self.cached_tile_sections: Optional[np.ndarray] = None
+        self._mmap_crops_path: Optional[Path] = None
+        self.cache_slice_indices: Optional[np.ndarray] = None
+        self.records: List[Tuple[str, str, int, int, int, int, int]] = []
 
         if (
             self.align_patches
@@ -379,7 +494,36 @@ class N2NOverlapPairDataset(Dataset):
         if self.tile_stride <= 0:
             raise ValueError(f"tile_stride must be > 0, got {self.tile_stride}")
 
+        tile_streaming = self.patch_sampling == "tile" and (
+            self.cache_in_ram or self.crop_cache_dir is not None
+        )
+
+        prep_fingerprint, prep_hash, exact_key = self._build_cache_keys(
+            first_sec=first_sec,
+            last_sec=last_sec,
+            split_strategy=split_strategy,
+            block_size=block_size,
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+            guard_band_size=guard_band_size,
+            orientation=orientation,
+            max_pairs=max_pairs,
+            seed=seed,
+        )
+
+        if tile_streaming and self.crop_cache_dir is not None:
+            if self._try_load_disk_cache(
+                prep_hash=prep_hash,
+                exact_key=exact_key,
+                first_sec=first_sec,
+                last_sec=last_sec,
+                max_pairs=max_pairs,
+                seed=seed,
+            ):
+                return
+
         manifest_path = self.overlaps_dir / "manifest.parquet"
+        record_limit = None if tile_streaming else max_pairs
         if manifest_path.exists():
             self.records = self._load_records_from_manifest(
                 manifest_path=manifest_path,
@@ -392,8 +536,9 @@ class N2NOverlapPairDataset(Dataset):
                 val_ratio=val_ratio,
                 guard_band_size=guard_band_size,
                 orientation=orientation,
-                max_pairs=max_pairs,
+                max_pairs=record_limit,
                 seed=seed,
+                order_by_shard=tile_streaming,
             )
         else:
             self.records = self._load_records_from_tar_dir(
@@ -405,17 +550,25 @@ class N2NOverlapPairDataset(Dataset):
                 val_ratio=val_ratio,
                 guard_band_size=guard_band_size,
                 orientation=orientation,
-                max_pairs=max_pairs,
+                max_pairs=record_limit,
                 seed=seed,
             )
 
-        self.cached_pairs: Optional[List[Tuple[np.ndarray, str]]] = None
+        if tile_streaming:
+            self._stream_and_materialize_tiles(
+                max_pairs=max_pairs,
+                seed=seed,
+                prep_fingerprint=prep_fingerprint,
+                prep_hash=prep_hash,
+                exact_key=exact_key,
+                first_sec=first_sec,
+                last_sec=last_sec,
+            )
+            return
+
         if self.cache_in_ram:
             self._preload_into_ram()
 
-        self.tile_index: Optional[List[Tuple[int, int, int]]] = None
-        self.cached_tile_crops: Optional[np.ndarray] = None
-        self.cached_tile_ids: Optional[List[str]] = None
         if self.patch_sampling == "tile":
             self.tile_index = self._build_tile_index()
             total_tiles = len(self.tile_index)
@@ -454,7 +607,8 @@ class N2NOverlapPairDataset(Dataset):
         orientation: str,
         max_pairs: Optional[int],
         seed: int,
-    ) -> List[Tuple[str, str, int, int, int, int]]:
+        order_by_shard: bool = False,
+    ) -> List[Tuple[str, str, int, int, int, int, int]]:
         """Query manifest.parquet via DuckDB and return byte-offset records."""
         con = duckdb.connect()
         if self.trim_enabled:
@@ -507,6 +661,11 @@ class N2NOverlapPairDataset(Dataset):
             "INSERT INTO split_secs VALUES (?)", [(s,) for s in target_sections]
         )
 
+        order_sql = (
+            "ORDER BY m.shard_relpath, m.tif_byte_offset"
+            if order_by_shard
+            else f"ORDER BY hash(m.pair_id || '_{int(seed)}')"
+        )
         limit_sql = f"LIMIT {int(max_pairs)}" if max_pairs is not None else ""
         query = f"""
             SELECT
@@ -515,11 +674,12 @@ class N2NOverlapPairDataset(Dataset):
                 m.tif_byte_offset,
                 m.tif_byte_length,
                 m.height,
-                m.width
+                m.width,
+                m.section_num
             FROM read_parquet('{manifest_str}') m
             INNER JOIN split_secs s ON m.section_num = s.section_num
             WHERE {where_sql}
-            ORDER BY hash(m.pair_id || '_{int(seed)}')
+            {order_sql}
             {limit_sql}
         """
         rows = con.execute(query).fetchall()
@@ -531,7 +691,15 @@ class N2NOverlapPairDataset(Dataset):
             )
 
         return [
-            (str(r[0]), str(r[1]), int(r[2]), int(r[3]), int(r[4]), int(r[5]))
+            (
+                str(r[0]),
+                str(r[1]),
+                int(r[2]),
+                int(r[3]),
+                int(r[4]),
+                int(r[5]),
+                int(r[6]),
+            )
             for r in rows
         ]
 
@@ -547,7 +715,7 @@ class N2NOverlapPairDataset(Dataset):
         orientation: str,
         max_pairs: Optional[int],
         seed: int,
-    ) -> List[Tuple[str, str, int, int, int, int]]:
+    ) -> List[Tuple[str, str, int, int, int, int, int]]:
         """Scan local .tar shards directly when manifest.parquet is not present."""
         tar_files = sorted(self.overlaps_dir.glob("*.tar"))
         if not tar_files and (self.overlaps_dir / "shards").is_dir():
@@ -612,7 +780,7 @@ class N2NOverlapPairDataset(Dataset):
             )
 
         filtered = [
-            (pair_id, rel_path, offset, length, 0, 0)
+            (pair_id, rel_path, offset, length, 0, 0, sec_num)
             for sec_num, pair_id, rel_path, offset, length in candidates
             if sec_num in target_sections
         ]
@@ -648,7 +816,9 @@ class N2NOverlapPairDataset(Dataset):
             f"Caching {len(self.records)} N2N '{self.split}' overlap pairs into RAM..."
         )
         shard_groups: Dict[str, List[Tuple[int, int, int, str]]] = defaultdict(list)
-        for idx, (pair_id, shard_rel, offset, length, _, _) in enumerate(self.records):
+        for idx, (pair_id, shard_rel, offset, length, _, _, _) in enumerate(
+            self.records
+        ):
             shard_groups[shard_rel].append((offset, length, idx, pair_id))
 
         cached: List[Optional[Tuple[np.ndarray, str]]] = [None] * len(self.records)
@@ -701,7 +871,7 @@ class N2NOverlapPairDataset(Dataset):
             )
 
     def _read_pair_from_disk(self, idx: int) -> Tuple[np.ndarray, str]:
-        pair_id, shard_rel, offset, length, _, _ = self.records[idx]
+        pair_id, shard_rel, offset, length, _, _, _ = self.records[idx]
         shard_path = self.overlaps_dir / shard_rel
         with open(shard_path, "rb") as f:
             f.seek(offset)
@@ -740,7 +910,7 @@ class N2NOverlapPairDataset(Dataset):
             if self.cached_pairs is not None:
                 _, h, w = self.cached_pairs[pair_idx][0].shape
             else:
-                _, _, _, _, h, w = self.records[pair_idx]
+                _, _, _, _, h, w, _ = self.records[pair_idx]
                 if h == 0 or w == 0:
                     arr, _ = self._read_pair_from_disk(pair_idx)
                     _, h, w = arr.shape
@@ -761,8 +931,235 @@ class N2NOverlapPairDataset(Dataset):
             )
         return tiles
 
-    def _passes_flat_filter(self, crop0: np.ndarray) -> bool:
-        """Return True if crop0 meets the optional min_patch_std texture threshold."""
+    def _build_cache_keys(
+        self,
+        first_sec: Optional[int],
+        last_sec: Optional[int],
+        split_strategy: str,
+        block_size: int,
+        train_ratio: float,
+        val_ratio: float,
+        guard_band_size: int,
+        orientation: str,
+        max_pairs: Optional[int],
+        seed: int,
+    ) -> Tuple[Dict[str, Any], str, str]:
+        """Build preprocessing fingerprint, its hash, and the exact cache directory key."""
+        source_sig = (
+            _compute_source_signature(self.overlaps_dir)
+            if self.crop_cache_dir is not None
+            else {"kind": "disabled"}
+        )
+        prep_fingerprint: Dict[str, Any] = {
+            "schema_version": 1,
+            "overlaps_dir": str(self.overlaps_dir.resolve()),
+            "source_signature": source_sig,
+            "split": self.split,
+            "patch_size": int(self.patch_size),
+            "tile_stride": int(self.tile_stride),
+            "orientation": str(orientation).lower().strip(),
+            "trim_enabled": bool(self.trim_enabled),
+            "v_trim": list(self.v_trim),
+            "h_trim": list(self.h_trim),
+            "align_patches": bool(self.align_patches),
+            "align_subpixel": bool(self.align_subpixel),
+            "align_max_shift_px": int(self.align_max_shift_px),
+            "align_blur_sigma": float(self.align_blur_sigma),
+            "quality_filter_enabled": bool(self.quality_filter_enabled),
+            "quality_metric": self.quality_metric,
+            "min_pair_quality": float(self.min_pair_quality),
+            "quality_blur_sigma": float(self.quality_blur_sigma),
+            "min_patch_std": float(self.min_patch_std),
+            "split_strategy": str(split_strategy),
+            "block_size": int(block_size),
+            "train_ratio": float(train_ratio),
+            "val_ratio": float(val_ratio),
+            "guard_band_size": int(guard_band_size),
+            "seed": int(seed),
+            "max_tiles_per_stripe": (
+                int(self.max_tiles_per_stripe)
+                if self.max_tiles_per_stripe is not None
+                else None
+            ),
+        }
+        prep_hash = _hash_payload(prep_fingerprint)
+        exact_payload = {
+            **prep_fingerprint,
+            "first_sec": int(first_sec) if first_sec is not None else None,
+            "last_sec": int(last_sec) if last_sec is not None else None,
+            "max_pairs": int(max_pairs) if max_pairs is not None else None,
+        }
+        exact_key = _hash_payload(exact_payload)
+        return prep_fingerprint, prep_hash, exact_key
+
+    @staticmethod
+    def _is_valid_cache_dir(cache_dir: Path) -> bool:
+        return (
+            cache_dir.is_dir()
+            and (cache_dir / "metadata.json").is_file()
+            and (cache_dir / "crops.npy").is_file()
+            and (cache_dir / "sections.npy").is_file()
+            and (cache_dir / "ids.txt").is_file()
+        )
+
+    def _activate_mmap_cache(
+        self,
+        cache_dir: Path,
+        sections: np.ndarray,
+        slice_indices: Optional[np.ndarray],
+        is_superset: bool,
+        meta: Dict[str, Any],
+    ) -> None:
+        """Bind a validated on-disk .npy mmap crop cache onto this dataset."""
+        crops_path = cache_dir / "crops.npy"
+        all_ids = (cache_dir / "ids.txt").read_text(encoding="utf-8").splitlines()
+        crops_mmap = np.load(crops_path, mmap_mode="r")
+        if len(all_ids) != crops_mmap.shape[0] or len(sections) != crops_mmap.shape[0]:
+            raise ValueError(
+                f"Corrupt crop cache in {cache_dir}: shape={crops_mmap.shape}, "
+                f"ids={len(all_ids)}, sections={len(sections)}"
+            )
+
+        self._mmap_crops_path = crops_path
+        self.cached_tile_crops = crops_mmap
+        if slice_indices is not None:
+            self.cache_slice_indices = np.asarray(slice_indices, dtype=np.int64)
+            self.cached_tile_ids = [all_ids[int(i)] for i in self.cache_slice_indices]
+            self.cached_tile_sections = sections[self.cache_slice_indices]
+        else:
+            self.cache_slice_indices = None
+            self.cached_tile_ids = all_ids
+            self.cached_tile_sections = sections
+
+        self.rejected_oob_count = int(meta.get("rejected_oob_count", 0))
+        self.rejected_flat_count = int(meta.get("rejected_flat_count", 0))
+        self.records = []
+        self.cached_pairs = None
+
+        size_gb = crops_path.stat().st_size / 1e9
+        n_active = len(self.cached_tile_ids)
+        mode_tag = "superset mmap slice" if is_superset else "exact mmap hit"
+        sec_lo = (
+            int(self.cached_tile_sections.min())
+            if len(self.cached_tile_sections) > 0
+            else None
+        )
+        sec_hi = (
+            int(self.cached_tile_sections.max())
+            if len(self.cached_tile_sections) > 0
+            else None
+        )
+        logger.info(
+            f"N2N '{self.split}' loaded disk cache ({mode_tag}) from {cache_dir}: "
+            f"{n_active}/{crops_mmap.shape[0]} crops ({crops_mmap.shape[2]}x{crops_mmap.shape[3]}, "
+            f"{size_gb:.2f} GB on disk), sections=[{sec_lo}, {sec_hi}]."
+        )
+
+    def _try_load_disk_cache(
+        self,
+        prep_hash: str,
+        exact_key: str,
+        first_sec: Optional[int],
+        last_sec: Optional[int],
+        max_pairs: Optional[int],
+        seed: int,
+    ) -> bool:
+        """Check for an exact or compatible superset disk crop cache and load via mmap."""
+        assert self.crop_cache_dir is not None
+        if not self.crop_cache_dir.exists():
+            return False
+
+        exact_dir = self.crop_cache_dir / f"{self.split}_{exact_key}"
+        if self._is_valid_cache_dir(exact_dir):
+            try:
+                meta = json.loads(
+                    (exact_dir / "metadata.json").read_text(encoding="utf-8")
+                )
+                if (
+                    meta.get("schema_version") == 1
+                    and meta.get("prep_fingerprint_hash") == prep_hash
+                ):
+                    sections = np.load(exact_dir / "sections.npy")
+                    self._activate_mmap_cache(
+                        cache_dir=exact_dir,
+                        sections=sections,
+                        slice_indices=None,
+                        is_superset=False,
+                        meta=meta,
+                    )
+                    return True
+            except Exception as exc:
+                logger.warning(f"Ignoring invalid cache at {exact_dir}: {exc}")
+
+        best_candidate: Optional[
+            Tuple[int, int, Path, np.ndarray, np.ndarray, Dict[str, Any]]
+        ] = None
+        for cand_dir in sorted(self.crop_cache_dir.glob(f"{self.split}_*")):
+            if cand_dir == exact_dir or not self._is_valid_cache_dir(cand_dir):
+                continue
+            try:
+                meta = json.loads(
+                    (cand_dir / "metadata.json").read_text(encoding="utf-8")
+                )
+            except Exception:
+                continue
+            if (
+                meta.get("schema_version") != 1
+                or meta.get("prep_fingerprint_hash") != prep_hash
+            ):
+                continue
+
+            c_first = meta.get("first_sec")
+            c_last = meta.get("last_sec")
+            covers_first = c_first is None or (
+                first_sec is not None and int(c_first) <= int(first_sec)
+            )
+            covers_last = c_last is None or (
+                last_sec is not None and int(c_last) >= int(last_sec)
+            )
+            if not (covers_first and covers_last):
+                continue
+
+            c_max = meta.get("max_pairs_requested")
+            if max_pairs is None and c_max is not None:
+                continue
+
+            sections = np.load(cand_dir / "sections.npy")
+            mask = np.ones(len(sections), dtype=bool)
+            if first_sec is not None:
+                mask &= sections >= int(first_sec)
+            if last_sec is not None:
+                mask &= sections <= int(last_sec)
+            idx = np.flatnonzero(mask)
+            if len(idx) == 0:
+                continue
+            if max_pairs is not None and len(idx) < int(max_pairs):
+                continue
+
+            is_uncapped = 1 if c_max is None else 0
+            score = (is_uncapped, int(len(idx)))
+            if best_candidate is None or score > best_candidate[:2]:
+                best_candidate = (*score, cand_dir, sections, idx, meta)
+
+        if best_candidate is None:
+            return False
+
+        _, _, cand_dir, sections, idx, meta = best_candidate
+        if max_pairs is not None and len(idx) > int(max_pairs):
+            rng_np = np.random.default_rng(int(seed))
+            idx = np.sort(rng_np.choice(idx, size=int(max_pairs), replace=False))
+
+        self._activate_mmap_cache(
+            cache_dir=cand_dir,
+            sections=sections,
+            slice_indices=idx,
+            is_superset=True,
+            meta=meta,
+        )
+        return True
+
+    def _is_patch_above_std(self, crop0: np.ndarray) -> bool:
+        """Pure check returning True if crop0 meets the optional min_patch_std threshold."""
         if self.min_patch_std <= 0.0:
             return True
         arr = crop0.astype(np.float32)
@@ -770,14 +1167,17 @@ class N2NOverlapPairDataset(Dataset):
             arr = gaussian_filter(arr, sigma=self.quality_blur_sigma)
         return float(arr.std()) >= self.min_patch_std
 
-    def _extract_aligned_crops(
-        self, pair_arr: np.ndarray, y0: int, x0: int
-    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-        """
-        Extract (ps, ps) crops at (y0, x0) and optionally align crop1.
+    def _passes_flat_filter(self, crop0: np.ndarray) -> bool:
+        """Return True if crop0 meets the optional min_patch_std texture threshold."""
+        return self._is_patch_above_std(crop0)
 
-        Returns `None` (incrementing `self.rejected_oob_count`) if the estimated shift
-        or sub-pixel padding would exceed the stripe boundary — never clamps.
+    def _align_crop_pair(
+        self, pair_arr: np.ndarray, y0: int, x0: int
+    ) -> Tuple[Optional[Tuple[np.ndarray, np.ndarray]], bool]:
+        """
+        Thread-safe crop extraction and alignment without mutating instance counters.
+
+        Returns `(crops_tuple_or_None, was_rejected_oob)`.
         """
         _, h, w = pair_arr.shape
         ps = self.patch_size
@@ -785,7 +1185,7 @@ class N2NOverlapPairDataset(Dataset):
         crop1 = pair_arr[1, y0 : y0 + ps, x0 : x0 + ps]
 
         if not self.align_patches:
-            return crop0, crop1
+            return (crop0, crop1), False
 
         if self.align_subpixel:
             dy_f, dx_f = _estimate_subpixel_shift(
@@ -798,8 +1198,7 @@ class N2NOverlapPairDataset(Dataset):
             y_lo, y_hi = y0 - pad, y0 + ps + pad
             x_lo, x_hi = x0 - pad, x0 + ps + pad
             if y_lo < 0 or y_hi > h or x_lo < 0 or x_hi > w:
-                self.rejected_oob_count += 1
-                return None
+                return None, True
             img1_pad = pair_arr[1, y_lo:y_hi, x_lo:x_hi].astype(np.float32)
             shifted_pad = ndi_shift(
                 img1_pad, shift=(dy_f, dx_f), order=3, mode="nearest"
@@ -807,7 +1206,7 @@ class N2NOverlapPairDataset(Dataset):
             crop1_shifted = np.clip(
                 shifted_pad[pad : pad + ps, pad : pad + ps], 0.0, 255.0
             )
-            return crop0, crop1_shifted
+            return (crop0, crop1_shifted), False
 
         dy, dx = _estimate_integer_shift(
             crop0,
@@ -818,9 +1217,508 @@ class N2NOverlapPairDataset(Dataset):
         y1 = y0 - dy
         x1 = x0 - dx
         if y1 < 0 or y1 + ps > h or x1 < 0 or x1 + ps > w:
+            return None, True
+        return (crop0, pair_arr[1, y1 : y1 + ps, x1 : x1 + ps]), False
+
+    def _extract_aligned_crops(
+        self, pair_arr: np.ndarray, y0: int, x0: int
+    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """
+        Extract (ps, ps) crops at (y0, x0) and optionally align crop1.
+
+        Returns `None` (incrementing `self.rejected_oob_count`) if the estimated shift
+        or sub-pixel padding would exceed the stripe boundary — never clamps.
+        """
+        crops, is_oob = self._align_crop_pair(pair_arr, y0, x0)
+        if is_oob:
             self.rejected_oob_count += 1
             return None
-        return crop0, pair_arr[1, y1 : y1 + ps, x1 : x1 + ps]
+        return crops
+
+    def _process_stripe_for_tiles(
+        self,
+        pair_idx: int,
+        sec_num: int,
+        pair_arr: np.ndarray,
+        pair_id: str,
+        stripe_seed: int,
+        per_stripe_cap: Optional[int],
+        skip_coords: Optional[set[Tuple[int, int]]] = None,
+    ) -> Tuple[
+        List[Tuple[int, int, int, int, np.ndarray, np.ndarray, str, Optional[float]]],
+        int,
+        int,
+        int,
+    ]:
+        """Extract, align, flat-filter, and quality-filter tiles from one stripe."""
+        _, h, w = pair_arr.shape
+        ps = self.patch_size
+        stride = self.tile_stride
+        tile_margin = 0 if not self.align_patches else (6 if self.align_subpixel else 2)
+        ys = self._axis_tile_coords(h, ps, stride, tile_margin)
+        xs = self._axis_tile_coords(w, ps, stride, tile_margin)
+        coords = [(y0, x0) for y0 in ys for x0 in xs]
+        random.Random(stripe_seed).shuffle(coords)
+
+        kept: List[
+            Tuple[int, int, int, int, np.ndarray, np.ndarray, str, Optional[float]]
+        ] = []
+        rejected_quality = 0
+        rejected_oob = 0
+        rejected_flat = 0
+
+        for y0, x0 in coords:
+            if skip_coords is not None and (y0, x0) in skip_coords:
+                continue
+            crops, is_oob = self._align_crop_pair(pair_arr, y0, x0)
+            if crops is None:
+                if is_oob:
+                    rejected_oob += 1
+                continue
+            crop0, crop1 = crops
+            if not self._is_patch_above_std(crop0):
+                rejected_flat += 1
+                continue
+
+            score: Optional[float] = None
+            if self.quality_filter_enabled:
+                score = _compute_pair_quality(
+                    crop0,
+                    crop1,
+                    metric=self.quality_metric,
+                    blur_sigma=self.quality_blur_sigma,
+                )
+                if score < self.min_pair_quality:
+                    rejected_quality += 1
+                    continue
+
+            c0_u8 = np.rint(np.clip(crop0, 0.0, 255.0)).astype(np.uint8)
+            c1_u8 = np.rint(np.clip(crop1, 0.0, 255.0)).astype(np.uint8)
+            kept.append(
+                (
+                    pair_idx,
+                    sec_num,
+                    y0,
+                    x0,
+                    c0_u8,
+                    c1_u8,
+                    f"{pair_id}_y{y0}_x{x0}",
+                    score,
+                )
+            )
+            if per_stripe_cap is not None and len(kept) >= per_stripe_cap:
+                break
+
+        return kept, rejected_quality, rejected_oob, rejected_flat
+
+    def _stream_and_materialize_tiles(
+        self,
+        max_pairs: Optional[int],
+        seed: int,
+        prep_fingerprint: Dict[str, Any],
+        prep_hash: str,
+        exact_key: str,
+        first_sec: Optional[int],
+        last_sec: Optional[int],
+    ) -> None:
+        """
+        Single-pass shard-streaming crop materializer.
+
+        Reads stripes from `.tar` shards in small sequential chunks (~180 MB RAM),
+        aligns/filters tiles deterministically (optionally with `prep_workers` threads),
+        enforces per-shard uniform quotas across all shards when `max_pairs` is capped,
+        and writes surviving uint8 crops directly into either RAM or a persistent `.npy`
+        memory-mapped cache directory.
+        """
+        ps = self.patch_size
+        target_cap = int(max_pairs) if max_pairs is not None else None
+        num_records = len(self.records)
+
+        shard_groups: Dict[str, List[Tuple[int, str, int, int, int]]] = defaultdict(
+            list
+        )
+        for pair_idx, (pair_id, shard_rel, offset, length, _, _, sec_num) in enumerate(
+            self.records
+        ):
+            shard_groups[shard_rel].append((pair_idx, pair_id, offset, length, sec_num))
+
+        shard_list = sorted(shard_groups.keys())
+        random.Random(int(seed)).shuffle(shard_list)
+        num_shards = len(shard_list)
+
+        if target_cap is not None:
+            per_stripe_cap: Optional[int] = (
+                max(1, self.max_tiles_per_stripe)
+                if self.max_tiles_per_stripe is not None
+                else max(1, math.ceil(1.5 * target_cap / max(num_records, 1)))
+            )
+        else:
+            per_stripe_cap = (
+                max(1, self.max_tiles_per_stripe)
+                if self.max_tiles_per_stripe is not None
+                else None
+            )
+
+        shard_shuffled_items: Dict[str, List[Tuple[int, str, int, int, int]]] = {}
+        for s_idx, shard_rel in enumerate(shard_list):
+            items = list(shard_groups[shard_rel])
+            random.Random(int(seed) ^ ((s_idx + 1) * 0x9E3779B9)).shuffle(items)
+            shard_shuffled_items[shard_rel] = items
+
+        # Initialize sink: disk mmap writer or compact RAM buffer
+        use_disk_cache = self.crop_cache_dir is not None
+        tmp_cache_dir: Optional[Path] = None
+        target_cache_dir: Optional[Path] = None
+        npy_writer: Optional[_NpyChunkWriter] = None
+        disk_batch_crops: List[Tuple[np.ndarray, np.ndarray]] = []
+        ram_buf: Optional[np.ndarray] = None
+        ram_chunks: List[np.ndarray] = []
+
+        if use_disk_cache:
+            assert self.crop_cache_dir is not None
+            self.crop_cache_dir.mkdir(parents=True, exist_ok=True)
+            target_cache_dir = self.crop_cache_dir / f"{self.split}_{exact_key}"
+            tmp_cache_dir = (
+                self.crop_cache_dir / f".{self.split}_{exact_key}.tmp.{os.getpid()}"
+            )
+            if tmp_cache_dir.exists():
+                shutil.rmtree(tmp_cache_dir, ignore_errors=True)
+            tmp_cache_dir.mkdir(parents=True, exist_ok=True)
+            npy_writer = _NpyChunkWriter(tmp_cache_dir / "crops.npy", patch_size=ps)
+        elif target_cap is not None:
+            ram_buf = np.empty((target_cap, 2, ps, ps), dtype=np.uint8)
+
+        kept_ids: List[str] = []
+        kept_sections: List[int] = []
+        scores_kept: List[float] = []
+        used_coords: Dict[int, set[Tuple[int, int]]] = defaultdict(set)
+        trim_seen: set[int] = set()
+        trim_kept_counts = {"_h": 0, "_v": 0}
+        trim_dropped_counts = {"_h": 0, "_v": 0}
+        rejected_quality = 0
+        rejected_oob = 0
+        rejected_flat = 0
+        shards_used: set[str] = set()
+        kept_count = 0
+        chunk_size = 64
+
+        def _flush_disk_batch() -> None:
+            if npy_writer is not None and disk_batch_crops:
+                arr_b = np.empty((len(disk_batch_crops), 2, ps, ps), dtype=np.uint8)
+                for j, (c0_b, c1_b) in enumerate(disk_batch_crops):
+                    arr_b[j, 0] = c0_b
+                    arr_b[j, 1] = c1_b
+                npy_writer.append(arr_b)
+                disk_batch_crops.clear()
+
+        def _emit_item(
+            shard_rel: str,
+            item: Tuple[
+                int, int, int, int, np.ndarray, np.ndarray, str, Optional[float]
+            ],
+        ) -> None:
+            nonlocal kept_count
+            pair_idx, sec_num, y0, x0, c0_u8, c1_u8, tile_id, score = item
+            if use_disk_cache:
+                disk_batch_crops.append((c0_u8, c1_u8))
+                if len(disk_batch_crops) >= 256:
+                    _flush_disk_batch()
+            elif ram_buf is not None:
+                ram_buf[kept_count, 0] = c0_u8
+                ram_buf[kept_count, 1] = c1_u8
+            else:
+                pair_u8 = np.empty((1, 2, ps, ps), dtype=np.uint8)
+                pair_u8[0, 0] = c0_u8
+                pair_u8[0, 1] = c1_u8
+                ram_chunks.append(pair_u8)
+
+            kept_ids.append(tile_id)
+            kept_sections.append(int(sec_num))
+            if target_cap is not None:
+                used_coords[pair_idx].add((y0, x0))
+            shards_used.add(shard_rel)
+            if score is not None:
+                scores_kept.append(score)
+            kept_count += 1
+
+        def _run_pass(
+            pass_name: str,
+            pass_per_stripe_cap: Optional[int],
+            use_shard_quotas: bool,
+            use_skip_coords: bool,
+        ) -> None:
+            nonlocal rejected_quality, rejected_oob, rejected_flat
+            pbar = tqdm(
+                total=target_cap if target_cap is not None else num_records,
+                desc=f"N2N Stream ({self.split}, {pass_name})",
+                bar_format="{desc}: {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
+            )
+            if target_cap is not None and kept_count > 0:
+                pbar.update(kept_count)
+
+            pool: Optional[ThreadPoolExecutor] = (
+                ThreadPoolExecutor(max_workers=self.prep_workers)
+                if self.prep_workers > 1
+                else None
+            )
+            try:
+                for s_idx, shard_rel in enumerate(shard_list):
+                    if target_cap is not None and kept_count >= target_cap:
+                        break
+                    shard_quota: Optional[int] = None
+                    if use_shard_quotas and target_cap is not None:
+                        shard_quota = target_cap // num_shards + (
+                            1 if s_idx < (target_cap % num_shards) else 0
+                        )
+                        if shard_quota <= 0:
+                            continue
+
+                    items = shard_shuffled_items[shard_rel]
+                    shard_path = self.overlaps_dir / shard_rel
+                    shard_kept = 0
+
+                    with open(shard_path, "rb") as f:
+                        for c_start in range(0, len(items), chunk_size):
+                            if target_cap is not None and kept_count >= target_cap:
+                                break
+                            if shard_quota is not None and shard_kept >= shard_quota:
+                                break
+
+                            raw_chunk = items[c_start : c_start + chunk_size]
+                            # Read in ascending byte-offset order for sequential I/O, then restore shuffled order
+                            read_order = sorted(
+                                range(len(raw_chunk)),
+                                key=lambda pos: raw_chunk[pos][2],
+                            )
+                            trimmed_slots: List[
+                                Optional[Tuple[int, int, np.ndarray, str]]
+                            ] = [None] * len(raw_chunk)
+
+                            for pos in read_order:
+                                pair_idx, pair_id, offset, length, sec_num = raw_chunk[
+                                    pos
+                                ]
+                                f.seek(offset)
+                                raw_bytes = f.read(length)
+                                arr = tifffile.imread(io.BytesIO(raw_bytes))
+                                if arr.ndim != 3 or arr.shape[0] != 2:
+                                    raise ValueError(
+                                        f"Expected (2, H, W) TIFF for {pair_id}, got shape {arr.shape}"
+                                    )
+                                arr = self._trim_pair(arr, pair_id)
+                                orient_key = "_v" if pair_id.endswith("_v") else "_h"
+                                if arr.shape[1] < ps or arr.shape[2] < ps:
+                                    if pair_idx not in trim_seen:
+                                        trim_seen.add(pair_idx)
+                                        trim_dropped_counts[orient_key] += 1
+                                    continue
+                                if pair_idx not in trim_seen:
+                                    trim_seen.add(pair_idx)
+                                    trim_kept_counts[orient_key] += 1
+                                trimmed_slots[pos] = (pair_idx, sec_num, arr, pair_id)
+
+                            work_items = [
+                                slot for slot in trimmed_slots if slot is not None
+                            ]
+                            if not work_items:
+                                if target_cap is None:
+                                    pbar.update(len(raw_chunk))
+                                continue
+
+                            if pool is not None and len(work_items) > 1:
+                                futures = [
+                                    pool.submit(
+                                        self._process_stripe_for_tiles,
+                                        pair_idx,
+                                        sec_num,
+                                        arr,
+                                        pair_id,
+                                        int(seed) ^ ((pair_idx + 1) * 0x9E3779B9),
+                                        pass_per_stripe_cap,
+                                        used_coords.get(pair_idx)
+                                        if use_skip_coords
+                                        else None,
+                                    )
+                                    for pair_idx, sec_num, arr, pair_id in work_items
+                                ]
+                                results = [fut.result() for fut in futures]
+                            else:
+                                results = [
+                                    self._process_stripe_for_tiles(
+                                        pair_idx,
+                                        sec_num,
+                                        arr,
+                                        pair_id,
+                                        int(seed) ^ ((pair_idx + 1) * 0x9E3779B9),
+                                        pass_per_stripe_cap,
+                                        used_coords.get(pair_idx)
+                                        if use_skip_coords
+                                        else None,
+                                    )
+                                    for pair_idx, sec_num, arr, pair_id in work_items
+                                ]
+
+                            for kept_list, rq, ro, rf in results:
+                                rejected_quality += rq
+                                rejected_oob += ro
+                                rejected_flat += rf
+                                for item in kept_list:
+                                    if (
+                                        target_cap is not None
+                                        and kept_count >= target_cap
+                                    ):
+                                        break
+                                    if (
+                                        shard_quota is not None
+                                        and shard_kept >= shard_quota
+                                    ):
+                                        break
+                                    _emit_item(shard_rel, item)
+                                    shard_kept += 1
+                                    if target_cap is not None:
+                                        pbar.update(1)
+
+                            if target_cap is None:
+                                pbar.update(len(raw_chunk))
+            finally:
+                if pool is not None:
+                    pool.shutdown(wait=True)
+                pbar.close()
+
+        try:
+            _run_pass(
+                pass_name="pass1",
+                pass_per_stripe_cap=per_stripe_cap,
+                use_shard_quotas=(target_cap is not None),
+                use_skip_coords=False,
+            )
+
+            if target_cap is not None and kept_count < target_cap:
+                logger.info(
+                    f"N2N '{self.split}' streaming pass1 collected {kept_count}/{target_cap}; "
+                    f"running shortfall fallback without per-shard/per-stripe caps."
+                )
+                _run_pass(
+                    pass_name="pass2_fallback",
+                    pass_per_stripe_cap=None,
+                    use_shard_quotas=False,
+                    use_skip_coords=True,
+                )
+
+            used_coords.clear()
+            _flush_disk_batch()
+            if kept_count == 0:
+                raise ValueError(
+                    f"No valid {ps}x{ps} tiles survived streaming materialization for "
+                    f"split '{self.split}' (rejected_quality={rejected_quality}, "
+                    f"rejected_oob={rejected_oob}, rejected_flat={rejected_flat})."
+                )
+
+            if self.trim_enabled:
+                logger.info(
+                    f"N2N '{self.split}' ROI trim summary (patch_size={ps}): "
+                    f"_h kept={trim_kept_counts['_h']} dropped={trim_dropped_counts['_h']} | "
+                    f"_v kept={trim_kept_counts['_v']} dropped={trim_dropped_counts['_v']}"
+                )
+
+            mean_score_str = (
+                f", mean_score={np.mean(scores_kept):.3f}" if scores_kept else ""
+            )
+            logger.info(
+                f"N2N '{self.split}' stream summary (shards={len(shards_used)}/{num_shards}): "
+                f"kept={kept_count}, rejected_quality={rejected_quality}, "
+                f"rejected_oob={rejected_oob}, rejected_flat={rejected_flat}{mean_score_str}"
+            )
+
+            self.rejected_oob_count = rejected_oob
+            self.rejected_flat_count = rejected_flat
+            sections_arr = np.asarray(kept_sections, dtype=np.int32)
+
+            if use_disk_cache:
+                assert (
+                    npy_writer is not None
+                    and tmp_cache_dir is not None
+                    and target_cache_dir is not None
+                )
+                npy_writer.finalize()
+                np.save(tmp_cache_dir / "sections.npy", sections_arr)
+                (tmp_cache_dir / "ids.txt").write_text(
+                    "\n".join(kept_ids) + "\n", encoding="utf-8"
+                )
+                meta = {
+                    "schema_version": 1,
+                    "prep_fingerprint_hash": prep_hash,
+                    "prep_fingerprint": prep_fingerprint,
+                    "split": self.split,
+                    "first_sec": int(first_sec) if first_sec is not None else None,
+                    "last_sec": int(last_sec) if last_sec is not None else None,
+                    "actual_min_sec": int(sections_arr.min()),
+                    "actual_max_sec": int(sections_arr.max()),
+                    "max_pairs_requested": target_cap,
+                    "num_crops": int(kept_count),
+                    "patch_size": int(ps),
+                    "shards_covered": int(len(shards_used)),
+                    "total_shards": int(num_shards),
+                    "rejected_quality_count": int(rejected_quality),
+                    "rejected_oob_count": int(rejected_oob),
+                    "rejected_flat_count": int(rejected_flat),
+                    "mean_quality_score": (
+                        float(np.mean(scores_kept)) if scores_kept else None
+                    ),
+                }
+                (tmp_cache_dir / "metadata.json").write_text(
+                    json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8"
+                )
+                if not target_cache_dir.exists():
+                    try:
+                        os.replace(tmp_cache_dir, target_cache_dir)
+                    except OSError:
+                        if not self._is_valid_cache_dir(target_cache_dir):
+                            raise
+                if tmp_cache_dir.exists():
+                    shutil.rmtree(tmp_cache_dir, ignore_errors=True)
+                self._activate_mmap_cache(
+                    cache_dir=target_cache_dir,
+                    sections=sections_arr,
+                    slice_indices=None,
+                    is_superset=False,
+                    meta=meta,
+                )
+            else:
+                if ram_buf is not None:
+                    final_buf = (
+                        ram_buf
+                        if kept_count == len(ram_buf)
+                        else ram_buf[:kept_count].copy()
+                    )
+                else:
+                    final_buf = np.concatenate(ram_chunks, axis=0)
+                    ram_chunks.clear()
+                self.cached_tile_crops = final_buf
+                self.cached_tile_ids = kept_ids
+                self.cached_tile_sections = sections_arr
+                self.cached_pairs = None
+                self.records = []
+                gc.collect()
+                logger.info(
+                    f"N2N '{self.split}' streamed {kept_count} aligned ({ps}x{ps}) "
+                    f"tile crops into RAM ({final_buf.nbytes / 1e6:.1f} MB) with zero full-stripe preload."
+                )
+        except Exception:
+            if npy_writer is not None:
+                npy_writer.abort()
+            if tmp_cache_dir is not None and tmp_cache_dir.exists():
+                shutil.rmtree(tmp_cache_dir, ignore_errors=True)
+            raise
+
+    def __getstate__(self) -> Dict[str, Any]:
+        state = self.__dict__.copy()
+        if state.get("_mmap_crops_path") is not None:
+            state["cached_tile_crops"] = None
+        return state
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        self.__dict__.update(state)
 
     def _store_materialized_crops(
         self, crops: List[Tuple[np.ndarray, np.ndarray, str]]
@@ -950,6 +1848,8 @@ class N2NOverlapPairDataset(Dataset):
         return kept
 
     def __len__(self) -> int:
+        if self.cache_slice_indices is not None:
+            return len(self.cache_slice_indices)
         if self.cached_tile_ids is not None:
             return len(self.cached_tile_ids)
         if self.tile_index is not None:
@@ -957,15 +1857,23 @@ class N2NOverlapPairDataset(Dataset):
         return len(self.records)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, str]:
-        if self.cached_tile_crops is not None and self.cached_tile_ids is not None:
-            return _format_pair_tensors(
-                crop0=self.cached_tile_crops[idx, 0],
-                crop1=self.cached_tile_crops[idx, 1],
-                pair_direction=self.pair_direction,
-                is_val_or_test=self.is_val_or_test,
-                augment=self.augment,
-                augment_rot90=self.augment_rot90,
-            ) + (self.cached_tile_ids[idx],)
+        if self.cached_tile_ids is not None:
+            if self.cached_tile_crops is None and self._mmap_crops_path is not None:
+                self.cached_tile_crops = np.load(self._mmap_crops_path, mmap_mode="r")
+            if self.cached_tile_crops is not None:
+                crop_idx = (
+                    int(self.cache_slice_indices[idx])
+                    if self.cache_slice_indices is not None
+                    else idx
+                )
+                return _format_pair_tensors(
+                    crop0=self.cached_tile_crops[crop_idx, 0],
+                    crop1=self.cached_tile_crops[crop_idx, 1],
+                    pair_direction=self.pair_direction,
+                    is_val_or_test=self.is_val_or_test,
+                    augment=self.augment,
+                    augment_rot90=self.augment_rot90,
+                ) + (self.cached_tile_ids[idx],)
 
         ps = self.patch_size
 

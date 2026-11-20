@@ -86,6 +86,7 @@ class TrainingConfig:
     num_workers: int = 0
     save_all_epochs: bool = True
     compile_model: bool = False
+    samples_per_epoch: Optional[int] = None
 
 
 @dataclass
@@ -209,6 +210,13 @@ class N2NConfig:
     min_patch_std: float = (
         0.0  # Optional min smoothed std (0-255 space) to drop flat/empty patches
     )
+    crop_cache_dir: Optional[str] = (
+        None  # Optional persistent .npy mmap crop cache dir for tile mode
+    )
+    max_tiles_per_stripe: Optional[int] = (
+        None  # Max kept tiles per stripe in streaming tile mode (null = auto)
+    )
+    prep_workers: int = 1  # Threads for alignment & QA during tile materialization
     streaming: bool = False
     shuffle_buffer_size: int = 2048
 

@@ -51,6 +51,9 @@ n2n:
   min_pair_quality: 0.60
   quality_blur_sigma: 1.5
   min_patch_std: 0.0              # Optional min std on smoothed crop0 (e.g. 5.0) to drop flat/empty epoxy patches
+  crop_cache_dir: null            # Optional path for persistent .npy mmap crop cache (instant <0.1s reloads + sub-range slicing)
+  max_tiles_per_stripe: null      # Max kept patches/stripe in streaming tile mode (null = auto-scale for uniform shard coverage)
+  prep_workers: 4                 # Threads for alignment & QA scoring per 64-stripe chunk during startup
   streaming: false                # Set true (with max_train_pairs: null) to stream all 2M+ pairs in <2 GB RAM
   shuffle_buffer_size: 2048
 
@@ -67,6 +70,7 @@ training:
   warmup_epochs: 2
   seed: 42
   cache_in_ram: true              # Materializes compact aligned patches and frees full stripes
+  samples_per_epoch: null         # Optional random subset per epoch when mmap cache has millions of patches
   device: "cuda"
   num_workers: 4
   save_all_epochs: false          # Keep checkpoint_last.pt + checkpoint_best.pt (fast on network FS)

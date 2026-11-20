@@ -616,3 +616,362 @@ def test_overlap_subpixel_warns_when_not_first_to_second(tmp_path: Path, caplog)
             pair_direction="random_swap",
         )
     assert any("first_to_second" in r.message for r in caplog.records)
+
+
+def _write_multi_shard_overlap_dataset(
+    tmp_path: Path,
+    shard_specs: list[tuple[str, list[tuple[int, str, np.ndarray]]]],
+    name: str = "overlaps_multi",
+) -> Path:
+    """Create multi-shard USTAR .tar files plus manifest.parquet matching sbem-n2n-overlaps."""
+    import tarfile
+    import duckdb
+
+    ov_dir = tmp_path / name
+    shards_dir = ov_dir / "shards"
+    shards_dir.mkdir(parents=True, exist_ok=True)
+    staging = tmp_path / f"{name}_staging"
+    staging.mkdir(parents=True, exist_ok=True)
+
+    manifest_rows: list[tuple[str, int, str, str, int, int, int, int]] = []
+    for shard_name, items in shard_specs:
+        shard_rel = f"shards/{shard_name}"
+        tar_path = ov_dir / shard_rel
+        with tarfile.open(tar_path, "w") as tf:
+            for _, fname, pair in items:
+                tif_path = staging / fname
+                tifffile.imwrite(tif_path, pair.astype(np.uint8))
+                tf.add(tif_path, arcname=fname)
+        meta_by_name = {
+            fname: (sec_num, pair.shape[1], pair.shape[2])
+            for sec_num, fname, pair in items
+        }
+        with tarfile.open(tar_path, "r") as tf:
+            for member in tf:
+                if not member.isfile() or member.name not in meta_by_name:
+                    continue
+                sec_num, h, w = meta_by_name[member.name]
+                pair_id = Path(member.name).stem
+                orient = "vertical" if pair_id.endswith("_v") else "horizontal"
+                manifest_rows.append(
+                    (
+                        pair_id,
+                        int(sec_num),
+                        orient,
+                        shard_rel,
+                        int(member.offset_data),
+                        int(member.size),
+                        int(h),
+                        int(w),
+                    )
+                )
+
+    con = duckdb.connect()
+    con.execute(
+        """
+        CREATE TABLE manifest (
+            pair_id VARCHAR,
+            section_num INTEGER,
+            orientation VARCHAR,
+            shard_relpath VARCHAR,
+            tif_byte_offset BIGINT,
+            tif_byte_length BIGINT,
+            height INTEGER,
+            width INTEGER
+        )
+        """
+    )
+    con.executemany(
+        "INSERT INTO manifest VALUES (?, ?, ?, ?, ?, ?, ?, ?)", manifest_rows
+    )
+    manifest_out = str(ov_dir / "manifest.parquet").replace("'", "''")
+    con.execute(f"COPY manifest TO '{manifest_out}' (FORMAT PARQUET)")
+    con.close()
+    return ov_dir
+
+
+def test_overlap_streaming_materialization_respects_section_range_and_never_preloads(
+    tmp_path: Path,
+):
+    from em_denoise_refactor.data.n2n_dataset import N2NOverlapPairDataset
+
+    shard_specs = []
+    for s_idx in range(3):
+        items = []
+        for sec in range(s_idx * 20, (s_idx + 1) * 20):
+            base = _make_structured_base(160, 288, seed=sec + 1)
+            pair = np.stack([base, base], axis=0).astype(np.uint8)
+            items.append((sec, f"s{sec:05d}_g0000_t0000_t0001_v.tif", pair))
+        shard_specs.append((f"shard_{s_idx:04d}.tar", items))
+    ov_dir = _write_multi_shard_overlap_dataset(tmp_path, shard_specs)
+
+    ds = N2NOverlapPairDataset(
+        overlaps_dir=ov_dir,
+        split="train",
+        patch_size=64,
+        first_sec=10,
+        last_sec=39,
+        split_strategy="mod10",
+        max_pairs=24,
+        cache_in_ram=True,
+        patch_sampling="tile",
+        align_patches=False,
+        seed=42,
+    )
+    assert ds.cached_pairs is None
+    assert ds.cached_tile_crops is not None
+    assert ds.cached_tile_crops.shape == (24, 2, 64, 64)
+    assert ds.cached_tile_crops.dtype == np.uint8
+    assert ds.cached_tile_sections is not None
+    assert int(ds.cached_tile_sections.min()) >= 10
+    assert int(ds.cached_tile_sections.max()) <= 39
+
+
+def test_overlap_streaming_materialization_uniform_shard_coverage(tmp_path: Path):
+    from em_denoise_refactor.data.n2n_dataset import N2NOverlapPairDataset
+
+    shard_specs = []
+    for s_idx in range(6):
+        items = []
+        # 4 train sections + 1 val/test section per shard; embed shard index in tile_id (t000{s_idx})
+        for local_i in range(10):
+            sec = s_idx * 10 + local_i
+            base = _make_structured_base(160, 288, seed=100 + sec)
+            pair = np.stack([base, base], axis=0).astype(np.uint8)
+            items.append((sec, f"s{sec:05d}_g0000_t000{s_idx}_t0009_v.tif", pair))
+        shard_specs.append((f"shard_{s_idx:04d}.tar", items))
+    ov_dir = _write_multi_shard_overlap_dataset(tmp_path, shard_specs)
+
+    ds = N2NOverlapPairDataset(
+        overlaps_dir=ov_dir,
+        split="train",
+        patch_size=64,
+        split_strategy="mod10",
+        max_pairs=12,
+        cache_in_ram=True,
+        patch_sampling="tile",
+        align_patches=False,
+        seed=42,
+    )
+    assert len(ds) == 12
+    assert ds.cached_tile_ids is not None
+    seen_shards = {tile_id.split("_t000")[1][:1] for tile_id in ds.cached_tile_ids}
+    assert seen_shards == {"0", "1", "2", "3", "4", "5"}
+
+
+def test_overlap_streaming_materialization_deterministic_across_prep_workers(
+    tmp_path: Path,
+):
+    from em_denoise_refactor.data.n2n_dataset import N2NOverlapPairDataset
+
+    items = []
+    for sec in range(20):
+        base = _make_structured_base(160, 320, seed=50 + sec)
+        shifted = np.clip(
+            ndi_shift(base, shift=(1.2, -1.3), order=3, mode="nearest"), 0, 255
+        )
+        pair = np.stack([base, shifted], axis=0).astype(np.uint8)
+        items.append((sec, f"s{sec:05d}_g0000_t0000_t0001_v.tif", pair))
+    ov_dir = _write_multi_shard_overlap_dataset(tmp_path, [("shard_0000.tar", items)])
+
+    kwargs = dict(
+        overlaps_dir=ov_dir,
+        split="train",
+        patch_size=64,
+        split_strategy="mod10",
+        max_pairs=16,
+        cache_in_ram=True,
+        patch_sampling="tile",
+        align_patches=True,
+        align_subpixel=True,
+        quality_filter_enabled=True,
+        quality_metric="ssim",
+        min_pair_quality=0.80,
+        seed=42,
+    )
+    ds1 = N2NOverlapPairDataset(**kwargs, prep_workers=1)
+    ds4 = N2NOverlapPairDataset(**kwargs, prep_workers=4)
+    assert ds1.cached_tile_ids == ds4.cached_tile_ids
+    assert ds1.cached_tile_crops is not None and ds4.cached_tile_crops is not None
+    assert np.array_equal(ds1.cached_tile_crops, ds4.cached_tile_crops)
+
+
+def test_overlap_streaming_materialization_shortfall_fallback(tmp_path: Path):
+    from em_denoise_refactor.data.n2n_dataset import N2NOverlapPairDataset
+
+    # Only 4 train sections under mod10 (secs 0, 1, 2, 3), each wide enough for multiple 64x64 tiles
+    items = []
+    for sec in range(4):
+        base = _make_structured_base(160, 320, seed=200 + sec)
+        pair = np.stack([base, base], axis=0).astype(np.uint8)
+        items.append((sec, f"s{sec:05d}_g0000_t0000_t0001_v.tif", pair))
+    ov_dir = _write_multi_shard_overlap_dataset(tmp_path, [("shard_0000.tar", items)])
+
+    ds = N2NOverlapPairDataset(
+        overlaps_dir=ov_dir,
+        split="train",
+        patch_size=64,
+        split_strategy="mod10",
+        max_pairs=8,
+        max_tiles_per_stripe=1,
+        cache_in_ram=True,
+        patch_sampling="tile",
+        align_patches=False,
+        seed=42,
+    )
+    assert len(ds) == 8
+
+
+def test_overlap_disk_mmap_cache_build_reload_and_invalidation(tmp_path: Path):
+    import pickle
+    from em_denoise_refactor.data.n2n_dataset import N2NOverlapPairDataset
+
+    items = []
+    for sec in range(20):
+        base = _make_structured_base(160, 288, seed=300 + sec)
+        pair = np.stack([base, base], axis=0).astype(np.uint8)
+        items.append((sec, f"s{sec:05d}_g0000_t0000_t0001_v.tif", pair))
+    ov_dir = _write_multi_shard_overlap_dataset(tmp_path, [("shard_0000.tar", items)])
+    cache_root = tmp_path / "crop_cache"
+
+    ds_build = N2NOverlapPairDataset(
+        overlaps_dir=ov_dir,
+        split="train",
+        patch_size=64,
+        split_strategy="mod10",
+        max_pairs=16,
+        cache_in_ram=False,
+        crop_cache_dir=cache_root,
+        patch_sampling="tile",
+        align_patches=False,
+        seed=42,
+    )
+    assert isinstance(ds_build.cached_tile_crops, np.memmap)
+    cache_dirs = [p for p in cache_root.iterdir() if p.is_dir()]
+    assert len(cache_dirs) == 1
+    cdir = cache_dirs[0]
+    assert (cdir / "crops.npy").is_file()
+    assert (cdir / "sections.npy").is_file()
+    assert (cdir / "ids.txt").is_file()
+    assert (cdir / "metadata.json").is_file()
+
+    # Delete source .tar file (manifest.parquet stays) to prove zero tar I/O on reload
+    (ov_dir / "shards" / "shard_0000.tar").unlink()
+
+    ds_reload = N2NOverlapPairDataset(
+        overlaps_dir=ov_dir,
+        split="train",
+        patch_size=64,
+        split_strategy="mod10",
+        max_pairs=16,
+        cache_in_ram=False,
+        crop_cache_dir=cache_root,
+        patch_sampling="tile",
+        align_patches=False,
+        seed=42,
+    )
+    assert ds_reload.cached_tile_ids == ds_build.cached_tile_ids
+    for idx in (0, 7, 15):
+        a0, b0, id0 = ds_build[idx]
+        a1, b1, id1 = ds_reload[idx]
+        assert id0 == id1
+        assert torch.equal(a0, a1) and torch.equal(b0, b1)
+
+    # Verify spawn-safe pickling strips live memmap and lazily reopens on __getitem__
+    raw_pickle = pickle.dumps(ds_reload)
+    assert len(raw_pickle) < 100_000
+    ds_unpickled = pickle.loads(raw_pickle)
+    assert ds_unpickled.cached_tile_crops is None
+    u0, u1, uid = ds_unpickled[0]
+    assert isinstance(ds_unpickled.cached_tile_crops, np.memmap)
+    assert uid == ds_build[0][2]
+    assert torch.equal(u0, ds_build[0][0])
+
+    # Rewrite intact shard on another overlaps copy and verify changing align_subpixel invalidates key
+    ov_dir2 = _write_multi_shard_overlap_dataset(
+        tmp_path, [("shard_0000.tar", items)], name="overlaps_multi_2"
+    )
+    cache_root2 = tmp_path / "crop_cache_2"
+    N2NOverlapPairDataset(
+        overlaps_dir=ov_dir2,
+        split="train",
+        patch_size=64,
+        split_strategy="mod10",
+        max_pairs=8,
+        crop_cache_dir=cache_root2,
+        patch_sampling="tile",
+        align_patches=True,
+        align_subpixel=False,
+        seed=42,
+    )
+    N2NOverlapPairDataset(
+        overlaps_dir=ov_dir2,
+        split="train",
+        patch_size=64,
+        split_strategy="mod10",
+        max_pairs=8,
+        crop_cache_dir=cache_root2,
+        patch_sampling="tile",
+        align_patches=True,
+        align_subpixel=True,
+        seed=42,
+    )
+    assert len([p for p in cache_root2.iterdir() if p.is_dir()]) == 2
+
+
+def test_overlap_disk_mmap_cache_superset_section_slicing(tmp_path: Path):
+    from em_denoise_refactor.data.n2n_dataset import N2NOverlapPairDataset
+
+    shard_specs = []
+    for s_idx in range(3):
+        items = []
+        for sec in range(s_idx * 20, (s_idx + 1) * 20):
+            base = _make_structured_base(160, 288, seed=400 + sec)
+            pair = np.stack([base, base], axis=0).astype(np.uint8)
+            items.append((sec, f"s{sec:05d}_g0000_t0000_t0001_v.tif", pair))
+        shard_specs.append((f"shard_{s_idx:04d}.tar", items))
+    ov_dir = _write_multi_shard_overlap_dataset(tmp_path, shard_specs)
+    cache_root = tmp_path / "superset_cache"
+
+    ds_full = N2NOverlapPairDataset(
+        overlaps_dir=ov_dir,
+        split="train",
+        patch_size=64,
+        first_sec=0,
+        last_sec=59,
+        split_strategy="mod10",
+        max_pairs=None,
+        cache_in_ram=False,
+        crop_cache_dir=cache_root,
+        patch_sampling="tile",
+        align_patches=False,
+        seed=42,
+    )
+    assert len(ds_full) > 0
+
+    # Delete all .tar shards to guarantee superset slicing never touches shards
+    for p in (ov_dir / "shards").glob("*.tar"):
+        p.unlink()
+
+    ds_slice = N2NOverlapPairDataset(
+        overlaps_dir=ov_dir,
+        split="train",
+        patch_size=64,
+        first_sec=0,
+        last_sec=29,
+        split_strategy="mod10",
+        max_pairs=None,
+        cache_in_ram=False,
+        crop_cache_dir=cache_root,
+        patch_sampling="tile",
+        align_patches=False,
+        seed=42,
+    )
+    assert 0 < len(ds_slice) < len(ds_full)
+    assert ds_slice.cached_tile_sections is not None
+    assert int(ds_slice.cached_tile_sections.max()) <= 29
+    for i in range(len(ds_slice)):
+        inp, tgt, tid = ds_slice[i]
+        sec = int(tid.split("_")[0].lstrip("s"))
+        assert 0 <= sec <= 29
+        assert inp.shape == (1, 64, 64) and tgt.shape == (1, 64, 64)

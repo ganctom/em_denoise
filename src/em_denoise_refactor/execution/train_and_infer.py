@@ -589,7 +589,7 @@ class DenoisingTrainer:
                 original_b = original_b.to(self.device, non_blocking=self.non_blocking)
                 mask_b = mask_b.to(self.device, non_blocking=self.non_blocking).float()
 
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)
                 pred_b = self.model(masked_b)
                 # Blind-spot loss: MSE only at masked positions
                 loss = ((pred_b - original_b) ** 2 * mask_b).sum() / torch.clamp(
@@ -603,7 +603,7 @@ class DenoisingTrainer:
                 noisy_b = noisy_b.to(self.device, non_blocking=self.non_blocking)
                 clean_b = clean_b.to(self.device, non_blocking=self.non_blocking)
 
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)
                 if hasattr(self.model, "ar_decoder"):
                     pred_b, loss_out = self.model(noisy_b)
                 elif self.use_amp:
@@ -1254,6 +1254,9 @@ def _build_n2n_overlap_dataset(
         min_pair_quality=cfg.n2n.min_pair_quality,
         quality_blur_sigma=cfg.n2n.quality_blur_sigma,
         min_patch_std=getattr(cfg.n2n, "min_patch_std", 0.0),
+        crop_cache_dir=getattr(cfg.n2n, "crop_cache_dir", None),
+        max_tiles_per_stripe=getattr(cfg.n2n, "max_tiles_per_stripe", None),
+        prep_workers=getattr(cfg.n2n, "prep_workers", 1),
     )
 
 
@@ -1584,10 +1587,32 @@ def main() -> None:
         num_workers = int(getattr(cfg.training, "num_workers", 0))
         use_pin_memory = device_str == "cuda"
         is_iterable = isinstance(train_dataset, IterableDataset)
+        samples_per_epoch = getattr(cfg.training, "samples_per_epoch", None)
+        train_sampler = None
+        train_shuffle = not is_iterable
+        train_epoch_len = len(train_dataset)
+        if (
+            not is_iterable
+            and not is_n2v_mode
+            and samples_per_epoch is not None
+            and 0 < int(samples_per_epoch) < len(train_dataset)
+        ):
+            train_epoch_len = int(samples_per_epoch)
+            train_sampler = torch.utils.data.RandomSampler(
+                train_dataset,
+                replacement=False,
+                num_samples=train_epoch_len,
+            )
+            train_shuffle = False
+            logger.info(
+                f"Epoch pacing enabled: drawing {train_epoch_len}/{len(train_dataset)} "
+                f"random training samples per epoch."
+            )
         train_loader = DataLoader(
             train_dataset,
-            batch_size=min(batch_size, len(train_dataset)),
-            shuffle=(not is_iterable),
+            batch_size=min(batch_size, train_epoch_len),
+            shuffle=train_shuffle,
+            sampler=train_sampler,
             num_workers=num_workers,
             pin_memory=use_pin_memory,
             persistent_workers=(num_workers > 0),

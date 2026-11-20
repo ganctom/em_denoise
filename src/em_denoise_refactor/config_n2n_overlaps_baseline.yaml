@@ -1,5 +1,5 @@
 experiment:
-  name: "16_n2n_overlaps_resunet_mse_cosinelr_30ep_QA1_TRM1_XCORR0"
+  name: "16_n2n_overlaps_resunet_mse_cosinelr_30ep_QA1_TRM1_XCORR1_SUBPIX1"
   output_dir: "/Users/ganctoma/SW/sort/N2V/run_43_n2n"
 
 splitting:
@@ -23,8 +23,8 @@ n2n:
   seed: 42
   augment_rot90: true             # Keep false to preserve fast/slow scan noise anisotropy
   align_patches: true             # Toggle cross-correlation patch registration ON/OFF
-  align_subpixel: false           # true = two-stage sub-pixel phase cross-correlation + cubic spline shift (recommended with pair_direction: "first_to_second")
-  align_max_shift_px: 16          # Max shift (px) searched in each axis (6-8 is safer when real shifts are +-2 px)
+  align_subpixel: true           # true = two-stage sub-pixel phase cross-correlation + cubic spline shift (recommended with pair_direction: "first_to_second")
+  align_max_shift_px: 8          # Max shift (px) searched in each axis (6-8 is safer when real shifts are +-2 px)
   align_blur_sigma: 1.0           # Gaussian smoothing sigma used only for shift estimation
   patch_sampling: "tile"          # "tile" (full stripe tiling) or "random" (1 crop/stripe/epoch)
   tile_stride: null               # null = patch_size (non-overlapping grid + flush edge tiles)
@@ -42,6 +42,9 @@ n2n:
   min_pair_quality: 0.80         # Reject patches scoring below this threshold
   quality_blur_sigma: 1.5         # Gaussian smoothing sigma before scoring
   min_patch_std: 0.0              # Optional min std on smoothed crop0 (e.g. 5.0) to drop flat/empty epoxy patches
+  crop_cache_dir: null            # Optional persistent .npy mmap crop cache dir (instant <0.1s reloads + sub-range slicing)
+  max_tiles_per_stripe: null      # Max kept patches/stripe in streaming tile mode (null = auto-scale across shards)
+  prep_workers: 4                 # Threads for alignment & QA scoring per 64-stripe chunk during startup
 
 model:
   model_type: "residual_unet"
@@ -56,6 +59,7 @@ training:
   warmup_epochs: 2
   seed: 42
   cache_in_ram: true
+  samples_per_epoch: null
   device: "mps"
 
 loss:
