@@ -126,3 +126,31 @@ Already implemented and verified on `feat/n2n`:
 | **4** | Stabilized `ResidualUNet` (`dim=48` / `64`) | `model_type: "residual_unet"`, `base_dim: 48` or `64` (ready on `f2ad4bc`) | Does 2.25×–4× wider multi-scale UNet capacity improve bouton/vesicle separation? |
 | **5** | 4× Flip TTA + EMA | Inference-time 4-flip average + weight EMA | How much "free" vesicle crispness & mottling reduction do we get without changing data? |
 | **6** | **2.5D N2N (`[z-1, z, z+1]`)** | 3-slice registered input → `z_second` target | Eliminates cross-slice inconsistent false vesicle mergers in Neuroglancer. |
+
+---
+
+## Cluster Scaling & Multi-GPU Compute Acceleration
+
+Currently `src/em_denoise_refactor/execution/train_and_infer.py` is **single-GPU only** (requesting `--gres=gpu:4` today leaves 3 GPUs idle). Below is the structured path to speed up training on multi-GPU cluster hardware.
+
+### 1. Immediate Zero-Code Wins (Single-GPU & Parallel Sweeps)
+- **Prefer A100 over A40 (`#SBATCH --gres=gpu:a10080g:1`):** 2D U-Nets are memory-bandwidth bound; A100 80 GB provides ~2.9× higher memory bandwidth (`2.0 TB/s` vs `696 GB/s`) and faster `bfloat16` Tensor Cores (~2× faster epochs).
+- **Enable `torch.compile()` (`training.compile_model: true`):** Fuses `GroupNorm + GELU + Conv` kernels on CUDA for ~25–45% throughput gain after a ~45 s Epoch 1 warmup.
+- **Scale `batch_size` (`128 → 256`) and `num_workers` (`4 → 8`):** Better saturates A40/A100 compute (scale `learning_rate` gently by $\sim\sqrt{2}$ when doubling batch size).
+- **Parallelize ablation sweeps:** Run 4 independent 1-GPU jobs simultaneously (all safely sharing the same read-only `crop_cache` via `mmap`) for exact 4× experiment throughput with zero multi-GPU communication overhead.
+
+### 2. True Multi-GPU Training (`torchrun` + PyTorch `DDP`)
+For heavy single runs (`ResidualUNet` `base_dim=64`, `500k–1M` patches, or 2.5D training), **DistributedDataParallel (DDP)** via `torchrun` provides ~3.5×–3.8× speedup on 4 GPUs:
+- **Architecture compatibility:** `ResidualUNet` and `ConnectomicsDenoisingNet` use `GroupNorm`/`LayerNorm` (no `BatchNorm`), so no `SyncBatchNorm` overhead is needed.
+- **Cache-safe startup:** Rank 0 builds `crop_cache` if missing, followed by `dist.barrier()`, then all ranks open `crops.npy` read-only via `mmap_mode="r"` in `< 0.1 s`.
+- **Implementation checklist (~90 lines in `train_and_infer.py`, backward-compatible with 1-GPU / MPS):**
+  1. Detect `WORLD_SIZE` / `LOCAL_RANK`, call `dist.init_process_group("nccl")` and `torch.cuda.set_device(local_rank)`.
+  2. Shard `train_loader` and `val_loader` with `DistributedSampler` (calling `sampler.set_epoch(epoch)` each epoch).
+  3. Wrap `model` in `DistributedDataParallel(model, device_ids=[local_rank])`.
+  4. `dist.all_reduce` validation sums across ranks for exact global `Val` / `PSNR` / `EstPSNR` / `SSIM`; gate logging, TensorBoard, checkpoints, previews, and final test evaluation to rank 0.
+  5. Launch via `torchrun --standalone --nproc_per_node=4 -m em_denoise_refactor.execution.train_and_infer --config "$CONFIG"`.
+
+### 3. Additional CUDA Pipeline Optimizations
+- **Eliminate per-batch `.item()` CPU↔GPU syncs** inside `train_epoch` and `loss.py` (accumulate loss tensors on GPU and sync only at epoch end or progress intervals).
+- **Use `channels_last` memory format** (`model.to(memory_format=torch.channels_last)`) on CUDA for faster `bfloat16` Tensor Core convolutions.
+- **Stage `crop_cache` to local node NVMe (`$TMPDIR`):** Copy small-to-medium caches (`3–30 GB`) to `$TMPDIR/crop_cache` at the top of `run_n2n_ovs.sh` so random `DataLoader` reads hit local SSD instead of `/tachyon` network storage.
