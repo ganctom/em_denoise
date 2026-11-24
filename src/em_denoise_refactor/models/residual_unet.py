@@ -19,6 +19,14 @@ class UNetConfig:
     global_residual: bool = True
 
 
+def _group_count(channels: int) -> int:
+    """Return a valid GroupNorm group count dividing `channels` (preferring 8)."""
+    for g in (8, 4, 2):
+        if channels % g == 0:
+            return g
+    return 1
+
+
 class ResBlock(nn.Module):
     """
     Pre-activation Residual Block using GroupNorm and GELU.
@@ -26,8 +34,8 @@ class ResBlock(nn.Module):
 
     def __init__(self, in_channels: int, out_channels: int, dropout: float = 0.0):
         super().__init__()
-        num_groups = 8 if in_channels % 8 == 0 else min(in_channels, 4)
-        out_groups = 8 if out_channels % 8 == 0 else min(out_channels, 4)
+        num_groups = _group_count(in_channels)
+        out_groups = _group_count(out_channels)
 
         self.norm1 = nn.GroupNorm(num_groups=num_groups, num_channels=in_channels)
         self.act1 = nn.GELU()
@@ -44,8 +52,10 @@ class ResBlock(nn.Module):
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
         if in_channels != out_channels:
-            self.shortcut = nn.Conv2d(
-                in_channels, out_channels, kernel_size=1, bias=False
+            # Normalize channel-changing shortcuts so skip variance stays O(1) across stages.
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+                nn.GroupNorm(num_groups=out_groups, num_channels=out_channels),
             )
         else:
             self.shortcut = nn.Identity()
@@ -58,26 +68,36 @@ class ResBlock(nn.Module):
 
 
 class Downsample(nn.Module):
-    """Strided convolution for downsampling to retain spatial phase."""
+    """Strided convolution with GroupNorm to keep multi-scale skip variance O(1)."""
 
     def __init__(self, channels: int):
         super().__init__()
-        self.conv = nn.Conv2d(channels, channels, kernel_size=3, stride=2, padding=1)
+        self.conv = nn.Conv2d(
+            channels, channels, kernel_size=3, stride=2, padding=1, bias=False
+        )
+        self.norm = nn.GroupNorm(
+            num_groups=_group_count(channels), num_channels=channels
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv(x)
+        return self.norm(self.conv(x))
 
 
 class Upsample(nn.Module):
-    """Bilinear interpolation followed by convolution to prevent checkerboard artifacts."""
+    """Bilinear interpolation followed by convolution and GroupNorm to keep skip variance O(1)."""
 
     def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.conv = nn.Conv2d(
+            in_channels, out_channels, kernel_size=3, padding=1, bias=False
+        )
+        self.norm = nn.GroupNorm(
+            num_groups=_group_count(out_channels), num_channels=out_channels
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = F.interpolate(x, scale_factor=2.0, mode="bilinear", align_corners=False)
-        return self.conv(x)
+        return self.norm(self.conv(x))
 
 
 class ResidualUNet(nn.Module):
@@ -141,12 +161,16 @@ class ResidualUNet(nn.Module):
             self.up_blocks.append(blocks)
             in_ch = out_ch
 
-        final_groups = 8 if in_ch % 8 == 0 else min(in_ch, 4)
+        final_groups = _group_count(in_ch)
         self.final_norm = nn.GroupNorm(final_groups, in_ch)
         self.final_act = nn.GELU()
         self.final_conv = nn.Conv2d(
             in_ch, config.out_channels, kernel_size=3, padding=1
         )
+        # Start global residual at identity (pred == input_x) to avoid step-0 overshoot.
+        nn.init.zeros_(self.final_conv.weight)
+        if self.final_conv.bias is not None:
+            nn.init.zeros_(self.final_conv.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         input_x = x

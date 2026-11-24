@@ -975,3 +975,49 @@ def test_overlap_disk_mmap_cache_superset_section_slicing(tmp_path: Path):
         sec = int(tid.split("_")[0].lstrip("s"))
         assert 0 <= sec <= 29
         assert inp.shape == (1, 64, 64) and tgt.shape == (1, 64, 64)
+
+
+def test_residual_unet_bfloat16_bounded_activations_dim64():
+    from em_denoise_refactor.models.factory import build_model
+
+    torch.manual_seed(0)
+    model = build_model("residual_unet", in_channels=1, out_channels=1, base_dim=64)
+    opt = torch.optim.AdamW(model.parameters(), lr=5e-4)
+
+    clean = torch.linspace(0.2, 0.8, 64).view(1, 1, 1, 64).expand(4, 1, 64, 64)
+    losses = []
+    for _ in range(12):
+        x = (clean + 0.15 * torch.randn_like(clean)).clamp(0.0, 1.0)
+        y = (clean + 0.15 * torch.randn_like(clean)).clamp(0.0, 1.0)
+        opt.zero_grad(set_to_none=True)
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            pred = model(x)
+            loss = torch.nn.functional.mse_loss(pred, y)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        opt.step()
+        losses.append(float(loss.item()))
+
+    assert losses[-1] < losses[0]
+
+    model.eval()
+    with torch.no_grad():
+        x_eval = (clean + 0.15 * torch.randn_like(clean)).clamp(0.0, 1.0)
+        h = model.init_conv(x_eval)
+        skips = []
+        stage_stds = [float(h.std().item())]
+        for block, down in zip(model.down_blocks, model.down_samples):
+            h = block(h)
+            skips.append(h)
+            stage_stds.append(float(h.std().item()))
+            h = down(h)
+        h = model.bottleneck(h)
+        stage_stds.append(float(h.std().item()))
+        for i in range(0, len(model.up_blocks), 2):
+            h = model.up_blocks[i](h)
+            h = model.up_blocks[i + 1](torch.cat([h, skips.pop()], dim=1))
+            stage_stds.append(float(h.std().item()))
+        pred_eval = model(x_eval)
+
+    assert max(stage_stds) < 20.0
+    assert float((pred_eval - x_eval).std().item()) > 0.01
