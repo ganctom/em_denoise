@@ -396,3 +396,37 @@ def test_random_mode_scales_to_max_pairs(tmp_path: Path):
     inp, tgt, _ = ds[49]
     assert inp.shape == (1, 64, 64)
     assert tgt.shape == (1, 64, 64)
+
+
+def test_rectangular_patch_size_random_and_tile_modes(tmp_path: Path, caplog):
+    dupl_dir = _create_duplicate_fixture(
+        tmp_path / "dupl", num_tiles=5, clusters=([100, 101],), h=192, w=320
+    )
+    with caplog.at_level(logging.WARNING, logger="train_and_infer"):
+        ds_rand = N2NDuplicateTileDataset(
+            dupl_dir,
+            split="train",
+            patch_size=(64, 128),
+            patch_sampling="random",
+            augment=True,
+            augment_rot90=True,
+            align_patches=True,
+            align_subpixel=True,
+        )
+    assert ds_rand.augment_rot90 is False
+    assert any("augment_rot90" in r.message for r in caplog.records)
+    x_r, y_r, _ = ds_rand[0]
+    assert x_r.shape == (1, 64, 128)
+    assert y_r.shape == (1, 64, 128)
+
+    ds_tile = N2NDuplicateTileDataset(
+        dupl_dir,
+        split="train",
+        patch_size=(64, 128),
+        tile_stride=(32, 64),
+        patch_sampling="tile",
+    )
+    assert len(ds_tile) > 0
+    x_t, y_t, _ = ds_tile[0]
+    assert x_t.shape == (1, 64, 128)
+    assert y_t.shape == (1, 64, 128)

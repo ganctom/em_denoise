@@ -19,7 +19,7 @@ splitting:
   guard_band_size: 5
 
 extraction:
-  patch_size: 128
+  patch_size: 128                 # Scalar int (e.g. 128) or [H, W] (e.g. [128, 256] on _v stripes with orientation: "vertical")
 
 n2n:
   enabled: true
@@ -36,7 +36,7 @@ n2n:
   align_max_shift_px: 8           # Max shift (px) searched in each axis (6-8 is safer when real shifts are +-2 px)
   align_blur_sigma: 1.0
   patch_sampling: "tile"
-  tile_stride: null
+  tile_stride: null               # null = patch_size, or scalar / [stride_h, stride_w]
   trim_enabled: true
   v_trim_top_px: 50
   v_trim_left_px: 500
@@ -85,3 +85,4 @@ inference:
   custom_input_dir: null          # Uses N2N test split; or set to cluster path of test_raw
   preview_image: null             # Optionally set to a cluster .tif path for per-epoch previews
   preview_crop_size: 512
+  tiled: false                    # Optional: enable overlapping (patch_h, patch_w) Hann-blended inference on large images

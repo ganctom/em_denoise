@@ -2,8 +2,39 @@
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Sequence, Tuple
 import yaml
+
+
+def normalize_hw_pair(
+    value: int | Sequence[int], name: str = "patch_size"
+) -> Tuple[int, int]:
+    """
+    Normalize a scalar int or 2-element (H, W) sequence into a positive (height, width) tuple.
+    """
+    if isinstance(value, bool):
+        raise ValueError(
+            f"{name} must be a positive int or 2-element (H, W) sequence, got bool"
+        )
+    if isinstance(value, int):
+        if value <= 0:
+            raise ValueError(f"{name} must be > 0, got {value}")
+        return int(value), int(value)
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        h, w = value
+        if (
+            isinstance(h, bool)
+            or isinstance(w, bool)
+            or not isinstance(h, int)
+            or not isinstance(w, int)
+        ):
+            raise ValueError(f"{name} elements must be positive ints, got {value!r}")
+        if h <= 0 or w <= 0:
+            raise ValueError(f"{name} dimensions must be > 0, got {(h, w)}")
+        return int(h), int(w)
+    raise ValueError(
+        f"{name} must be a positive int or 2-element (H, W) sequence, got {value!r}"
+    )
 
 
 @dataclass
@@ -44,13 +75,21 @@ class SplittingConfig:
 
 @dataclass
 class ExtractionSettingsConfig:
-    patch_size: int = 512
+    patch_size: int | list[int] = 512
     patches_per_tile: int = 4
     tiles_per_section: int = 4
     z_depth_per_roi: int = 1
     target_train_patches: int = 100
     target_val_patches: int = 10
     target_test_patches: int = 10
+
+    def __post_init__(self):
+        ph, pw = normalize_hw_pair(self.patch_size, "extraction.patch_size")
+        self.patch_size = ph if ph == pw else [ph, pw]
+
+    @property
+    def patch_hw(self) -> Tuple[int, int]:
+        return normalize_hw_pair(self.patch_size, "extraction.patch_size")
 
 
 @dataclass
@@ -96,6 +135,7 @@ class InferenceConfig:
     preview_crop_size: int = 512
     preview_crop_y: Optional[int] = None
     preview_crop_x: Optional[int] = None
+    tiled: bool = False
 
     def __post_init__(self):
         if self.custom_input_dir is not None and self.custom_input_dir != "":
@@ -106,6 +146,7 @@ class InferenceConfig:
             self.preview_image = Path(self.preview_image)
         else:
             self.preview_image = None
+        self.tiled = bool(self.tiled)
 
 
 @dataclass
@@ -193,7 +234,9 @@ class N2NConfig:
     patch_sampling: str = (
         "random"  # "random" (1 crop/stripe/epoch) or "tile" (full stripe tiling)
     )
-    tile_stride: Optional[int] = None  # Defaults to extraction.patch_size when null
+    tile_stride: Optional[int | list[int]] = (
+        None  # Defaults to extraction.patch_size when null
+    )
     trim_enabled: bool = False
     v_trim_top_px: int = 50
     v_trim_left_px: int = 500
@@ -219,6 +262,11 @@ class N2NConfig:
     prep_workers: int = 1  # Threads for alignment & QA during tile materialization
     streaming: bool = False
     shuffle_buffer_size: int = 2048
+
+    def __post_init__(self):
+        if self.tile_stride is not None:
+            sh, sw = normalize_hw_pair(self.tile_stride, "n2n.tile_stride")
+            self.tile_stride = sh if sh == sw else [sh, sw]
 
 
 @dataclass

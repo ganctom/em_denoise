@@ -130,7 +130,8 @@ For multi-run benchmarking and large section ranges (hundreds of thousands to mi
 - On the first run, curated `(N, 2, ps, ps)` `uint8` crops are streamed directly to `<crop_cache_dir>/<split>_<hash>/crops.npy` along with `sections.npy`, `ids.txt`, and `metadata.json` (written atomically via a temp directory).
 - Subsequent runs with matching preprocessing settings open `crops.npy` via `np.load(..., mmap_mode="r")` in `< 0.1 s` with `< 4 GB` RAM, even across `num_workers > 0` DataLoader workers.
 - **Instant sub-range slicing:** A cache built over a wide range (e.g. `1250–22800` with `max_pairs: null`) automatically serves narrower `first_sec..last_sec` queries (e.g. `1250–8000`) via `sections.npy` without rebuilding.
-- **Automatic invalidation:** `metadata.json` hashes `overlaps_dir`, `manifest.parquet` stat, `patch_size`, `trim_*`, `align_*`, `quality_*`, `min_patch_std`, and split parameters. Changing training hyperparameters (`model_type`, `base_dim`, `loss`, `learning_rate`, `batch_size`, `pair_direction`, `samples_per_epoch`) reuses the same cache.
+- **Automatic invalidation:** `metadata.json` hashes `overlaps_dir`, `manifest.parquet` stat, `patch_size` (`int` or `[H, W]`), `trim_*`, `align_*`, `quality_*`, `min_patch_std`, and split parameters. Changing training hyperparameters (`model_type`, `base_dim`, `loss`, `learning_rate`, `batch_size`, `pair_direction`, `samples_per_epoch`) reuses the same cache.
+- **Rectangular `_v` patches (`[H, W]`):** Setting `extraction.patch_size: [128, 256]` or `[128, 384]` (paired with `n2n.orientation: "vertical"` and `n2n.augment_rot90: false`) captures wider fast-scan context without dropping ~156 px tall `_v` stripes. Existing scalar `patch_size` caches keep identical hash keys.
 - **Epoch pacing:** Set `training.samples_per_epoch` (e.g. `200000`) to draw a fresh random subset per epoch from a multi-million-patch cache so validation and checkpoints run at regular intervals.
 
 > **Note on `n2n.streaming: true` (`N2NStreamingShardDataset`):** Streams raw stripes per epoch in `< 2 GB` RAM with 0 extra disk space, but does **not** apply ROI trimming, cross-correlation alignment, or QA filtering. Prefer `crop_cache_dir` for curated N2N training.
@@ -252,7 +253,7 @@ Schemas are defined in `src/em_denoise_refactor/config.py`.
 | `splitting.block_size` | `100` | Sections per block when `strategy: "block"`. |
 | `splitting.train_ratio`, `val_ratio`, `test_ratio` | `0.8`, `0.1`, `0.1` | Split fractions. |
 | `splitting.guard_band_size` | `5` | Excluded boundary sections at each block edge. |
-| `extraction.patch_size` | `512` | Square training/tiling patch size (`128` recommended for N2N). |
+| `extraction.patch_size` | `512` | Square `int` or rectangular `[patch_h, patch_w]` crop size (`128` or `[128, 256]` recommended for N2N). |
 
 </details>
 
@@ -276,7 +277,7 @@ Schemas are defined in `src/em_denoise_refactor/config.py`.
 | `align_max_shift_px` | `16` | Max shift search radius (px) per axis (`6`–`8` recommended). |
 | `align_blur_sigma` | `1.0` | Gaussian smoothing sigma (px) for shift estimation only. |
 | `patch_sampling` | `"random"` | `"tile"` (deterministic full-stripe grid) or `"random"`. |
-| `tile_stride` | `null` | Tile grid stride (`null` = `patch_size`). |
+| `tile_stride` | `null` | Tile grid stride (`null` = `patch_size`, scalar `int`, or `[stride_h, stride_w]`). |
 | `trim_enabled` | `false` | Trim distorted stripe borders before tiling. |
 | `v_trim_top_px`, `v_trim_left_px`, `v_trim_bottom_px`, `v_trim_right_px` | `50, 500, 0, 0` | Margin trims for `_v` overlap stripes. |
 | `h_trim_top_px`, `h_trim_bottom_px`, `h_trim_left_px`, `h_trim_right_px` | `0, 0, 32, 0` | Margin trims for `_h` overlap stripes. |
@@ -316,6 +317,7 @@ Schemas are defined in `src/em_denoise_refactor/config.py`.
 | `inference.custom_input_dir` | `null` | Folder of raw `.tif` images evaluated after training. |
 | `inference.preview_image` | `null` | Single `.tif` path used to render per-epoch preview PNGs. |
 | `inference.preview_crop_size` | `512` | Center/custom crop size for per-epoch previews. |
+| `inference.tiled` | `false` | Optional 50%-overlapping `(patch_h, patch_w)` Hann-blended tiled inference for images larger than `patch_size`. |
 
 </details>
 

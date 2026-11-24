@@ -19,7 +19,7 @@ import math
 from pathlib import Path
 import random
 import re
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 import zlib
 
 import numpy as np
@@ -28,6 +28,7 @@ import tifffile
 import torch
 from torch.utils.data import Dataset, get_worker_info
 
+from em_denoise_refactor.config import normalize_hw_pair
 from em_denoise_refactor.data.n2n_dataset import (
     _compute_pair_quality,
     _estimate_integer_shift,
@@ -122,7 +123,7 @@ class N2NDuplicateTileDataset(Dataset):
         self,
         duplicates_dir: Path | str,
         split: str = "train",
-        patch_size: int = 128,
+        patch_size: int | Sequence[int] = 128,
         train_ratio: float = 0.8,
         val_ratio: float = 0.1,
         test_ratio: float = 0.1,
@@ -141,7 +142,7 @@ class N2NDuplicateTileDataset(Dataset):
         align_max_shift_px: int = 16,
         align_blur_sigma: float = 1.0,
         patch_sampling: str = "random",
-        tile_stride: Optional[int] = None,
+        tile_stride: Optional[int | Sequence[int]] = None,
         trim_enabled: bool = False,
         quality_filter_enabled: bool = False,
         quality_metric: str = "ssim",
@@ -151,7 +152,12 @@ class N2NDuplicateTileDataset(Dataset):
     ) -> None:
         self.duplicates_dir = Path(duplicates_dir)
         self.split = split.lower().strip()
-        self.patch_size = int(patch_size)
+        self.patch_h, self.patch_w = normalize_hw_pair(patch_size, "patch_size")
+        self.patch_size: int | Tuple[int, int] = (
+            self.patch_h
+            if self.patch_h == self.patch_w
+            else (self.patch_h, self.patch_w)
+        )
         self.train_ratio = float(train_ratio)
         self.val_ratio = float(val_ratio)
         self.test_ratio = float(test_ratio)
@@ -164,14 +170,27 @@ class N2NDuplicateTileDataset(Dataset):
         self.max_cache_tiles = max(2, int(max_cache_tiles))
         self.augment = bool(augment)
         self.augment_rot90 = bool(augment_rot90)
+        if self.augment_rot90 and self.patch_h != self.patch_w:
+            logger.warning(
+                f"augment_rot90=True is incompatible with rectangular patches "
+                f"({self.patch_h}x{self.patch_w}) because 90/270-deg rotation transposes H/W; "
+                "auto-disabling augment_rot90."
+            )
+            self.augment_rot90 = False
         self.seed = int(seed)
         self.align_patches = bool(align_patches)
         self.align_subpixel = bool(align_subpixel)
         self.align_max_shift_px = int(align_max_shift_px)
         self.align_blur_sigma = float(align_blur_sigma)
         self.patch_sampling = patch_sampling.lower().strip()
-        self.tile_stride = (
-            int(tile_stride) if tile_stride is not None else self.patch_size
+        if tile_stride is not None:
+            self.stride_h, self.stride_w = normalize_hw_pair(tile_stride, "tile_stride")
+        else:
+            self.stride_h, self.stride_w = self.patch_h, self.patch_w
+        self.tile_stride: int | Tuple[int, int] = (
+            self.stride_h
+            if self.stride_h == self.stride_w
+            else (self.stride_h, self.stride_w)
         )
         self.quality_filter_enabled = bool(quality_filter_enabled)
         self.quality_metric = quality_metric.lower().strip()
@@ -273,7 +292,7 @@ class N2NDuplicateTileDataset(Dataset):
             raise ValueError(
                 f"patch_sampling must be 'random' or 'tile', got '{self.patch_sampling}'"
             )
-        if self.tile_stride <= 0:
+        if self.stride_h <= 0 or self.stride_w <= 0:
             raise ValueError(f"tile_stride must be > 0, got {self.tile_stride}")
 
     def _scan_and_group(
@@ -432,9 +451,9 @@ class N2NDuplicateTileDataset(Dataset):
         for _, _, path_a, _, _, _ in self.pairs:
             try:
                 h, w = self._get_tile_shape(path_a)
-                if h < self.patch_size or w < self.patch_size:
+                if h < self.patch_h or w < self.patch_w:
                     raise ValueError(
-                        f"patch_size ({self.patch_size}) exceeds tile dimensions "
+                        f"patch_size ({self.patch_h}x{self.patch_w}) exceeds tile dimensions "
                         f"({h}x{w}) in {path_a.name}"
                     )
                 return
@@ -489,8 +508,8 @@ class N2NDuplicateTileDataset(Dataset):
             ]
 
     def _build_tile_index(self) -> List[Tuple[int, int, int]]:
-        ps = self.patch_size
-        stride = self.tile_stride
+        ph, pw = self.patch_h, self.patch_w
+        sh, sw = self.stride_h, self.stride_w
         tiles: List[Tuple[int, int, int]] = []
         for pair_idx, (pair_id, _, path_a, _, _, _) in enumerate(self.pairs):
             try:
@@ -498,14 +517,14 @@ class N2NDuplicateTileDataset(Dataset):
             except Exception as exc:
                 self._handle_corrupt_tile(path_a, exc)
                 continue
-            if h < ps or w < ps:
+            if h < ph or w < pw:
                 continue
-            ys = list(range(0, h - ps + 1, stride))
-            if ys[-1] != h - ps:
-                ys.append(h - ps)
-            xs = list(range(0, w - ps + 1, stride))
-            if xs[-1] != w - ps:
-                xs.append(w - ps)
+            ys = list(range(0, h - ph + 1, sh))
+            if ys[-1] != h - ph:
+                ys.append(h - ph)
+            xs = list(range(0, w - pw + 1, sw))
+            if xs[-1] != w - pw:
+                xs.append(w - pw)
             for y0 in ys:
                 for x0 in xs:
                     if (
@@ -524,7 +543,7 @@ class N2NDuplicateTileDataset(Dataset):
                     tiles.append((pair_idx, y0, x0))
         if not tiles:
             raise ValueError(
-                f"No valid {ps}x{ps} tiles generated for split '{self.split}'."
+                f"No valid {ph}x{pw} tiles generated for split '{self.split}'."
             )
         return tiles
 
@@ -572,8 +591,8 @@ class N2NDuplicateTileDataset(Dataset):
         h0, w0 = img0.shape
         h1, w1 = img1.shape
         h, w = min(h0, h1), min(w0, w1)
-        ps = self.patch_size
-        if h < ps or w < ps:
+        ph, pw = self.patch_h, self.patch_w
+        if h < ph or w < pw:
             return None
 
         max_attempts = 1 if fixed_yx is not None else self.max_quality_attempts
@@ -581,8 +600,8 @@ class N2NDuplicateTileDataset(Dataset):
             if fixed_yx is not None:
                 y0, x0 = fixed_yx
             else:
-                y0 = rng.randint(0, h - ps) if h > ps else 0
-                x0 = rng.randint(0, w - ps) if w > ps else 0
+                y0 = rng.randint(0, h - ph) if h > ph else 0
+                x0 = rng.randint(0, w - pw) if w > pw else 0
                 if self.split_unit == "patch":
                     found_coord = False
                     for _ in range(64):
@@ -599,13 +618,13 @@ class N2NDuplicateTileDataset(Dataset):
                         ):
                             found_coord = True
                             break
-                        y0 = rng.randint(0, h - ps) if h > ps else 0
-                        x0 = rng.randint(0, w - ps) if w > ps else 0
+                        y0 = rng.randint(0, h - ph) if h > ph else 0
+                        x0 = rng.randint(0, w - pw) if w > pw else 0
                     if not found_coord:
                         continue
 
-            crop0 = img0[y0 : y0 + ps, x0 : x0 + ps]
-            crop1 = img1[y0 : y0 + ps, x0 : x0 + ps]
+            crop0 = img0[y0 : y0 + ph, x0 : x0 + pw]
+            crop1 = img1[y0 : y0 + ph, x0 : x0 + pw]
 
             if self.align_patches:
                 if self.align_subpixel:
@@ -617,9 +636,9 @@ class N2NDuplicateTileDataset(Dataset):
                     )
                     pad = math.ceil(max(abs(dy_f), abs(dx_f))) + 4
                     y_lo = y0 - pad
-                    y_hi = y0 + ps + pad
+                    y_hi = y0 + ph + pad
                     x_lo = x0 - pad
-                    x_hi = x0 + ps + pad
+                    x_hi = x0 + pw + pad
                     if y_lo < 0 or y_hi > h1 or x_lo < 0 or x_hi > w1:
                         self.rejected_oob_count += 1
                         continue
@@ -628,7 +647,7 @@ class N2NDuplicateTileDataset(Dataset):
                         img1_pad, shift=(dy_f, dx_f), order=3, mode="nearest"
                     )
                     crop1 = np.clip(
-                        shifted_pad[pad : pad + ps, pad : pad + ps], 0.0, 255.0
+                        shifted_pad[pad : pad + ph, pad : pad + pw], 0.0, 255.0
                     )
                 else:
                     dy, dx = _estimate_integer_shift(
@@ -639,10 +658,10 @@ class N2NDuplicateTileDataset(Dataset):
                     )
                     y1 = y0 - dy
                     x1 = x0 - dx
-                    if y1 < 0 or y1 + ps > h1 or x1 < 0 or x1 + ps > w1:
+                    if y1 < 0 or y1 + ph > h1 or x1 < 0 or x1 + pw > w1:
                         self.rejected_oob_count += 1
                         continue
-                    crop1 = img1[y1 : y1 + ps, x1 : x1 + ps]
+                    crop1 = img1[y1 : y1 + ph, x1 : x1 + pw]
 
             if self.quality_filter_enabled:
                 score = _compute_pair_quality(

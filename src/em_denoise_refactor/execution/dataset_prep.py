@@ -208,8 +208,7 @@ class DatasetPreparer:
 
         logger.info(f"Extracting {target_count} patches for '{split_name}' split...")
 
-        patch_h = self.cfg.extraction.patch_size
-        patch_w = self.cfg.extraction.patch_size
+        patch_h, patch_w = self.cfg.extraction.patch_hw
         max_patches_per_tile = self.cfg.extraction.patches_per_tile
 
         rois = sampler.generate_rois(metadata, num_regions=max(target_count * 2, 50))

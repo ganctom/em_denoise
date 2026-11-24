@@ -1021,3 +1021,258 @@ def test_residual_unet_bfloat16_bounded_activations_dim64():
 
     assert max(stage_stds) < 20.0
     assert float((pred_eval - x_eval).std().item()) > 0.01
+
+
+def test_normalize_hw_pair_and_yaml_rectangular_config(tmp_path: Path):
+    from em_denoise_refactor.config import normalize_hw_pair
+
+    assert normalize_hw_pair(128) == (128, 128)
+    assert normalize_hw_pair([128, 256]) == (128, 256)
+    assert normalize_hw_pair((64, 192)) == (64, 192)
+    for bad in (0, -4, True, [128], [128, 256, 3], [128, 0], [True, 128], "128"):
+        with pytest.raises(ValueError):
+            normalize_hw_pair(bad)  # type: ignore[arg-type]
+
+    cfg_path = tmp_path / "rect.yaml"
+    cfg_path.write_text(
+        """
+extraction:
+  patch_size: [128, 256]
+n2n:
+  tile_stride: [64, 128]
+inference:
+  tiled: true
+""",
+        encoding="utf-8",
+    )
+    cfg = PipelineConfig.from_yaml(cfg_path)
+    assert cfg.extraction.patch_size == [128, 256]
+    assert cfg.extraction.patch_hw == (128, 256)
+    assert cfg.n2n.tile_stride == [64, 128]
+    assert cfg.inference.tiled is True
+
+    # Square list canonicalizes back to scalar int while defaults keep tiled=False
+    cfg_sq_path = tmp_path / "sq.yaml"
+    cfg_sq_path.write_text("extraction:\n  patch_size: [128, 128]\n", encoding="utf-8")
+    cfg_sq = PipelineConfig.from_yaml(cfg_sq_path)
+    assert cfg_sq.extraction.patch_size == 128
+    assert isinstance(cfg_sq.extraction.patch_size, int)
+    assert cfg_sq.extraction.patch_hw == (128, 128)
+    assert cfg_sq.inference.tiled is False
+
+
+def test_rectangular_overlap_sql_pushdown_alignment_cache_and_rot90_guard(
+    tmp_path: Path, caplog
+):
+    import hashlib
+    import logging
+    from torch.utils.data import DataLoader
+    from em_denoise_refactor.data.n2n_dataset import (
+        N2NOverlapPairDataset,
+        _compute_source_signature,
+        _format_pair_tensors,
+    )
+
+    shard_items = []
+    for sec in range(20):
+        # _v stripe (160x352): fits 64x128 cleanly with subpixel margin
+        base_v = _make_structured_base(160, 352, seed=700 + sec)
+        shifted_v = np.clip(
+            ndi_shift(base_v, shift=(1.3, -1.7), order=3, mode="nearest"), 0, 255
+        )
+        pair_v = np.stack([base_v, shifted_v], axis=0).astype(np.uint8)
+        shard_items.append((sec, f"s{sec:05d}_g0000_t0000_t0001_v.tif", pair_v))
+
+        # _h stripe (320x100): wide enough for 64x64? no, width 100 < 128, filtered by SQL pushdown
+        base_h = _make_structured_base(320, 100, seed=800 + sec)
+        pair_h = np.stack([base_h, base_h], axis=0).astype(np.uint8)
+        shard_items.append((sec, f"s{sec:05d}_g0000_t0001_t0002_h.tif", pair_h))
+
+    ov_dir = _write_multi_shard_overlap_dataset(
+        tmp_path, [("shard_0000.tar", shard_items)], name="ov_rect"
+    )
+    cache_root = tmp_path / "rect_cache"
+
+    # 1. Verify square cache fingerprint matches legacy scalar int SHA-256 payload
+    ds_sq = N2NOverlapPairDataset(
+        overlaps_dir=ov_dir,
+        split="train",
+        patch_size=64,
+        split_strategy="mod10",
+        max_pairs=8,
+        crop_cache_dir=cache_root,
+        patch_sampling="tile",
+        align_patches=False,
+        seed=42,
+    )
+    sq_meta = json.loads(
+        next(cache_root.glob("train_*/metadata.json")).read_text(encoding="utf-8")
+    )
+    assert sq_meta["prep_fingerprint"]["patch_size"] == 64
+    assert sq_meta["prep_fingerprint"]["tile_stride"] == 64
+    expected_fp = {
+        "schema_version": 1,
+        "overlaps_dir": str(ov_dir.resolve()),
+        "source_signature": _compute_source_signature(ov_dir),
+        "split": "train",
+        "patch_size": 64,
+        "tile_stride": 64,
+        "orientation": "all",
+        "trim_enabled": False,
+        "v_trim": [50, 0, 500, 0],
+        "h_trim": [0, 0, 32, 0],
+        "align_patches": False,
+        "align_subpixel": False,
+        "align_max_shift_px": 16,
+        "align_blur_sigma": 1.0,
+        "quality_filter_enabled": False,
+        "quality_metric": "ncc",
+        "min_pair_quality": 0.6,
+        "quality_blur_sigma": 1.5,
+        "min_patch_std": 0.0,
+        "split_strategy": "mod10",
+        "block_size": 100,
+        "train_ratio": 0.8,
+        "val_ratio": 0.1,
+        "guard_band_size": 5,
+        "seed": 42,
+        "max_tiles_per_stripe": None,
+    }
+    expected_hash = hashlib.sha256(
+        json.dumps(expected_fp, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:16]
+    assert sq_meta["prep_fingerprint_hash"] == expected_hash
+    assert ds_sq.cached_tile_crops is not None and ds_sq.cached_tile_crops.shape[
+        2:
+    ] == (
+        64,
+        64,
+    )
+
+    # 2. Build rectangular (64, 128) cache with subpixel alignment, QA, flat filter, and rot90 guard
+    with caplog.at_level(logging.WARNING, logger="train_and_infer"):
+        ds_rect = N2NOverlapPairDataset(
+            overlaps_dir=ov_dir,
+            split="train",
+            patch_size=(64, 128),
+            split_strategy="mod10",
+            max_pairs=16,
+            cache_in_ram=False,
+            crop_cache_dir=cache_root,
+            patch_sampling="tile",
+            pair_direction="first_to_second",
+            augment=True,
+            augment_rot90=True,
+            align_patches=True,
+            align_subpixel=True,
+            align_max_shift_px=8,
+            quality_filter_enabled=True,
+            quality_metric="ssim",
+            min_pair_quality=0.50,
+            min_patch_std=3.0,
+            prep_workers=2,
+            seed=42,
+        )
+    assert ds_rect.augment_rot90 is False
+    assert any("augment_rot90" in r.message for r in caplog.records)
+    assert isinstance(ds_rect.cached_tile_crops, np.memmap)
+    assert ds_rect.cached_tile_crops.shape == (16, 2, 64, 128)
+    assert ds_rect.cached_tile_ids is not None
+    # SQL pushdown excluded _h stripes (width 100 < 128)
+    assert all("_v_" in tid for tid in ds_rect.cached_tile_ids)
+
+    # Different orientation (128, 64) gets a distinct cache key and keeps square cache untouched
+    ds_transposed = N2NOverlapPairDataset(
+        overlaps_dir=ov_dir,
+        split="train",
+        patch_size=(128, 64),
+        split_strategy="mod10",
+        max_pairs=8,
+        cache_in_ram=False,
+        crop_cache_dir=cache_root,
+        patch_sampling="tile",
+        align_patches=False,
+        seed=42,
+    )
+    assert ds_transposed.cached_tile_crops is not None
+    assert ds_transposed.cached_tile_crops.shape[2:] == (128, 64)
+    assert len([p for p in cache_root.iterdir() if p.is_dir()]) == 3
+
+    # Verify DataLoader collation succeeds with rectangular batches
+    loader = DataLoader(ds_rect, batch_size=4, shuffle=True, num_workers=0)
+    xb, yb, _ = next(iter(loader))
+    assert xb.shape == (4, 1, 64, 128)
+    assert yb.shape == (4, 1, 64, 128)
+
+    # Direct _format_pair_tensors guard prevents rot90 transposition on non-square arrays
+    c0 = np.zeros((64, 128), dtype=np.uint8)
+    c1 = np.zeros((64, 128), dtype=np.uint8)
+    for _ in range(10):
+        t0, t1 = _format_pair_tensors(c0, c1, "first_to_second", False, True, True)
+        assert t0.shape == (1, 64, 128) and t1.shape == (1, 64, 128)
+
+    # Verify zero tar I/O on mmap reload of rectangular cache
+    (ov_dir / "shards" / "shard_0000.tar").unlink()
+    ds_reload = N2NOverlapPairDataset(
+        overlaps_dir=ov_dir,
+        split="train",
+        patch_size=(64, 128),
+        split_strategy="mod10",
+        max_pairs=16,
+        cache_in_ram=False,
+        crop_cache_dir=cache_root,
+        patch_sampling="tile",
+        pair_direction="first_to_second",
+        align_patches=True,
+        align_subpixel=True,
+        align_max_shift_px=8,
+        quality_filter_enabled=True,
+        quality_metric="ssim",
+        min_pair_quality=0.50,
+        min_patch_std=3.0,
+        seed=42,
+    )
+    assert ds_reload.cached_tile_ids == ds_rect.cached_tile_ids
+    assert ds_reload.cached_tile_crops is not None
+    assert np.array_equal(ds_reload.cached_tile_crops, ds_rect.cached_tile_crops)
+    assert ds_reload[0][0].shape == (1, 64, 128)
+
+
+def test_rectangular_models_and_tiled_inference(tmp_path: Path):
+    from em_denoise_refactor.execution.inference import StandaloneInferenceEngine
+    from em_denoise_refactor.execution.mps_manager import AppleSiliconManager
+    from em_denoise_refactor.models.factory import build_model
+
+    x_rect = torch.rand(2, 1, 64, 128)
+    for mtype in ("residual_unet", "connectomics"):
+        model = build_model(mtype, in_channels=1, out_channels=1, base_dim=16)
+        out = model(x_rect)
+        assert out.shape == x_rect.shape
+        loss = out.mean()
+        loss.backward()
+
+        evaluator = train_and_infer.DenoisingEvaluator(
+            model=model,
+            device=torch.device("cpu"),
+            patch_size=(64, 128),
+            tiled_inference=True,
+        )
+        img = torch.rand(1, 1, 160, 300)
+        with torch.no_grad():
+            tiled_out = evaluator._denoise_tiled(img)
+        assert tiled_out.shape == img.shape
+        assert torch.isfinite(tiled_out).all()
+
+    # StandaloneInferenceEngine rectangular tile_overlap=(32, 64) -> (64, 128) windows
+    in_tif = tmp_path / "raw_rect.tif"
+    out_tif = tmp_path / "den_rect.tif"
+    tifffile.imwrite(in_tif, _make_structured_base(160, 300, seed=17).astype(np.uint8))
+    engine = StandaloneInferenceEngine(
+        model=build_model("connectomics", base_dim=8),
+        device_manager=AppleSiliconManager(),
+    )
+    engine.device = torch.device("cpu")
+    engine.model.to(engine.device)
+    engine.process_raw_tif(in_tif, out_tif, tile_overlap=(32, 64))
+    assert out_tif.exists()
+    assert tifffile.imread(out_tif).shape == (160, 300)

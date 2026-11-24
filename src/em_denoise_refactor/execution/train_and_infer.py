@@ -17,7 +17,7 @@ import math
 import random
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Sequence, Tuple, Any
 
 import numpy as np
 import tifffile
@@ -27,7 +27,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 from tqdm import tqdm
 
-from em_denoise_refactor.config import PipelineConfig
+from em_denoise_refactor.config import PipelineConfig, normalize_hw_pair
 from em_denoise_refactor.data.dataset import (
     SBFSEMNoiseSynthesizer,
     EmpiricalNoiseSynthesizer,
@@ -277,10 +277,11 @@ class PatchFolderDataset(Dataset):
         if torch.rand(1).item() > 0.5:
             noisy = torch.flip(noisy, dims=[-2])
             clean = torch.flip(clean, dims=[-2])
-        k = torch.randint(0, 4, (1,)).item()
-        if k > 0:
-            noisy = torch.rot90(noisy, k, dims=[-2, -1])
-            clean = torch.rot90(clean, k, dims=[-2, -1])
+        if noisy.shape[-2] == noisy.shape[-1]:
+            k = torch.randint(0, 4, (1,)).item()
+            if k > 0:
+                noisy = torch.rot90(noisy, k, dims=[-2, -1])
+                clean = torch.rot90(clean, k, dims=[-2, -1])
         return noisy, clean
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, str]:
@@ -463,10 +464,11 @@ class LMDBPatchDataset(Dataset):
         if torch.rand(1).item() > 0.5:
             noisy = torch.flip(noisy, dims=[-2])
             clean = torch.flip(clean, dims=[-2])
-        k = torch.randint(0, 4, (1,)).item()
-        if k > 0:
-            noisy = torch.rot90(noisy, k, dims=[-2, -1])
-            clean = torch.rot90(clean, k, dims=[-2, -1])
+        if noisy.shape[-2] == noisy.shape[-1]:
+            k = torch.randint(0, 4, (1,)).item()
+            if k > 0:
+                noisy = torch.rot90(noisy, k, dims=[-2, -1])
+                clean = torch.rot90(clean, k, dims=[-2, -1])
         return noisy, clean
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, str]:
@@ -819,10 +821,14 @@ class DenoisingEvaluator:
         model: nn.Module,
         device: torch.device,
         use_amp: bool = False,
+        patch_size: int | Sequence[int] = 128,
+        tiled_inference: bool = False,
     ) -> None:
         self.model = model
         self.device = device
         self.use_amp = use_amp
+        self.patch_hw = normalize_hw_pair(patch_size, "patch_size")
+        self.tiled_inference = bool(tiled_inference)
         self.amp_dtype = (
             torch.bfloat16
             if (
@@ -839,27 +845,43 @@ class DenoisingEvaluator:
         self.sobel_fn = SobelEdgeLoss().to(device)
 
     def _denoise_tiled(
-        self, x: torch.Tensor, patch_size: int = 128, num_samples: int = 5
+        self,
+        x: torch.Tensor,
+        patch_size: Optional[int | Sequence[int]] = None,
+        num_samples: int = 5,
     ) -> torch.Tensor:
         if hasattr(self.model, "crop_size"):
-            patch_size = self.model.crop_size[0]
+            ph, pw = normalize_hw_pair(self.model.crop_size, "model.crop_size")
+        elif patch_size is not None:
+            ph, pw = normalize_hw_pair(patch_size, "patch_size")
+        else:
+            ph, pw = self.patch_hw
 
-        # Use 50% overlap for smooth blending
-        stride = patch_size // 2
         B, C, H, W = x.shape
-        output = torch.zeros_like(x)
-        weight_sum = torch.zeros_like(x)
+        eff_h = min(ph, H)
+        eff_w = min(pw, W)
+        stride_h = max(1, eff_h // 2)
+        stride_w = max(1, eff_w // 2)
 
-        # 2D Hann window for smooth cosine blending across tile boundaries
-        w1d = torch.hann_window(patch_size, periodic=False, device=x.device)
-        window = torch.outer(w1d, w1d).clamp(min=1e-4).unsqueeze(0).unsqueeze(0)
+        output = torch.zeros_like(x, dtype=torch.float32)
+        weight_sum = torch.zeros_like(x, dtype=torch.float32)
 
-        for y in range(0, H, stride):
-            for x_coord in range(0, W, stride):
-                y1 = min(y, H - patch_size)
-                x1 = min(x_coord, W - patch_size)
-                y2 = y1 + patch_size
-                x2 = x1 + patch_size
+        # Separable 2D Hann window for smooth cosine blending across rectangular tile boundaries
+        wy = torch.hann_window(eff_h, periodic=False, device=x.device)
+        wx = torch.hann_window(eff_w, periodic=False, device=x.device)
+        window = torch.outer(wy, wx).clamp(min=1e-4).unsqueeze(0).unsqueeze(0)
+
+        ys = list(range(0, max(1, H - eff_h + 1), stride_h))
+        if ys[-1] != H - eff_h:
+            ys.append(H - eff_h)
+        xs = list(range(0, max(1, W - eff_w + 1), stride_w))
+        if xs[-1] != W - eff_w:
+            xs.append(W - eff_w)
+
+        for y1 in ys:
+            y2 = y1 + eff_h
+            for x1 in xs:
+                x2 = x1 + eff_w
                 patch = x[:, :, y1:y2, x1:x2]
 
                 if hasattr(self.model, "denoise"):
@@ -867,10 +889,13 @@ class DenoisingEvaluator:
                         self.model.denoise(patch) for _ in range(num_samples)
                     ]
                     pred_patch = torch.stack(sample_preds, dim=0).mean(dim=0)
+                elif self.use_amp:
+                    with torch.autocast(device_type="cuda", dtype=self.amp_dtype):
+                        pred_patch = self.model(patch)
                 else:
                     pred_patch = self.model(patch)
 
-                output[:, :, y1:y2, x1:x2] += pred_patch * window
+                output[:, :, y1:y2, x1:x2] += pred_patch.float() * window
                 weight_sum[:, :, y1:y2, x1:x2] += window
 
         return output / weight_sum
@@ -904,7 +929,13 @@ class DenoisingEvaluator:
                 fname = fname_tuple[0]
                 noisy_b, clean_b = noisy_b.to(self.device), clean_b.to(self.device)
 
-                if hasattr(self.model, "ar_decoder"):
+                if hasattr(self.model, "ar_decoder") or (
+                    self.tiled_inference
+                    and (
+                        noisy_b.shape[-2] > self.patch_hw[0]
+                        or noisy_b.shape[-1] > self.patch_hw[1]
+                    )
+                ):
                     pred_b = self._denoise_tiled(noisy_b)
                 elif self.use_amp:
                     with torch.autocast(device_type="cuda", dtype=self.amp_dtype):
@@ -1674,17 +1705,44 @@ def main() -> None:
         torch.set_float32_matmul_precision("high")
 
     # model_type resolved early (before dataset construction) as `model_type` and `is_n2v_mode`
+    patch_h, patch_w = cfg.extraction.patch_hw
+    m_type = model_type.lower().strip()
+    if m_type in (
+        "connectomics",
+        "nafnet",
+        "modern_unet",
+        "modern",
+        "n2v",
+        "noise2void",
+        "n2v2",
+    ) and (patch_h % 4 != 0 or patch_w % 4 != 0):
+        raise ValueError(
+            f"Model '{model_type}' requires patch_h and patch_w to be divisible by 4, "
+            f"got ({patch_h}, {patch_w})."
+        )
+    if m_type in ("residual_unet", "res_unet", "residual") and (
+        patch_h % 16 != 0 or patch_w % 16 != 0
+    ):
+        logger.warning(
+            f"ResidualUNet prefers patch dimensions divisible by 16 to avoid bilinear "
+            f"skip-resize interpolation; got ({patch_h}, {patch_w})."
+        )
+
     base_dim = cfg.model.base_dim if hasattr(cfg, "model") and cfg.model else 32
-    cosdd_opts = {}
+    cosdd_opts = {"crop_size": (patch_h, patch_w)}
     if hasattr(cfg, "cosdd") and cfg.cosdd:
-        cosdd_opts = {
-            "s_code_channels": getattr(cfg.cosdd, "s_code_channels", 64),
-            "number_layers": getattr(cfg.cosdd, "number_layers", 14),
-            "number_components": getattr(cfg.cosdd, "number_components", 3),
-            "scale_initialisation": getattr(cfg.cosdd, "scale_initialisation", True),
-            "noise_direction": getattr(cfg.cosdd, "noise_direction", "x"),
-            "use_direct_denoiser": getattr(cfg.cosdd, "use_direct_denoiser", False),
-        }
+        cosdd_opts.update(
+            {
+                "s_code_channels": getattr(cfg.cosdd, "s_code_channels", 64),
+                "number_layers": getattr(cfg.cosdd, "number_layers", 14),
+                "number_components": getattr(cfg.cosdd, "number_components", 3),
+                "scale_initialisation": getattr(
+                    cfg.cosdd, "scale_initialisation", True
+                ),
+                "noise_direction": getattr(cfg.cosdd, "noise_direction", "x"),
+                "use_direct_denoiser": getattr(cfg.cosdd, "use_direct_denoiser", False),
+            }
+        )
     n2v_opts = {}
     if hasattr(cfg, "n2v") and cfg.n2v:
         n2v_opts = {
@@ -2057,7 +2115,13 @@ def main() -> None:
         )
 
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
-    evaluator = DenoisingEvaluator(model=model, device=device, use_amp=use_amp)
+    evaluator = DenoisingEvaluator(
+        model=model,
+        device=device,
+        use_amp=use_amp,
+        patch_size=cfg.extraction.patch_size,
+        tiled_inference=bool(getattr(cfg.inference, "tiled", False)),
+    )
     results = evaluator.evaluate_test_set(test_loader, test_denoised_dir)
 
     summary_lines = [

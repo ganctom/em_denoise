@@ -4,8 +4,9 @@ import numpy as np
 import tifffile
 import itertools
 from pathlib import Path
-from typing import Dict, Any, Callable, List
+from typing import Dict, Any, Callable, List, Sequence
 from torch.utils.data import DataLoader
+from em_denoise_refactor.config import normalize_hw_pair
 from em_denoise_refactor.execution.interfaces import MPSDeviceManager, ModelTrainer
 
 
@@ -147,45 +148,60 @@ class StandaloneInferenceEngine:
         # LMDB batch inference integration
         pass
 
-    def _create_2d_hann_window(self, window_size: int) -> torch.Tensor:
+    def _create_2d_hann_window(self, window_size: int | Sequence[int]) -> torch.Tensor:
         """
-        Generates a 2D partition-of-unity window for 50% spatial overlap blending.
+        Generates a separable 2D partition-of-unity window for 50% spatial overlap blending.
         Uses a sine-window (sqrt-Hann) to guarantee sum(W^2) == 1.0 across overlap steps.
         """
+        win_h, win_w = normalize_hw_pair(window_size, "window_size")
         # Linear space from 0.5/N to (N-0.5)/N to prevent exact boundary zeros
-        n = torch.linspace(0.5, window_size - 0.5, window_size, device=self.device)
-        window_1d = torch.sin(torch.pi * n / window_size)
-        window_2d = window_1d.unsqueeze(1) * window_1d.unsqueeze(0)
-        return window_2d
+        ny = torch.linspace(0.5, win_h - 0.5, win_h, device=self.device)
+        nx = torch.linspace(0.5, win_w - 0.5, win_w, device=self.device)
+        win_y = torch.sin(torch.pi * ny / win_h)
+        win_x = torch.sin(torch.pi * nx / win_w)
+        return win_y.unsqueeze(1) * win_x.unsqueeze(0)
 
     def process_raw_tif(
-        self, input_tif_path: Path, output_tif_path: Path, tile_overlap: int = 256
+        self,
+        input_tif_path: Path,
+        output_tif_path: Path,
+        tile_overlap: int | Sequence[int] = 256,
     ) -> None:
         """
         Applies windowed sliding-crop inference with spatial overlap blending on the MPS backend.
-        Assumes 50% overlap where tile_overlap = 256 yields a 512x512 window.
+        Assumes 50% overlap where tile_overlap = 256 yields a 512x512 window (or (H_ov, W_ov) -> (2*H_ov, 2*W_ov)).
         """
-        window_size = tile_overlap * 2
-        step = window_size - tile_overlap
+        ov_h, ov_w = normalize_hw_pair(tile_overlap, "tile_overlap")
 
         # 1. Zero-Copy Memory Mapping
         in_mmap = tifffile.memmap(input_tif_path, mode="r")
         h, w = in_mmap.shape
+        eff_h = min(ov_h * 2, h)
+        eff_w = min(ov_w * 2, w)
+        step_h = max(1, eff_h - min(ov_h, eff_h // 2))
+        step_w = max(1, eff_w - min(ov_w, eff_w // 2))
 
         # 2. Local Accumulator Buffers (CPU RAM)
         out_accum = np.zeros((h, w), dtype=np.float32)
         weight_accum = np.zeros((h, w), dtype=np.float32)
 
         # 3. Blending Window Setup
-        hann_2d = self._create_2d_hann_window(window_size)
+        hann_2d = self._create_2d_hann_window((eff_h, eff_w))
         hann_2d_cpu = hann_2d.cpu().numpy()  # Cached for CPU accumulation
+
+        ys = list(range(0, max(1, h - eff_h + 1), step_h))
+        if ys[-1] != h - eff_h:
+            ys.append(h - eff_h)
+        xs = list(range(0, max(1, w - eff_w + 1), step_w))
+        if xs[-1] != w - eff_w:
+            xs.append(w - eff_w)
 
         self.model.eval()
         with torch.no_grad():
-            for y in range(0, h - window_size + 1, step):
-                for x in range(0, w - window_size + 1, step):
-                    # Pull 512x512 tile from SSD into RAM
-                    patch = in_mmap[y : y + window_size, x : x + window_size]
+            for y in ys:
+                for x in xs:
+                    # Pull tile from SSD into RAM
+                    patch = in_mmap[y : y + eff_h, x : x + eff_w]
 
                     # Cast & Transfer to Acceleration Device
                     patch_tensor = torch.from_numpy(patch.astype(np.float32) / 255.0)
@@ -200,12 +216,10 @@ class StandaloneInferenceEngine:
                     blended_pred = pred * hann_2d
 
                     # Accumulate in CPU memory map
-                    out_accum[y : y + window_size, x : x + window_size] += (
+                    out_accum[y : y + eff_h, x : x + eff_w] += (
                         blended_pred.cpu().numpy()
                     )
-                    weight_accum[y : y + window_size, x : x + window_size] += (
-                        hann_2d_cpu
-                    )
+                    weight_accum[y : y + eff_h, x : x + eff_w] += hann_2d_cpu
 
                 # M4 Pro Unified Memory Protection (Row-level cache purge)
                 self.device_manager.optimize_memory()

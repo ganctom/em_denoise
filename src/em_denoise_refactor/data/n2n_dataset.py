@@ -32,7 +32,7 @@ import struct
 import tarfile
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import duckdb
 import numpy as np
@@ -42,6 +42,8 @@ import tifffile
 import torch
 from torch.utils.data import Dataset, IterableDataset
 from tqdm import tqdm
+
+from em_denoise_refactor.config import normalize_hw_pair
 
 logger = logging.getLogger("train_and_infer")
 
@@ -229,22 +231,27 @@ def _build_section_split_filter(
 
 
 class _NpyChunkWriter:
-    """Constant-RAM sequential writer for standard NumPy .npy v1.0 (N, 2, ps, ps) uint8 files."""
+    """Constant-RAM sequential writer for standard NumPy .npy v1.0 (N, 2, H, W) uint8 files."""
 
     HEADER_LEN = 128
 
-    def __init__(self, path: Path, patch_size: int) -> None:
+    def __init__(self, path: Path, patch_size: int | Sequence[int]) -> None:
         self.path = Path(path)
-        self.patch_size = int(patch_size)
+        self.patch_h, self.patch_w = normalize_hw_pair(patch_size, "patch_size")
+        self.patch_size: int | Tuple[int, int] = (
+            self.patch_h
+            if self.patch_h == self.patch_w
+            else (self.patch_h, self.patch_w)
+        )
         self.count = 0
         self._fh = open(self.path, "wb")
         self._fh.write(b"\x00" * self.HEADER_LEN)
 
     def append(self, chunk: np.ndarray) -> None:
         arr = np.ascontiguousarray(chunk, dtype=np.uint8)
-        if arr.ndim != 4 or arr.shape[1:] != (2, self.patch_size, self.patch_size):
+        if arr.ndim != 4 or arr.shape[1:] != (2, self.patch_h, self.patch_w):
             raise ValueError(
-                f"Expected chunk shape (N, 2, {self.patch_size}, {self.patch_size}), "
+                f"Expected chunk shape (N, 2, {self.patch_h}, {self.patch_w}), "
                 f"got {arr.shape}"
             )
         if arr.shape[0] == 0:
@@ -256,7 +263,7 @@ class _NpyChunkWriter:
         try:
             header_dict = (
                 f"{{'descr': '|u1', 'fortran_order': False, "
-                f"'shape': ({self.count}, 2, {self.patch_size}, {self.patch_size}), }}"
+                f"'shape': ({self.count}, 2, {self.patch_h}, {self.patch_w}), }}"
             ).encode("latin1")
             dict_target_len = self.HEADER_LEN - 10
             pad_len = dict_target_len - len(header_dict) - 1
@@ -328,8 +335,8 @@ class N2NOverlapPairDataset(Dataset):
         and `shards/`.
     split : str
         One of `"train"`, `"val"`, or `"test"`.
-    patch_size : int
-        Square crop size `(patch_size, patch_size)` extracted from `(H_ov, W_ov)`.
+    patch_size : int | Sequence[int]
+        Crop size `(patch_h, patch_w)` (or square scalar `ps`) extracted from `(H_ov, W_ov)`.
     first_sec : Optional[int]
         Minimum `section_num` to include (inclusive).
     last_sec : Optional[int]
@@ -368,7 +375,7 @@ class N2NOverlapPairDataset(Dataset):
         self,
         overlaps_dir: Path | str,
         split: str = "train",
-        patch_size: int = 128,
+        patch_size: int | Sequence[int] = 128,
         first_sec: Optional[int] = None,
         last_sec: Optional[int] = None,
         split_strategy: str = "block",
@@ -388,7 +395,7 @@ class N2NOverlapPairDataset(Dataset):
         align_max_shift_px: int = 16,
         align_blur_sigma: float = 1.0,
         patch_sampling: str = "random",
-        tile_stride: Optional[int] = None,
+        tile_stride: Optional[int | Sequence[int]] = None,
         trim_enabled: bool = False,
         v_trim_top_px: int = 50,
         v_trim_left_px: int = 500,
@@ -409,17 +416,37 @@ class N2NOverlapPairDataset(Dataset):
     ) -> None:
         self.overlaps_dir = Path(overlaps_dir)
         self.split = split.lower().strip()
-        self.patch_size = patch_size
+        self.patch_h, self.patch_w = normalize_hw_pair(patch_size, "patch_size")
+        self.patch_size: int | Tuple[int, int] = (
+            self.patch_h
+            if self.patch_h == self.patch_w
+            else (self.patch_h, self.patch_w)
+        )
         self.pair_direction = pair_direction.lower().strip()
         self.cache_in_ram = cache_in_ram
         self.augment = augment
-        self.augment_rot90 = augment_rot90
+        self.augment_rot90 = bool(augment_rot90)
+        if self.augment_rot90 and self.patch_h != self.patch_w:
+            logger.warning(
+                f"augment_rot90=True is incompatible with rectangular patches "
+                f"({self.patch_h}x{self.patch_w}) because 90/270-deg rotation transposes H/W; "
+                "auto-disabling augment_rot90."
+            )
+            self.augment_rot90 = False
         self.align_patches = align_patches
         self.align_subpixel = bool(align_subpixel)
         self.align_max_shift_px = align_max_shift_px
         self.align_blur_sigma = align_blur_sigma
         self.patch_sampling = patch_sampling.lower().strip()
-        self.tile_stride = tile_stride if tile_stride is not None else patch_size
+        if tile_stride is not None:
+            self.stride_h, self.stride_w = normalize_hw_pair(tile_stride, "tile_stride")
+        else:
+            self.stride_h, self.stride_w = self.patch_h, self.patch_w
+        self.tile_stride: int | Tuple[int, int] = (
+            self.stride_h
+            if self.stride_h == self.stride_w
+            else (self.stride_h, self.stride_w)
+        )
         self.trim_enabled = trim_enabled
         self.v_trim = (
             int(v_trim_top_px),
@@ -491,8 +518,14 @@ class N2NOverlapPairDataset(Dataset):
             raise ValueError(
                 f"patch_sampling must be 'random' or 'tile', got '{patch_sampling}'"
             )
-        if self.tile_stride <= 0:
-            raise ValueError(f"tile_stride must be > 0, got {self.tile_stride}")
+        if (
+            self.quality_filter_enabled
+            and self.quality_metric == "ssim"
+            and min(self.patch_h, self.patch_w) < 7
+        ):
+            raise ValueError(
+                f"SSIM quality filtering requires patch_h, patch_w >= 7, got ({self.patch_h}, {self.patch_w})"
+            )
 
         tile_streaming = self.patch_sampling == "tile" and (
             self.cache_in_ram or self.crop_cache_dir is not None
@@ -590,13 +623,13 @@ class N2NOverlapPairDataset(Dataset):
 
             logger.info(
                 f"N2N '{self.split}' tile mode: {len(self.records)} stripes -> "
-                f"{len(self.tile_index)}/{total_tiles} patches ({self.patch_size}x{self.patch_size}, stride={self.tile_stride})"
+                f"{len(self.tile_index)}/{total_tiles} patches ({self.patch_h}x{self.patch_w}, stride={self.tile_stride})"
             )
 
     def _load_records_from_manifest(
         self,
         manifest_path: Path,
-        patch_size: int,
+        patch_size: int | Sequence[int],
         first_sec: Optional[int],
         last_sec: Optional[int],
         split_strategy: str,
@@ -610,20 +643,21 @@ class N2NOverlapPairDataset(Dataset):
         order_by_shard: bool = False,
     ) -> List[Tuple[str, str, int, int, int, int, int]]:
         """Query manifest.parquet via DuckDB and return byte-offset records."""
+        ph, pw = normalize_hw_pair(patch_size, "patch_size")
         con = duckdb.connect()
         if self.trim_enabled:
             vt, vb, vl, vr = self.v_trim
             ht, hb, hl, hr = self.h_trim
             where_clauses = [
                 f"(CASE WHEN lower(m.orientation) = 'vertical' "
-                f"THEN m.height - {vt + vb} ELSE m.height - {ht + hb} END) >= {int(patch_size)}",
+                f"THEN m.height - {vt + vb} ELSE m.height - {ht + hb} END) >= {ph}",
                 f"(CASE WHEN lower(m.orientation) = 'vertical' "
-                f"THEN m.width - {vl + vr} ELSE m.width - {hl + hr} END) >= {int(patch_size)}",
+                f"THEN m.width - {vl + vr} ELSE m.width - {hl + hr} END) >= {pw}",
             ]
         else:
             where_clauses = [
-                f"m.height >= {int(patch_size)}",
-                f"m.width >= {int(patch_size)}",
+                f"m.height >= {ph}",
+                f"m.width >= {pw}",
             ]
         if first_sec is not None:
             where_clauses.append(f"m.section_num >= {int(first_sec)}")
@@ -824,7 +858,7 @@ class N2NOverlapPairDataset(Dataset):
         cached: List[Optional[Tuple[np.ndarray, str]]] = [None] * len(self.records)
         kept_counts = {"_h": 0, "_v": 0}
         dropped_counts = {"_h": 0, "_v": 0}
-        ps = self.patch_size
+        ph, pw = self.patch_h, self.patch_w
 
         pbar = tqdm(
             total=len(self.records),
@@ -845,7 +879,7 @@ class N2NOverlapPairDataset(Dataset):
                         )
                     arr = self._trim_pair(arr, pair_id)
                     orient_key = "_v" if pair_id.endswith("_v") else "_h"
-                    if arr.shape[1] < ps or arr.shape[2] < ps:
+                    if arr.shape[1] < ph or arr.shape[2] < pw:
                         dropped_counts[orient_key] += 1
                     else:
                         kept_counts[orient_key] += 1
@@ -858,14 +892,14 @@ class N2NOverlapPairDataset(Dataset):
         ]
         if not valid_pairs:
             raise ValueError(
-                f"No pairs remained after ROI trimming (patch_size={ps}) for split '{self.split}'"
+                f"No pairs remained after ROI trimming (patch_size={ph}x{pw}) for split '{self.split}'"
             )
         self.records = [rec for rec, _ in valid_pairs]
         self.cached_pairs = [c for _, c in valid_pairs]
 
         if self.trim_enabled:
             logger.info(
-                f"N2N '{self.split}' ROI trim summary (patch_size={ps}): "
+                f"N2N '{self.split}' ROI trim summary (patch_size={ph}x{pw}): "
                 f"_h kept={kept_counts['_h']} dropped={dropped_counts['_h']} | "
                 f"_v kept={kept_counts['_v']} dropped={dropped_counts['_v']}"
             )
@@ -901,8 +935,8 @@ class N2NOverlapPairDataset(Dataset):
 
     def _build_tile_index(self) -> List[Tuple[int, int, int]]:
         """Generate (pair_idx, y0, x0) grid coordinates for each stripe."""
-        ps = self.patch_size
-        stride = self.tile_stride
+        ph, pw = self.patch_h, self.patch_w
+        sh, sw = self.stride_h, self.stride_w
         tile_margin = 0 if not self.align_patches else (6 if self.align_subpixel else 2)
         tiles: List[Tuple[int, int, int]] = []
 
@@ -915,11 +949,11 @@ class N2NOverlapPairDataset(Dataset):
                     arr, _ = self._read_pair_from_disk(pair_idx)
                     _, h, w = arr.shape
 
-            if h < ps or w < ps:
+            if h < ph or w < pw:
                 continue
 
-            ys = self._axis_tile_coords(h, ps, stride, tile_margin)
-            xs = self._axis_tile_coords(w, ps, stride, tile_margin)
+            ys = self._axis_tile_coords(h, ph, sh, tile_margin)
+            xs = self._axis_tile_coords(w, pw, sw, tile_margin)
 
             for y0 in ys:
                 for x0 in xs:
@@ -927,7 +961,7 @@ class N2NOverlapPairDataset(Dataset):
 
         if not tiles:
             raise ValueError(
-                f"No valid {ps}x{ps} tiles generated for split '{self.split}'"
+                f"No valid {ph}x{pw} tiles generated for split '{self.split}'"
             )
         return tiles
 
@@ -950,13 +984,24 @@ class N2NOverlapPairDataset(Dataset):
             if self.crop_cache_dir is not None
             else {"kind": "disabled"}
         )
+        # Preserve scalar int serialization for square configs so existing square caches stay valid.
+        patch_fp: int | List[int] = (
+            int(self.patch_h)
+            if self.patch_h == self.patch_w
+            else [int(self.patch_h), int(self.patch_w)]
+        )
+        stride_fp: int | List[int] = (
+            int(self.stride_h)
+            if self.stride_h == self.stride_w
+            else [int(self.stride_h), int(self.stride_w)]
+        )
         prep_fingerprint: Dict[str, Any] = {
             "schema_version": 1,
             "overlaps_dir": str(self.overlaps_dir.resolve()),
             "source_signature": source_sig,
             "split": self.split,
-            "patch_size": int(self.patch_size),
-            "tile_stride": int(self.tile_stride),
+            "patch_size": patch_fp,
+            "tile_stride": stride_fp,
             "orientation": str(orientation).lower().strip(),
             "trim_enabled": bool(self.trim_enabled),
             "v_trim": list(self.v_trim),
@@ -1014,9 +1059,15 @@ class N2NOverlapPairDataset(Dataset):
         crops_path = cache_dir / "crops.npy"
         all_ids = (cache_dir / "ids.txt").read_text(encoding="utf-8").splitlines()
         crops_mmap = np.load(crops_path, mmap_mode="r")
-        if len(all_ids) != crops_mmap.shape[0] or len(sections) != crops_mmap.shape[0]:
+        if (
+            crops_mmap.ndim != 4
+            or crops_mmap.shape[1:] != (2, self.patch_h, self.patch_w)
+            or len(all_ids) != crops_mmap.shape[0]
+            or len(sections) != crops_mmap.shape[0]
+        ):
             raise ValueError(
                 f"Corrupt crop cache in {cache_dir}: shape={crops_mmap.shape}, "
+                f"expected (*, 2, {self.patch_h}, {self.patch_w}), "
                 f"ids={len(all_ids)}, sections={len(sections)}"
             )
 
@@ -1180,9 +1231,9 @@ class N2NOverlapPairDataset(Dataset):
         Returns `(crops_tuple_or_None, was_rejected_oob)`.
         """
         _, h, w = pair_arr.shape
-        ps = self.patch_size
-        crop0 = pair_arr[0, y0 : y0 + ps, x0 : x0 + ps]
-        crop1 = pair_arr[1, y0 : y0 + ps, x0 : x0 + ps]
+        ph, pw = self.patch_h, self.patch_w
+        crop0 = pair_arr[0, y0 : y0 + ph, x0 : x0 + pw]
+        crop1 = pair_arr[1, y0 : y0 + ph, x0 : x0 + pw]
 
         if not self.align_patches:
             return (crop0, crop1), False
@@ -1195,8 +1246,8 @@ class N2NOverlapPairDataset(Dataset):
                 blur_sigma=self.align_blur_sigma,
             )
             pad = math.ceil(max(abs(dy_f), abs(dx_f))) + 3
-            y_lo, y_hi = y0 - pad, y0 + ps + pad
-            x_lo, x_hi = x0 - pad, x0 + ps + pad
+            y_lo, y_hi = y0 - pad, y0 + ph + pad
+            x_lo, x_hi = x0 - pad, x0 + pw + pad
             if y_lo < 0 or y_hi > h or x_lo < 0 or x_hi > w:
                 return None, True
             img1_pad = pair_arr[1, y_lo:y_hi, x_lo:x_hi].astype(np.float32)
@@ -1204,7 +1255,7 @@ class N2NOverlapPairDataset(Dataset):
                 img1_pad, shift=(dy_f, dx_f), order=3, mode="nearest"
             )
             crop1_shifted = np.clip(
-                shifted_pad[pad : pad + ps, pad : pad + ps], 0.0, 255.0
+                shifted_pad[pad : pad + ph, pad : pad + pw], 0.0, 255.0
             )
             return (crop0, crop1_shifted), False
 
@@ -1216,15 +1267,15 @@ class N2NOverlapPairDataset(Dataset):
         )
         y1 = y0 - dy
         x1 = x0 - dx
-        if y1 < 0 or y1 + ps > h or x1 < 0 or x1 + ps > w:
+        if y1 < 0 or y1 + ph > h or x1 < 0 or x1 + pw > w:
             return None, True
-        return (crop0, pair_arr[1, y1 : y1 + ps, x1 : x1 + ps]), False
+        return (crop0, pair_arr[1, y1 : y1 + ph, x1 : x1 + pw]), False
 
     def _extract_aligned_crops(
         self, pair_arr: np.ndarray, y0: int, x0: int
     ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         """
-        Extract (ps, ps) crops at (y0, x0) and optionally align crop1.
+        Extract (patch_h, patch_w) crops at (y0, x0) and optionally align crop1.
 
         Returns `None` (incrementing `self.rejected_oob_count`) if the estimated shift
         or sub-pixel padding would exceed the stripe boundary — never clamps.
@@ -1252,11 +1303,11 @@ class N2NOverlapPairDataset(Dataset):
     ]:
         """Extract, align, flat-filter, and quality-filter tiles from one stripe."""
         _, h, w = pair_arr.shape
-        ps = self.patch_size
-        stride = self.tile_stride
+        ph, pw = self.patch_h, self.patch_w
+        sh, sw = self.stride_h, self.stride_w
         tile_margin = 0 if not self.align_patches else (6 if self.align_subpixel else 2)
-        ys = self._axis_tile_coords(h, ps, stride, tile_margin)
-        xs = self._axis_tile_coords(w, ps, stride, tile_margin)
+        ys = self._axis_tile_coords(h, ph, sh, tile_margin)
+        xs = self._axis_tile_coords(w, pw, sw, tile_margin)
         coords = [(y0, x0) for y0 in ys for x0 in xs]
         random.Random(stripe_seed).shuffle(coords)
 
@@ -1330,7 +1381,7 @@ class N2NOverlapPairDataset(Dataset):
         and writes surviving uint8 crops directly into either RAM or a persistent `.npy`
         memory-mapped cache directory.
         """
-        ps = self.patch_size
+        ph, pw = self.patch_h, self.patch_w
         target_cap = int(max_pairs) if max_pairs is not None else None
         num_records = len(self.records)
 
@@ -1384,9 +1435,11 @@ class N2NOverlapPairDataset(Dataset):
             if tmp_cache_dir.exists():
                 shutil.rmtree(tmp_cache_dir, ignore_errors=True)
             tmp_cache_dir.mkdir(parents=True, exist_ok=True)
-            npy_writer = _NpyChunkWriter(tmp_cache_dir / "crops.npy", patch_size=ps)
+            npy_writer = _NpyChunkWriter(
+                tmp_cache_dir / "crops.npy", patch_size=(ph, pw)
+            )
         elif target_cap is not None:
-            ram_buf = np.empty((target_cap, 2, ps, ps), dtype=np.uint8)
+            ram_buf = np.empty((target_cap, 2, ph, pw), dtype=np.uint8)
 
         kept_ids: List[str] = []
         kept_sections: List[int] = []
@@ -1404,7 +1457,7 @@ class N2NOverlapPairDataset(Dataset):
 
         def _flush_disk_batch() -> None:
             if npy_writer is not None and disk_batch_crops:
-                arr_b = np.empty((len(disk_batch_crops), 2, ps, ps), dtype=np.uint8)
+                arr_b = np.empty((len(disk_batch_crops), 2, ph, pw), dtype=np.uint8)
                 for j, (c0_b, c1_b) in enumerate(disk_batch_crops):
                     arr_b[j, 0] = c0_b
                     arr_b[j, 1] = c1_b
@@ -1427,7 +1480,7 @@ class N2NOverlapPairDataset(Dataset):
                 ram_buf[kept_count, 0] = c0_u8
                 ram_buf[kept_count, 1] = c1_u8
             else:
-                pair_u8 = np.empty((1, 2, ps, ps), dtype=np.uint8)
+                pair_u8 = np.empty((1, 2, ph, pw), dtype=np.uint8)
                 pair_u8[0, 0] = c0_u8
                 pair_u8[0, 1] = c1_u8
                 ram_chunks.append(pair_u8)
@@ -1507,7 +1560,7 @@ class N2NOverlapPairDataset(Dataset):
                                     )
                                 arr = self._trim_pair(arr, pair_id)
                                 orient_key = "_v" if pair_id.endswith("_v") else "_h"
-                                if arr.shape[1] < ps or arr.shape[2] < ps:
+                                if arr.shape[1] < ph or arr.shape[2] < pw:
                                     if pair_idx not in trim_seen:
                                         trim_seen.add(pair_idx)
                                         trim_dropped_counts[orient_key] += 1
@@ -1609,14 +1662,14 @@ class N2NOverlapPairDataset(Dataset):
             _flush_disk_batch()
             if kept_count == 0:
                 raise ValueError(
-                    f"No valid {ps}x{ps} tiles survived streaming materialization for "
+                    f"No valid {ph}x{pw} tiles survived streaming materialization for "
                     f"split '{self.split}' (rejected_quality={rejected_quality}, "
                     f"rejected_oob={rejected_oob}, rejected_flat={rejected_flat})."
                 )
 
             if self.trim_enabled:
                 logger.info(
-                    f"N2N '{self.split}' ROI trim summary (patch_size={ps}): "
+                    f"N2N '{self.split}' ROI trim summary (patch_size={ph}x{pw}): "
                     f"_h kept={trim_kept_counts['_h']} dropped={trim_dropped_counts['_h']} | "
                     f"_v kept={trim_kept_counts['_v']} dropped={trim_dropped_counts['_v']}"
                 )
@@ -1656,7 +1709,9 @@ class N2NOverlapPairDataset(Dataset):
                     "actual_max_sec": int(sections_arr.max()),
                     "max_pairs_requested": target_cap,
                     "num_crops": int(kept_count),
-                    "patch_size": int(ps),
+                    "patch_size": (int(ph) if ph == pw else [int(ph), int(pw)]),
+                    "patch_h": int(ph),
+                    "patch_w": int(pw),
                     "shards_covered": int(len(shards_used)),
                     "total_shards": int(num_shards),
                     "rejected_quality_count": int(rejected_quality),
@@ -1701,7 +1756,7 @@ class N2NOverlapPairDataset(Dataset):
                 self.records = []
                 gc.collect()
                 logger.info(
-                    f"N2N '{self.split}' streamed {kept_count} aligned ({ps}x{ps}) "
+                    f"N2N '{self.split}' streamed {kept_count} aligned ({ph}x{pw}) "
                     f"tile crops into RAM ({final_buf.nbytes / 1e6:.1f} MB) with zero full-stripe preload."
                 )
         except Exception:
@@ -1723,10 +1778,10 @@ class N2NOverlapPairDataset(Dataset):
     def _store_materialized_crops(
         self, crops: List[Tuple[np.ndarray, np.ndarray, str]]
     ) -> None:
-        """Pack pre-aligned (ps, ps) uint8 crop pairs into a compact array and drop full stripes."""
+        """Pack pre-aligned (patch_h, patch_w) uint8 crop pairs into a compact array and drop full stripes."""
         n = len(crops)
-        ps = self.patch_size
-        buf = np.empty((n, 2, ps, ps), dtype=np.uint8)
+        ph, pw = self.patch_h, self.patch_w
+        buf = np.empty((n, 2, ph, pw), dtype=np.uint8)
         ids: List[str] = []
         for i, (c0, c1, pid) in enumerate(crops):
             buf[i, 0] = np.rint(np.clip(c0, 0.0, 255.0)).astype(np.uint8)
@@ -1737,7 +1792,7 @@ class N2NOverlapPairDataset(Dataset):
         self.cached_pairs = None
         gc.collect()
         logger.info(
-            f"N2N '{self.split}' materialized {n} aligned ({ps}x{ps}) tile crops "
+            f"N2N '{self.split}' materialized {n} aligned ({ph}x{pw}) tile crops "
             f"({buf.nbytes / 1e6:.1f} MB) and freed full stripe cache."
         )
 
@@ -1767,7 +1822,7 @@ class N2NOverlapPairDataset(Dataset):
             crops.append((crop0, crop1, f"{pair_id}_y{y0}_x{x0}"))
         if not crops:
             raise ValueError(
-                f"No valid {self.patch_size}x{self.patch_size} crops survived alignment/flat "
+                f"No valid {self.patch_h}x{self.patch_w} crops survived alignment/flat "
                 f"filtering for split '{self.split}' (rejected_oob={rejected_oob}, rejected_flat={rejected_flat})."
             )
         if rejected_oob > 0 or rejected_flat > 0:
@@ -1875,7 +1930,7 @@ class N2NOverlapPairDataset(Dataset):
                     augment_rot90=self.augment_rot90,
                 ) + (self.cached_tile_ids[idx],)
 
-        ps = self.patch_size
+        ph, pw = self.patch_h, self.patch_w
 
         if self.tile_index is not None:
             n_tiles = len(self.tile_index)
@@ -1915,9 +1970,11 @@ class N2NOverlapPairDataset(Dataset):
                 pair_arr, pair_id = self._read_pair_from_disk(pair_idx)
 
             _, h, w = pair_arr.shape
+            if h < ph or w < pw:
+                continue
             if self.is_val_or_test:
-                y0 = (h - ps) // 2
-                x0 = (w - ps) // 2
+                y0 = (h - ph) // 2
+                x0 = (w - pw) // 2
                 res = self._extract_aligned_crops(pair_arr, y0, x0)
                 if res is None:
                     continue
@@ -1938,8 +1995,8 @@ class N2NOverlapPairDataset(Dataset):
                 best_score = -float("inf")
                 best_crops: Optional[Tuple[np.ndarray, np.ndarray]] = None
                 for _ in range(16):
-                    cy0 = random.randint(0, h - ps) if h > ps else 0
-                    cx0 = random.randint(0, w - ps) if w > ps else 0
+                    cy0 = random.randint(0, h - ph) if h > ph else 0
+                    cx0 = random.randint(0, w - pw) if w > pw else 0
                     res = self._extract_aligned_crops(pair_arr, cy0, cx0)
                     if res is None:
                         continue
@@ -1971,8 +2028,8 @@ class N2NOverlapPairDataset(Dataset):
                     ) + (pair_id,)
             else:
                 for _ in range(16):
-                    y0 = random.randint(0, h - ps) if h > ps else 0
-                    x0 = random.randint(0, w - ps) if w > ps else 0
+                    y0 = random.randint(0, h - ph) if h > ph else 0
+                    x0 = random.randint(0, w - pw) if w > pw else 0
                     res = self._extract_aligned_crops(pair_arr, y0, x0)
                     if res is None:
                         continue
@@ -2023,7 +2080,7 @@ def _format_pair_tensors(
         if random.random() < 0.5:
             inp_t = torch.flip(inp_t, dims=[1])
             tgt_t = torch.flip(tgt_t, dims=[1])
-        if augment_rot90:
+        if augment_rot90 and inp_t.shape[1] == inp_t.shape[2]:
             k = random.randint(0, 3)
             if k > 0:
                 inp_t = torch.rot90(inp_t, k, dims=[1, 2])
@@ -2045,7 +2102,7 @@ class N2NStreamingShardDataset(IterableDataset):
         self,
         overlaps_dir: Path | str,
         split: str = "train",
-        patch_size: int = 128,
+        patch_size: int | Sequence[int] = 128,
         first_sec: Optional[int] = None,
         last_sec: Optional[int] = None,
         split_strategy: str = "block",
@@ -2064,10 +2121,22 @@ class N2NStreamingShardDataset(IterableDataset):
         super().__init__()
         self.overlaps_dir = Path(overlaps_dir)
         self.split = split.lower().strip()
-        self.patch_size = patch_size
+        self.patch_h, self.patch_w = normalize_hw_pair(patch_size, "patch_size")
+        self.patch_size: int | Tuple[int, int] = (
+            self.patch_h
+            if self.patch_h == self.patch_w
+            else (self.patch_h, self.patch_w)
+        )
         self.pair_direction = pair_direction.lower().strip()
         self.augment = augment
-        self.augment_rot90 = augment_rot90
+        self.augment_rot90 = bool(augment_rot90)
+        if self.augment_rot90 and self.patch_h != self.patch_w:
+            logger.warning(
+                f"augment_rot90=True is incompatible with rectangular patches "
+                f"({self.patch_h}x{self.patch_w}) because 90/270-deg rotation transposes H/W; "
+                "auto-disabling augment_rot90."
+            )
+            self.augment_rot90 = False
         self.seed = int(seed)
         self.shuffle_buffer_size = (
             0 if self.split in ("val", "test") else int(shuffle_buffer_size)
@@ -2082,8 +2151,8 @@ class N2NStreamingShardDataset(IterableDataset):
             )
 
         where_clauses = [
-            f"m.height >= {int(patch_size)}",
-            f"m.width >= {int(patch_size)}",
+            f"m.height >= {self.patch_h}",
+            f"m.width >= {self.patch_w}",
         ]
         if first_sec is not None:
             where_clauses.append(f"m.section_num >= {int(first_sec)}")
@@ -2178,7 +2247,7 @@ class N2NStreamingShardDataset(IterableDataset):
 
         buf: List[Tuple[torch.Tensor, torch.Tensor, str]] = []
         yielded = 0
-        ps = self.patch_size
+        ph, pw = self.patch_h, self.patch_w
 
         try:
             for shard_rel in worker_shards:
@@ -2202,18 +2271,18 @@ class N2NStreamingShardDataset(IterableDataset):
                         raw_bytes = f.read(int(length))
                         arr = tifffile.imread(io.BytesIO(raw_bytes))
                         _, h, w = arr.shape
-                        if h < ps or w < ps:
+                        if h < ph or w < pw:
                             continue
 
                         if self.is_val_or_test:
-                            y0 = (h - ps) // 2
-                            x0 = (w - ps) // 2
+                            y0 = (h - ph) // 2
+                            x0 = (w - pw) // 2
                         else:
-                            y0 = rng.randint(0, h - ps) if h > ps else 0
-                            x0 = rng.randint(0, w - ps) if w > ps else 0
+                            y0 = rng.randint(0, h - ph) if h > ph else 0
+                            x0 = rng.randint(0, w - pw) if w > pw else 0
 
-                        crop0 = arr[0, y0 : y0 + ps, x0 : x0 + ps]
-                        crop1 = arr[1, y0 : y0 + ps, x0 : x0 + ps]
+                        crop0 = arr[0, y0 : y0 + ph, x0 : x0 + pw]
+                        crop1 = arr[1, y0 : y0 + ph, x0 : x0 + pw]
                         inp_t, tgt_t = _format_pair_tensors(
                             crop0=crop0,
                             crop1=crop1,
