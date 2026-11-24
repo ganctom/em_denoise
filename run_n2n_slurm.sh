@@ -25,6 +25,11 @@ export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export BLOSC_NTHREADS=1
 
+# Redirect Triton / TorchInductor caches off read-only $HOME onto local node scratch
+export TRITON_CACHE_DIR="${TMPDIR:-/tmp}/triton_cache_${SLURM_JOB_ID:-$$}"
+export TORCHINDUCTOR_CACHE_DIR="${TMPDIR:-/tmp}/inductor_cache_${SLURM_JOB_ID:-$$}"
+mkdir -p "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR"
+
 # 2. Repo & environment on /tachyon (adjust REPO_DIR if cloned elsewhere)
 REPO_DIR="/tachyon/groups/scratch/gmicro_sem/gfriedri/tgan/em_denoise"
 cd "$REPO_DIR"
