@@ -17,6 +17,7 @@ import tifffile
 import torch
 
 from em_denoise_refactor.config import PipelineConfig
+from em_denoise_refactor.data.inference_25d_dataset import Custom25DTIFFStackDataset
 from em_denoise_refactor.data.n2n_25d_dataset import (
     N2N25DOverlapDataset,
     assert_disjoint_z_supports,
@@ -865,3 +866,45 @@ inference:
     raw_a = np.load(run_dir / "test" / "denoised" / "per_sample_noisy_mse.npy")
     ci = diagnostics_25d.paired_bootstrap_mse_ci(mse_a, mse_a * 0.95, raw_a, n_boot=500)
     assert ci["delta_mse"] < 0.0 and ci["delta_est_psnr"] > 0.0
+
+
+def test_custom_25d_raw_tile_inference_dataset(tmp_path: Path):
+    raw_dir = tmp_path / "raw_stack"
+    raw_dir.mkdir()
+    canvas = _make_em_texture(320, 320, seed=404)
+    # 4 consecutive sections of tile t0313 with +-5 px drift, plus 1 isolated tile t0999
+    shifts = {10: (0, 0), 11: (4, -3), 12: (-2, 5), 13: (1, 1)}
+    for sec, (dy, dx) in shifts.items():
+        tile = canvas[30 + dy : 30 + dy + 256, 30 + dx : 30 + dx + 256]
+        tifffile.imwrite(raw_dir / f"20260201_RoLi_F1_g0000_t0313_s{sec:05d}.tif", tile)
+    tifffile.imwrite(
+        raw_dir / "20260201_RoLi_F1_g0000_t0999_s00500.tif",
+        _make_em_texture(256, 256, seed=505),
+    )
+
+    ds = Custom25DTIFFStackDataset(
+        raw_dir, z_context_radius=1, z_register=True, z_register_max_shift_px=24
+    )
+    assert len(ds) == 5
+
+    # Boundary slice s00010 (first of t0313): ch 0 is center-filled, ch 2 is registered s00011
+    x0, y0, fn0 = ds[0]
+    assert fn0 == "20260201_RoLi_F1_g0000_t0313_s00010.tif"
+    assert x0.shape == (3, 256, 256) and y0.shape == (1, 256, 256)
+    assert torch.allclose(x0[0], x0[1])
+
+    # Interior slice s00011: both neighbors registered -> interior matches center within 0 (identical base canvas)
+    x1, _, fn1 = ds[1]
+    assert fn1 == "20260201_RoLi_F1_g0000_t0313_s00011.tif"
+    assert torch.allclose(x1[0, 16:-16, 16:-16], x1[1, 16:-16, 16:-16], atol=1e-4)
+    assert torch.allclose(x1[2, 16:-16, 16:-16], x1[1, 16:-16, 16:-16], atol=1e-4)
+
+    # Isolated tile t0999: all channels center-filled
+    x_iso, _, fn_iso = ds[4]
+    assert fn_iso == "20260201_RoLi_F1_g0000_t0999_s00500.tif"
+    assert torch.allclose(x_iso[0], x_iso[1]) and torch.allclose(x_iso[2], x_iso[1])
+
+    # M6: num_workers > 0 must raise RuntimeError
+    loader = torch.utils.data.DataLoader(ds, batch_size=1, num_workers=1)
+    with pytest.raises(RuntimeError, match="num_workers=0"):
+        next(iter(loader))

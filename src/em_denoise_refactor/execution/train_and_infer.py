@@ -41,6 +41,7 @@ from em_denoise_refactor.data.n2n_25d_dataset import (
     N2N25DOverlapDataset,
     assert_disjoint_z_supports,
 )
+from em_denoise_refactor.data.inference_25d_dataset import Custom25DTIFFStackDataset
 from em_denoise_refactor.data.n2n_duplicate_dataset import N2NDuplicateTileDataset
 from em_denoise_refactor.execution.calibration import run_calibration
 from em_denoise_refactor.models.factory import build_model
@@ -2273,7 +2274,25 @@ def main() -> None:
         logger.info(
             f"Loading custom inference images from directory: {custom_input_dir}"
         )
-        test_dataset = CustomTIFFDataset(custom_input_dir, cache_in_ram=True)
+        if in_channels > 1:
+            test_dataset = Custom25DTIFFStackDataset(
+                custom_input_dir,
+                z_context_radius=in_channels // 2,
+                z_register=bool(getattr(cfg.inference, "z_register", True)),
+                z_register_max_shift_px=int(
+                    getattr(cfg.inference, "z_register_max_shift_px", 64)
+                ),
+                z_register_block_size=int(
+                    getattr(cfg.inference, "z_register_block_size", 1024)
+                ),
+            )
+            if not bool(getattr(cfg.inference, "tiled", False)):
+                logger.warning(
+                    "Running 2.5D custom_input_dir inference with inference.tiled=False; "
+                    "enable inference.tiled=True for large 3072x4096 tiles."
+                )
+        else:
+            test_dataset = CustomTIFFDataset(custom_input_dir, cache_in_ram=True)
         test_denoised_dir = run_dir / "custom_inference" / "denoised"
     elif is_n2n_mode and n2n_source == "duplicates":
         logger.info(f"Loading N2N duplicate test pairs from: {cfg.n2n.duplicates_dir}")

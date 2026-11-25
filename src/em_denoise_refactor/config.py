@@ -139,6 +139,9 @@ class InferenceConfig:
     preview_crop_y: Optional[int] = None
     preview_crop_x: Optional[int] = None
     tiled: bool = False
+    z_register: bool = True
+    z_register_max_shift_px: int = 64
+    z_register_block_size: int = 1024
 
     def __post_init__(self):
         if self.custom_input_dir is not None and self.custom_input_dir != "":
