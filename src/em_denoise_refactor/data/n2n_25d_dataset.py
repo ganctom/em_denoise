@@ -1128,7 +1128,9 @@ class N2N25DOverlapDataset(Dataset):
         # Sliding section pixel buffer: sec_buf[sec][skey] = (2, H, W) uint8 or (1, H, W)
         sec_buf: Dict[int, Dict[StripeKey, np.ndarray]] = {}
 
-        def _ensure_section_loaded(sec: int) -> None:
+        def _ensure_section_loaded(
+            sec: int, active_ftids: Optional[set[int]] = None
+        ) -> None:
             if sec in sec_buf:
                 return
             meta_map = stripes_by_sec.get(sec, {})
@@ -1137,7 +1139,12 @@ class N2N25DOverlapDataset(Dataset):
                 return
             # Read in ascending (shard_relpath, byte_offset) order for sequential I/O
             ordered = sorted(
-                meta_map.values(), key=lambda sm: (sm.shard_relpath, sm.byte_offset)
+                (
+                    sm
+                    for sm in meta_map.values()
+                    if active_ftids is None or sm.first_exposed_tile_id in active_ftids
+                ),
+                key=lambda sm: (sm.shard_relpath, sm.byte_offset),
             )
             loaded: Dict[StripeKey, np.ndarray] = {}
             for sm in ordered:
@@ -1155,15 +1162,15 @@ class N2N25DOverlapDataset(Dataset):
                     del sec_buf[s]
 
         def _compute_canonical_hop(
-            s0: int, s1: int
+            s0: int, s1: int, active_ftids: Optional[set[int]] = None
         ) -> Dict[StripeKey, Tuple[Optional[ShiftResult], Optional[str]]]:
             """Compute canonical 1-step directed hop (s0 -> s1) ONCE deterministically (H4)."""
             assert s1 == s0 + 1
             if (s0, s1) in hop_cache:
                 return hop_cache[(s0, s1)]
 
-            _ensure_section_loaded(s0)
-            _ensure_section_loaded(s1)
+            _ensure_section_loaded(s0, active_ftids)
+            _ensure_section_loaded(s1, active_ftids)
             m0 = stripes_by_sec.get(s0, {})
             m1 = stripes_by_sec.get(s1, {})
             b0 = sec_buf.get(s0, {})
@@ -1261,21 +1268,21 @@ class N2N25DOverlapDataset(Dataset):
             hop_cache[(s0, s1)] = verdicts
             return verdicts
 
-        def _get_skip_shift(s_a: int, s_b: int, skey: StripeKey) -> ShiftResult:
+        def _compute_skip_shift(s_a: int, s_b: int, skey: StripeKey) -> ShiftResult:
+            """Thread-safe read-only skip-shift computation (no shared cache mutation)."""
             ck = (s_a, s_b, skey)
-            if ck in skip_cache:
-                return skip_cache[ck]
+            cached = skip_cache.get(ck)
+            if cached is not None:
+                return cached
             sm_a = stripes_by_sec[s_a][skey]
             sm_b = stripes_by_sec[s_b][skey]
-            res = self._register_single_pair(
+            return self._register_single_pair(
                 ref_p0=sec_buf[s_a][skey][0],
                 mov_p0=sec_buf[s_b][skey][0],
                 prior_dy=sm_b.fy0 - sm_a.fy0,
                 prior_dx=sm_b.fx0 - sm_a.fx0,
                 orient=sm_a.orientation,
             )
-            skip_cache[ck] = res
-            return res
 
         def _extract_stripe_patches(
             sec_z: int,
@@ -1446,7 +1453,29 @@ class N2N25DOverlapDataset(Dataset):
                         if shard_quota is not None
                         else None
                     )
+
+                    # Deterministic per-shard tile subsetting in Pass 1 when sec_quota is small:
+                    # keeps both _v and _h of selected first_exposed_tile_ids so C3 & H4 stay intact
+                    # while cutting network TIFF reads & hop FFTs by ~5x.
+                    active_ftids: Optional[set[int]] = None
+                    if use_quotas and sec_quota is not None:
+                        all_ftids = sorted(
+                            {
+                                stripes_by_sec[sz][sk].first_exposed_tile_id
+                                for sz in secs_in_shard
+                                for sk in center_keys_by_sec[sz]
+                                if sk in stripes_by_sec[sz]
+                            }
+                        )
+                        target_ftids = max(10, math.ceil(sec_quota / 3) + 6)
+                        if len(all_ftids) > target_ftids:
+                            random.Random(
+                                _stable_seed(seed, "shard_ftids", shard_rel)
+                            ).shuffle(all_ftids)
+                            active_ftids = set(all_ftids[:target_ftids])
+
                     shard_kept = 0
+                    batch_n = max(4, self.prep_workers)
 
                     for sec_z in secs_in_shard:
                         if target_cap is not None and kept_count >= target_cap:
@@ -1457,21 +1486,31 @@ class N2N25DOverlapDataset(Dataset):
                         window_secs = set(range(sec_z - r, sec_z + r + 1))
                         _evict_sections_outside(window_secs)
                         for ws in sorted(window_secs):
-                            _ensure_section_loaded(ws)
+                            _ensure_section_loaded(ws, active_ftids)
 
                         # Compute all canonical 1-step hops needed for sec_z once (H4)
                         for s_hop in range(sec_z - r, sec_z + r):
-                            _compute_canonical_hop(s_hop, s_hop + 1)
+                            _compute_canonical_hop(s_hop, s_hop + 1, active_ftids)
 
                         # Candidate center stripes on sec_z in deterministic shuffled order
-                        cand_keys = list(center_keys_by_sec[sec_z])
+                        cand_keys = [
+                            sk
+                            for sk in center_keys_by_sec[sec_z]
+                            if active_ftids is None
+                            or stripes_by_sec[sec_z][sk].first_exposed_tile_id
+                            in active_ftids
+                        ]
                         random.Random(_stable_seed(seed, "sec_keys", sec_z)).shuffle(
                             cand_keys
                         )
 
-                        # Validate hops + cycle closure per candidate stripe (serially & deterministically)
-                        valid_triplets: List[
-                            Tuple[StripeKey, Dict[int, ShiftResult]]
+                        # Filter by precomputed hop_cache first (instant dict lookups)
+                        hop_passed: List[
+                            Tuple[
+                                StripeKey,
+                                Dict[int, ShiftResult],
+                                Optional[Tuple[ShiftResult, ShiftResult]],
+                            ]
                         ] = []
                         for skey in cand_keys:
                             hop_prev_res, hop_prev_rej = hop_cache[
@@ -1490,35 +1529,15 @@ class N2N25DOverlapDataset(Dataset):
                                     counters[hop_next_rej or "rejected_z_lock"] += 1
                                 continue
 
-                            # Shifts from z: z->z-1 is -hop(z-1->z), z->z+1 is hop(z->z+1)
                             shifts_from_z: Dict[int, ShiftResult] = {
                                 -1: hop_prev_res.negated(),
                                 1: hop_next_res,
                             }
-
-                            # C3 #2: Cycle closure verification
                             if r == 1:
-                                skip = _get_skip_shift(sec_z - 1, sec_z + 1, skey)
-                                # shift(z-1->z) + shift(z->z+1) == shift(z-1->z+1)
-                                c_err = max(
-                                    abs((hop_prev_res.dy + hop_next_res.dy) - skip.dy),
-                                    abs((hop_prev_res.dx + hop_next_res.dx) - skip.dx),
+                                hop_passed.append(
+                                    (skey, shifts_from_z, (hop_prev_res, hop_next_res))
                                 )
-                                if (
-                                    not is_confident_lock(
-                                        skip,
-                                        min_dog_ncc=min(0.12, self.z_align_min_dog_ncc),
-                                        min_psr=min(6.0, self.z_align_high_ncc_min_psr),
-                                        high_ncc_override=self.z_align_high_ncc_override,
-                                        high_ncc_min_psr=self.z_align_high_ncc_min_psr,
-                                    )
-                                    or c_err > self.z_align_closure_tol_px
-                                ):
-                                    if not use_skip_coords:
-                                        counters["rejected_z_closure"] += 1
-                                    continue
                             else:
-                                # R == 2: chained 1-hop + direct z->z+-2 closure check
                                 h_m2_res, h_m2_rej = hop_cache[
                                     (sec_z - 2, sec_z - 1)
                                 ].get(skey, (None, "rejected_z_lock"))
@@ -1534,30 +1553,62 @@ class N2N25DOverlapDataset(Dataset):
                                         counters[h_p2_rej or "rejected_z_lock"] += 1
                                     continue
 
-                                chain_m2 = ShiftResult(
+                                shifts_from_z[-2] = ShiftResult(
                                     dy=-(hop_prev_res.dy + h_m2_res.dy),
                                     dx=-(hop_prev_res.dx + h_m2_res.dx),
                                     dog_ncc=min(hop_prev_res.dog_ncc, h_m2_res.dog_ncc),
                                     psr=min(hop_prev_res.psr, h_m2_res.psr),
                                     valid=True,
                                 )
-                                chain_p2 = ShiftResult(
+                                shifts_from_z[2] = ShiftResult(
                                     dy=hop_next_res.dy + h_p2_res.dy,
                                     dx=hop_next_res.dx + h_p2_res.dx,
                                     dog_ncc=min(hop_next_res.dog_ncc, h_p2_res.dog_ncc),
                                     psr=min(hop_next_res.psr, h_p2_res.psr),
                                     valid=True,
                                 )
+                                hop_passed.append((skey, shifts_from_z, None))
 
-                                dir_m2 = _get_skip_shift(sec_z, sec_z - 2, skey)
-                                dir_p2 = _get_skip_shift(sec_z, sec_z + 2, skey)
+                        def _closure_and_extract(
+                            item: Tuple[
+                                StripeKey,
+                                Dict[int, ShiftResult],
+                                Optional[Tuple[ShiftResult, ShiftResult]],
+                            ],
+                        ) -> Tuple[
+                            bool,
+                            List[Tuple[int, int, np.ndarray, str, Optional[float]]],
+                            Dict[str, int],
+                        ]:
+                            skey, shifts_from_z, r1_hops = item
+                            if r == 1:
+                                assert r1_hops is not None
+                                h_prev, h_next = r1_hops
+                                skip = _compute_skip_shift(sec_z - 1, sec_z + 1, skey)
+                                c_err = max(
+                                    abs((h_prev.dy + h_next.dy) - skip.dy),
+                                    abs((h_prev.dx + h_next.dx) - skip.dx),
+                                )
+                                if (
+                                    not is_confident_lock(
+                                        skip,
+                                        min_dog_ncc=min(0.12, self.z_align_min_dog_ncc),
+                                        min_psr=min(6.0, self.z_align_high_ncc_min_psr),
+                                        high_ncc_override=self.z_align_high_ncc_override,
+                                        high_ncc_min_psr=self.z_align_high_ncc_min_psr,
+                                    )
+                                    or c_err > self.z_align_closure_tol_px
+                                ):
+                                    return False, [], {}
+                            else:
+                                dir_m2 = _compute_skip_shift(sec_z, sec_z - 2, skey)
+                                dir_p2 = _compute_skip_shift(sec_z, sec_z + 2, skey)
+                                ch_m2, ch_p2 = shifts_from_z[-2], shifts_from_z[2]
                                 err_m2 = max(
-                                    abs(chain_m2.dy - dir_m2.dy),
-                                    abs(chain_m2.dx - dir_m2.dx),
+                                    abs(ch_m2.dy - dir_m2.dy), abs(ch_m2.dx - dir_m2.dx)
                                 )
                                 err_p2 = max(
-                                    abs(chain_p2.dy - dir_p2.dy),
-                                    abs(chain_p2.dx - dir_p2.dx),
+                                    abs(ch_p2.dy - dir_p2.dy), abs(ch_p2.dx - dir_p2.dx)
                                 )
                                 lock_m2 = is_confident_lock(
                                     dir_m2,
@@ -1579,58 +1630,70 @@ class N2N25DOverlapDataset(Dataset):
                                     or err_m2 > self.z_align_closure_tol_px
                                     or err_p2 > self.z_align_closure_tol_px
                                 ):
+                                    return False, [], {}
+
+                            kept_l, lrej_d = _extract_stripe_patches(
+                                sec_z,
+                                skey,
+                                shifts_from_z,
+                                pass_stripe_cap,
+                                use_skip_coords,
+                            )
+                            return True, kept_l, lrej_d
+
+                        # Batched parallel closure + extraction with immediate quota early-stop
+                        sec_kept = 0
+                        for b_start in range(0, len(hop_passed), batch_n):
+                            batch_items = hop_passed[b_start : b_start + batch_n]
+                            if pool is not None and len(batch_items) > 1:
+                                batch_res = list(
+                                    pool.map(_closure_and_extract, batch_items)
+                                )
+                            else:
+                                batch_res = [
+                                    _closure_and_extract(it) for it in batch_items
+                                ]
+
+                            for (skey, _, _), (closure_ok, kept_list, lrej) in zip(
+                                batch_items, batch_res
+                            ):
+                                if not closure_ok:
                                     if not use_skip_coords:
                                         counters["rejected_z_closure"] += 1
                                     continue
-
-                                shifts_from_z[-2] = chain_m2
-                                shifts_from_z[2] = chain_p2
-
-                            valid_triplets.append((skey, shifts_from_z))
-
-                        # Extract patches (optionally in parallel across stripes, emitted in deterministic order)
-                        if pool is not None and len(valid_triplets) > 1:
-                            futs = [
-                                pool.submit(
-                                    _extract_stripe_patches,
-                                    sec_z,
-                                    skey,
-                                    smap,
-                                    pass_stripe_cap,
-                                    use_skip_coords,
-                                )
-                                for skey, smap in valid_triplets
-                            ]
-                            ext_results = [f.result() for f in futs]
-                        else:
-                            ext_results = [
-                                _extract_stripe_patches(
-                                    sec_z, skey, smap, pass_stripe_cap, use_skip_coords
-                                )
-                                for skey, smap in valid_triplets
-                            ]
-
-                        sec_kept = 0
-                        for (skey, _), (kept_list, lrej) in zip(
-                            valid_triplets, ext_results
-                        ):
-                            for rk, rv in lrej.items():
-                                counters[rk] += rv
-                            for y0, x0, stack_u8, tile_id, score in kept_list:
-                                if target_cap is not None and kept_count >= target_cap:
-                                    break
+                                for rk, rv in lrej.items():
+                                    counters[rk] += rv
+                                for y0, x0, stack_u8, tile_id, score in kept_list:
+                                    if (
+                                        target_cap is not None
+                                        and kept_count >= target_cap
+                                    ):
+                                        break
+                                    if (
+                                        shard_quota is not None
+                                        and shard_kept >= shard_quota
+                                    ):
+                                        break
+                                    if sec_quota is not None and sec_kept >= sec_quota:
+                                        break
+                                    _emit(sec_z, skey, y0, x0, stack_u8, tile_id, score)
+                                    shard_kept += 1
+                                    sec_kept += 1
+                                    if target_cap is not None:
+                                        pbar.update(1)
                                 if (
-                                    shard_quota is not None
-                                    and shard_kept >= shard_quota
+                                    (
+                                        target_cap is not None
+                                        and kept_count >= target_cap
+                                    )
+                                    or (
+                                        shard_quota is not None
+                                        and shard_kept >= shard_quota
+                                    )
+                                    or (sec_quota is not None and sec_kept >= sec_quota)
                                 ):
                                     break
-                                if sec_quota is not None and sec_kept >= sec_quota:
-                                    break
-                                _emit(sec_z, skey, y0, x0, stack_u8, tile_id, score)
-                                shard_kept += 1
-                                sec_kept += 1
-                                if target_cap is not None:
-                                    pbar.update(1)
+
                             if (
                                 (target_cap is not None and kept_count >= target_cap)
                                 or (
@@ -1644,8 +1707,10 @@ class N2N25DOverlapDataset(Dataset):
                         if target_cap is None:
                             pbar.update(len(cand_keys))
 
-                    # Evict section buffers between shards
+                    # Clear per-shard caches so active_ftids subsets stay strictly isolated
                     sec_buf.clear()
+                    hop_cache.clear()
+                    skip_cache.clear()
             finally:
                 pbar.close()
 
