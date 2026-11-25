@@ -35,7 +35,7 @@ n2n:
   max_cache_tiles: 32            # Max full tiles kept in per-worker LRU cache when training.cache_in_ram is false
   augment_rot90: true           # false = H/V flips only (preserves scan-axis noise anisotropy) | true = also 90-deg rotations
   align_patches: true            # true = per-patch FFT integer-shift registration | false = raw coordinates
-  align_max_shift_px: 16         # Max integer shift (px) searched per axis when align_patches is true
+  align_max_shift_px: 8         # Max integer shift (px) searched per axis when align_patches is true
   align_blur_sigma: 1.0          # Gaussian smoothing sigma (px) used only for shift estimation
   patch_sampling: "random"       # "random" (1 random crop per pair per epoch) | "tile" (full-tile grid with tile_stride)
   tile_stride: null              # Stride (px) when patch_sampling == "tile" (null = patch_size, non-overlapping)

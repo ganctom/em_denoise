@@ -2029,7 +2029,24 @@ def main() -> None:
     checkpoint = torch.load(
         best_checkpoint_path, map_location=device, weights_only=False
     )
-    getattr(model, "_orig_mod", model).load_state_dict(checkpoint["model_state_dict"])
+    state_dict = checkpoint["model_state_dict"]
+    if (
+        model_type.lower().strip() in ("residual_unet", "res_unet", "residual")
+        and "down_samples.0.conv.bias" in state_dict
+        and "down_samples.0.norm.weight" not in state_dict
+    ):
+        logger.info(
+            "Detected legacy ResidualUNet checkpoint (pre-normalized transitions); "
+            "rebuilding model with norm_transitions=False."
+        )
+        model = build_model(
+            model_type=model_type,
+            in_channels=1,
+            out_channels=1,
+            base_dim=base_dim,
+            norm_transitions=False,
+        ).to(device)
+    getattr(model, "_orig_mod", model).load_state_dict(state_dict)
 
     custom_input_dir = (
         Path(args.input_dir)

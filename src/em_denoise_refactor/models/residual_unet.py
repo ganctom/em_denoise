@@ -17,6 +17,7 @@ class UNetConfig:
     num_res_blocks: int = 2
     dropout_rate: float = 0.0
     global_residual: bool = True
+    norm_transitions: bool = True
 
 
 def _group_count(channels: int) -> int:
@@ -32,7 +33,13 @@ class ResBlock(nn.Module):
     Pre-activation Residual Block using GroupNorm and GELU.
     """
 
-    def __init__(self, in_channels: int, out_channels: int, dropout: float = 0.0):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        dropout: float = 0.0,
+        norm_transitions: bool = True,
+    ):
         super().__init__()
         num_groups = _group_count(in_channels)
         out_groups = _group_count(out_channels)
@@ -52,11 +59,16 @@ class ResBlock(nn.Module):
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
         if in_channels != out_channels:
-            # Normalize channel-changing shortcuts so skip variance stays O(1) across stages.
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
-                nn.GroupNorm(num_groups=out_groups, num_channels=out_channels),
-            )
+            if norm_transitions:
+                # Normalize channel-changing shortcuts so skip variance stays O(1) across stages.
+                self.shortcut = nn.Sequential(
+                    nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+                    nn.GroupNorm(num_groups=out_groups, num_channels=out_channels),
+                )
+            else:
+                self.shortcut = nn.Conv2d(
+                    in_channels, out_channels, kernel_size=1, bias=False
+                )
         else:
             self.shortcut = nn.Identity()
 
@@ -68,15 +80,22 @@ class ResBlock(nn.Module):
 
 
 class Downsample(nn.Module):
-    """Strided convolution with GroupNorm to keep multi-scale skip variance O(1)."""
+    """Strided convolution with optional GroupNorm to keep multi-scale skip variance O(1)."""
 
-    def __init__(self, channels: int):
+    def __init__(self, channels: int, norm_transitions: bool = True):
         super().__init__()
         self.conv = nn.Conv2d(
-            channels, channels, kernel_size=3, stride=2, padding=1, bias=False
+            channels,
+            channels,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            bias=not norm_transitions,
         )
-        self.norm = nn.GroupNorm(
-            num_groups=_group_count(channels), num_channels=channels
+        self.norm: nn.Module = (
+            nn.GroupNorm(num_groups=_group_count(channels), num_channels=channels)
+            if norm_transitions
+            else nn.Identity()
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -84,15 +103,25 @@ class Downsample(nn.Module):
 
 
 class Upsample(nn.Module):
-    """Bilinear interpolation followed by convolution and GroupNorm to keep skip variance O(1)."""
+    """Bilinear interpolation followed by convolution and optional GroupNorm to keep skip variance O(1)."""
 
-    def __init__(self, in_channels: int, out_channels: int):
+    def __init__(
+        self, in_channels: int, out_channels: int, norm_transitions: bool = True
+    ):
         super().__init__()
         self.conv = nn.Conv2d(
-            in_channels, out_channels, kernel_size=3, padding=1, bias=False
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            padding=1,
+            bias=not norm_transitions,
         )
-        self.norm = nn.GroupNorm(
-            num_groups=_group_count(out_channels), num_channels=out_channels
+        self.norm: nn.Module = (
+            nn.GroupNorm(
+                num_groups=_group_count(out_channels), num_channels=out_channels
+            )
+            if norm_transitions
+            else nn.Identity()
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -126,18 +155,35 @@ class ResidualUNet(nn.Module):
             out_ch = config.base_channels * mult
             blocks = nn.Sequential(
                 *[
-                    ResBlock(in_ch if i == 0 else out_ch, out_ch, config.dropout_rate)
+                    ResBlock(
+                        in_ch if i == 0 else out_ch,
+                        out_ch,
+                        config.dropout_rate,
+                        norm_transitions=config.norm_transitions,
+                    )
                     for i in range(config.num_res_blocks)
                 ]
             )
             self.down_blocks.append(blocks)
-            self.down_samples.append(Downsample(out_ch))
+            self.down_samples.append(
+                Downsample(out_ch, norm_transitions=config.norm_transitions)
+            )
             in_ch = out_ch
 
         # --- Bottleneck ---
         self.bottleneck = nn.Sequential(
-            ResBlock(in_ch, in_ch, config.dropout_rate),
-            ResBlock(in_ch, in_ch, config.dropout_rate),
+            ResBlock(
+                in_ch,
+                in_ch,
+                config.dropout_rate,
+                norm_transitions=config.norm_transitions,
+            ),
+            ResBlock(
+                in_ch,
+                in_ch,
+                config.dropout_rate,
+                norm_transitions=config.norm_transitions,
+            ),
         )
 
         # --- Decoder ---
@@ -146,7 +192,9 @@ class ResidualUNet(nn.Module):
             out_ch = config.base_channels * mult
             skip_ch = config.base_channels * reversed_mults[i]
 
-            self.up_blocks.append(Upsample(in_ch, out_ch))
+            self.up_blocks.append(
+                Upsample(in_ch, out_ch, norm_transitions=config.norm_transitions)
+            )
 
             blocks = nn.Sequential(
                 *[
@@ -154,6 +202,7 @@ class ResidualUNet(nn.Module):
                         out_ch + skip_ch if j == 0 else out_ch,
                         out_ch,
                         config.dropout_rate,
+                        norm_transitions=config.norm_transitions,
                     )
                     for j in range(config.num_res_blocks)
                 ]

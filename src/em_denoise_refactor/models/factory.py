@@ -42,6 +42,7 @@ def build_model(
             channel_multipliers=(1, 2, 4, 8),
             num_res_blocks=2,
             global_residual=True,
+            norm_transitions=kwargs.get("norm_transitions", True),
         )
         return ResidualUNet(config=config)
     elif m_type in ("modern_unet", "modern"):
