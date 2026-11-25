@@ -74,10 +74,11 @@ class Custom25DTIFFStackDataset(Dataset):
         z_register: bool = True,
         z_register_max_shift_px: int = 64,
         z_register_block_size: int = 1024,
-        min_dog_ncc: float = 0.15,
-        min_psr: float = 7.0,
+        min_dog_ncc: float = 0.05,
+        min_psr: float = 7.5,
         high_ncc_override: float = 0.45,
-        high_ncc_min_psr: float = 5.5,
+        high_ncc_min_psr: float = 6.0,
+        max_dog_ncc: float = 0.70,
         closure_tol_px: int = 3,
     ) -> None:
         self.image_dir = Path(image_dir)
@@ -98,6 +99,7 @@ class Custom25DTIFFStackDataset(Dataset):
         self.min_psr = float(min_psr)
         self.high_ncc_override = float(high_ncc_override)
         self.high_ncc_min_psr = float(high_ncc_min_psr)
+        self.max_dog_ncc = float(max_dog_ncc)
         self.closure_tol_px = int(closure_tol_px)
 
         all_files = sorted(
@@ -157,6 +159,9 @@ class Custom25DTIFFStackDataset(Dataset):
         )
 
     def _is_ok(self, res: ShiftResult) -> bool:
+        if res.dog_ncc > self.max_dog_ncc:
+            # Thin/missed cut: reject neighbor so network does not average two near-identical slices
+            return False
         return is_confident_lock(
             res,
             min_dog_ncc=self.min_dog_ncc,

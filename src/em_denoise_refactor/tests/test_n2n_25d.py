@@ -883,7 +883,11 @@ def test_custom_25d_raw_tile_inference_dataset(tmp_path: Path):
     )
 
     ds = Custom25DTIFFStackDataset(
-        raw_dir, z_context_radius=1, z_register=True, z_register_max_shift_px=24
+        raw_dir,
+        z_context_radius=1,
+        z_register=True,
+        z_register_max_shift_px=24,
+        max_dog_ncc=1.01,
     )
     assert len(ds) == 5
 
@@ -908,3 +912,14 @@ def test_custom_25d_raw_tile_inference_dataset(tmp_path: Path):
     loader = torch.utils.data.DataLoader(ds, batch_size=1, num_workers=1)
     with pytest.raises(RuntimeError, match="num_workers=0"):
         next(iter(loader))
+
+    # Thin/missed-cut guard (max_dog_ncc=0.70): identical-canvas neighbors must be center-filled
+    ds_thin = Custom25DTIFFStackDataset(
+        raw_dir,
+        z_context_radius=1,
+        z_register=True,
+        z_register_max_shift_px=24,
+        max_dog_ncc=0.70,
+    )
+    x_thin, _, _ = ds_thin[1]
+    assert torch.allclose(x_thin[0], x_thin[1]) and torch.allclose(x_thin[2], x_thin[1])
