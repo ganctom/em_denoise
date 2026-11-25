@@ -1,0 +1,112 @@
+# Cluster Pipeline Configuration for Tier 3 True 2.5D Noise2Noise (R=1: 3-slice [z-1, z_first, z+1] -> z_second)
+#
+# Controlled A/B Protocol (C1):
+#   - Arm 0 (Same-patch 2D baseline): set `n2n.z_context_view: "center_only"` on this exact cache
+#   - Arm 1 (3-slice 2.5D stripe-rigid): `z_context_radius: 1`, `z_context_view: "full"`, `z_align_local_refine_px: 0`
+#   - Arm 2 (Local Z-refine benchmark): Arm 1 with `z_align_local_refine_px: 4`
+#   - Arm 3 (5-slice 2.5D): `z_context_radius: 2`, `z_context_view: "full"`
+
+experiment:
+  name: "20_n2n_25d_r1_resunet_dim48_mse_100k_stripe_rigid"
+  output_dir: "/tachyon/groups/scratch/gmicro_sem/gfriedri/tgan/n2n_runs"
+
+data:
+  sbem_root: "/tachyon/groups/scratch/gmicro_sem/gfriedri/_EM_acquisitions/20260201_RoLi_F1/"
+  grid_num: 0
+  first_sec: 1250
+  last_sec: 8000
+
+splitting:
+  strategy: "block"           # Required for 2.5D (prevents Z-leakage across train/val/test)
+  origin: 0                   # Absolute block-grid anchor (C4: invariant across first_sec & superset slices)
+  block_size: 100
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+  guard_band_size: 5          # Must be >= z_context_radius (guarantees disjoint Z-support sets)
+
+extraction:
+  patch_size: 128
+
+n2n:
+  enabled: true
+  source: "overlaps"
+  overlaps_dir: "/tachyon/groups/scratch/gmicro_sem/gfriedri/_processing/SOFIMA/nextflow/ganctoma/gfriedri-em-alignment-flows/runs/roli-f1/all-01240_22814/_inspect/overlaps/2026_11_10_n2n_training_data"
+  pair_direction: "first_to_second"   # Required for 2.5D: all input slices are virgin single-exposure page 0
+  orientation: "all"
+  max_train_pairs: 100000
+  max_val_pairs: 10000
+  max_test_pairs: 10000
+  seed: 42
+  augment_rot90: false                # Preserve SBF-SEM horizontal fast-scan noise anisotropy
+  align_patches: true
+  align_subpixel: false               # Benchmark true separately once 2.5D gain is established
+  align_max_shift_px: 8
+  align_blur_sigma: 1.0
+  patch_sampling: "tile"
+  tile_stride: null
+  trim_enabled: true
+  v_trim_top_px: 25                   # Keep <= 25 for 2.5D so shifted vertical stripes retain >= 128 px
+  v_trim_left_px: 500
+  v_trim_bottom_px: 0
+  v_trim_right_px: 0
+  h_trim_left_px: 24                  # Recovers ~54%+ of horizontal stripes for 2.5D
+  h_trim_top_px: 0
+  h_trim_bottom_px: 0
+  h_trim_right_px: 0
+  quality_filter_enabled: true
+  quality_metric: "ncc"
+  min_pair_quality: 0.60
+  quality_blur_sigma: 1.5
+  min_patch_std: 0.0
+  crop_cache_dir: "/tachyon/groups/scratch/gmicro_sem/gfriedri/tgan/n2n_crop_cache_25d"
+  max_tiles_per_stripe: null
+  prep_workers: 8
+  streaming: false
+  # True 2.5D N2N settings (Phase 0 locked thresholds)
+  z_context_radius: 1                 # 1 = 3-slice [z-1, z_first, z+1]; 2 = 5-slice [z-2..z+2]
+  z_context_view: "full"              # "full" | "center_only" (same-patch 2D control) | "center_filled" (ablation)
+  z_eval_radius: null                 # Set 1 when evaluating an R=1 model on a frozen R=2 cache
+  z_neighbor_dropout_prob: 0.15
+  z_flip_augment: false               # Default false (SBEM subsurface BSE asymmetry)
+  z_align_prior_search_px: 32
+  z_align_min_dog_ncc: 0.15
+  z_align_min_psr: 7.5
+  z_align_high_ncc_override: 0.45
+  z_align_high_ncc_min_psr: 6.0
+  z_align_missed_cut_max_ncc: 0.85
+  z_align_closure_tol_px: 2
+  z_align_tile_consistency_tol_px: 2
+  z_align_consensus_tol_px: 12.0
+  z_align_local_refine_px: 0          # 0 = stripe-rigid default; benchmark against 4
+
+model:
+  model_type: "residual_unet"
+  base_dim: 48
+
+training:
+  batch_size: 128
+  epochs: 30
+  learning_rate: 0.0003
+  lr_scheduler: "cosine"
+  lr_min: 0.000001
+  warmup_epochs: 2
+  seed: 42
+  cache_in_ram: true
+  samples_per_epoch: null
+  device: "cuda"
+  num_workers: 4
+  save_all_epochs: false
+  compile_model: true
+
+loss:
+  loss_type: "composite"
+  mse_weight: 1.0
+  edge_weight: 0.0
+  ssim_weight: 0.0
+
+inference:
+  custom_input_dir: null
+  preview_image: null
+  preview_crop_size: 512
+  tiled: true

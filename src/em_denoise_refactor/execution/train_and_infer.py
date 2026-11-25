@@ -37,6 +37,10 @@ from em_denoise_refactor.data.n2n_dataset import (
     N2NOverlapPairDataset,
     N2NStreamingShardDataset,
 )
+from em_denoise_refactor.data.n2n_25d_dataset import (
+    N2N25DOverlapDataset,
+    assert_disjoint_z_supports,
+)
 from em_denoise_refactor.data.n2n_duplicate_dataset import N2NDuplicateTileDataset
 from em_denoise_refactor.execution.calibration import run_calibration
 from em_denoise_refactor.models.factory import build_model
@@ -724,8 +728,10 @@ class DenoisingTrainer:
                     batch_size = noisy_b.size(0)
                     pred_clamp = torch.clamp(pred_b.float(), 0.0, 1.0)
                     clean_f = clean_b.float()
+                    c_center = noisy_b.shape[1] // 2
+                    noisy_center_f = noisy_b[:, c_center : c_center + 1].float()
                     raw_pair_mse = float(
-                        torch.mean((noisy_b.float() - clean_f) ** 2).item()
+                        torch.mean((noisy_center_f - clean_f) ** 2).item()
                     )
                     mse_per_sample = torch.mean(
                         (pred_clamp - clean_f) ** 2, dim=(1, 2, 3)
@@ -785,6 +791,8 @@ class DenoisingTrainer:
         scheduler: Optional[Any] = None,
         config: Optional[Dict[str, Any]] = None,
         save_all_epochs: bool = True,
+        in_channels: int = 1,
+        z_context_radius: int = 0,
     ) -> Path:
         raw_model = getattr(self.model, "_orig_mod", self.model)
         state = {
@@ -795,6 +803,8 @@ class DenoisingTrainer:
                 scheduler.state_dict() if scheduler is not None else None
             ),
             "config": config,
+            "in_channels": int(in_channels),
+            "z_context_radius": int(z_context_radius),
             "val_loss": val_loss,
             "val_psnr": val_psnr,
             "val_ssim": val_ssim,
@@ -863,8 +873,8 @@ class DenoisingEvaluator:
         stride_h = max(1, eff_h // 2)
         stride_w = max(1, eff_w // 2)
 
-        output = torch.zeros_like(x, dtype=torch.float32)
-        weight_sum = torch.zeros_like(x, dtype=torch.float32)
+        output = torch.zeros((B, 1, H, W), device=x.device, dtype=torch.float32)
+        weight_sum = torch.zeros((B, 1, H, W), device=x.device, dtype=torch.float32)
 
         # Separable 2D Hann window for smooth cosine blending across rectangular tile boundaries
         wy = torch.hann_window(eff_h, periodic=False, device=x.device)
@@ -944,9 +954,11 @@ class DenoisingEvaluator:
                     pred_b = self.model(noisy_b)
 
                 pred_b = torch.clamp(pred_b.float(), 0.0, 1.0)
+                c_center = noisy_b.shape[1] // 2
+                noisy_center_b = noisy_b[:, c_center : c_center + 1]
 
                 clean_np = clean_b.squeeze().cpu().numpy()
-                noisy_np = noisy_b.squeeze().cpu().numpy()
+                noisy_np = noisy_center_b.squeeze().cpu().numpy()
                 denoised_np = pred_b.squeeze().cpu().numpy()
                 denoised_uint8 = np.clip(denoised_np * 255.0, 0, 255).astype(np.uint8)
 
@@ -966,22 +978,26 @@ class DenoisingEvaluator:
                     EvaluationMetrics.compute_ssim(denoised_np, clean_np)
                 )
 
-                # Specialized loss metrics
-                noisy_charbs.append(float(self.charbonnier_fn(noisy_b, clean_b).item()))
+                # Specialized loss metrics (evaluated against center channel)
+                noisy_charbs.append(
+                    float(self.charbonnier_fn(noisy_center_b, clean_b).item())
+                )
                 denoised_charbs.append(
                     float(self.charbonnier_fn(pred_b, clean_b).item())
                 )
 
-                noisy_laps.append(float(self.laplacian_fn(noisy_b, clean_b).item()))
+                noisy_laps.append(
+                    float(self.laplacian_fn(noisy_center_b, clean_b).item())
+                )
                 denoised_laps.append(float(self.laplacian_fn(pred_b, clean_b).item()))
 
-                noisy_ffls.append(float(self.ffl_fn(noisy_b, clean_b).item()))
+                noisy_ffls.append(float(self.ffl_fn(noisy_center_b, clean_b).item()))
                 denoised_ffls.append(float(self.ffl_fn(pred_b, clean_b).item()))
 
-                noisy_espis.append(float(self.espi_fn(noisy_b, clean_b).item()))
+                noisy_espis.append(float(self.espi_fn(noisy_center_b, clean_b).item()))
                 denoised_espis.append(float(self.espi_fn(pred_b, clean_b).item()))
 
-                noisy_edges.append(float(self.sobel_fn(noisy_b, clean_b).item()))
+                noisy_edges.append(float(self.sobel_fn(noisy_center_b, clean_b).item()))
                 denoised_edges.append(float(self.sobel_fn(pred_b, clean_b).item()))
 
                 out_fname = (
@@ -990,6 +1006,16 @@ class DenoisingEvaluator:
                     else f"{fname}.tif"
                 )
                 tifffile.imwrite(output_denoised_dir / out_fname, denoised_uint8)
+
+        # Persist per-sample MSEs for paired bootstrap CIs (C1)
+        np.save(
+            output_denoised_dir / "per_sample_denoised_mse.npy",
+            np.asarray(denoised_mses, dtype=np.float64),
+        )
+        np.save(
+            output_denoised_dir / "per_sample_noisy_mse.npy",
+            np.asarray(noisy_mses, dtype=np.float64),
+        )
 
         mean_noisy_mse = float(np.mean(noisy_mses))
         mean_denoised_mse = float(np.mean(denoised_mses))
@@ -1029,22 +1055,69 @@ def _load_preview_crop(
     crop_size: int = 512,
     crop_y: Optional[int] = None,
     crop_x: Optional[int] = None,
+    in_channels: int = 1,
 ) -> np.ndarray:
-    """Load a fixed 2D float32 [0, 1] crop from a raw TIFF for checkpoint previews."""
-    arr = tifffile.imread(str(image_path))
-    if arr.ndim > 2:
-        arr = arr[0]
-    h, w = arr.shape
+    """Load a fixed 2D `(H, W)` or 2.5D `(C, H, W)` float32 `[0, 1]` crop for checkpoint previews."""
+    import re
+
+    def _read_norm_crop(path: Path, y0: int, x0: int, cs: int) -> np.ndarray:
+        arr = tifffile.imread(str(path))
+        if arr.ndim > 2:
+            arr = arr[0]
+        crop = arr[y0 : y0 + cs, x0 : x0 + cs]
+        if crop.dtype == np.uint8:
+            return crop.astype(np.float32) / 255.0
+        crop_f = crop.astype(np.float32)
+        if crop_f.max() > 1.0:
+            crop_f = crop_f / 255.0
+        return np.clip(crop_f, 0.0, 1.0)
+
+    arr0 = tifffile.imread(str(image_path))
+    if arr0.ndim > 2:
+        arr0 = arr0[0]
+    h, w = arr0.shape
     cs = min(crop_size, h, w)
     y0 = (h - cs) // 2 if crop_y is None else min(max(0, crop_y), h - cs)
     x0 = (w - cs) // 2 if crop_x is None else min(max(0, crop_x), w - cs)
-    crop = arr[y0 : y0 + cs, x0 : x0 + cs]
-    if crop.dtype == np.uint8:
-        return crop.astype(np.float32) / 255.0
-    crop_f = crop.astype(np.float32)
-    if crop_f.max() > 1.0:
-        crop_f = crop_f / 255.0
-    return np.clip(crop_f, 0.0, 1.0)
+    center_crop = _read_norm_crop(image_path, y0, x0, cs)
+
+    if in_channels <= 1:
+        return center_crop
+
+    radius = in_channels // 2
+    stack = np.repeat(center_crop[None, ...], in_channels, axis=0)
+    match = re.search(r"(_s)(\d+)(\.tiff?)$", image_path.name, flags=re.IGNORECASE)
+    if match is None:
+        logger.warning(
+            f"2.5D preview_image '{image_path.name}' has no '_sNNNNN' section token; "
+            f"repeating center slice across {in_channels} channels."
+        )
+        return stack
+
+    prefix = image_path.name[: match.start(2)]
+    sec_str = match.group(2)
+    suffix = match.group(3)
+    sec_num = int(sec_str)
+    width_digits = len(sec_str)
+    missing = []
+    for idx_ch, d in enumerate(range(-radius, radius + 1)):
+        if d == 0:
+            continue
+        nb_name = f"{prefix}{sec_num + d:0{width_digits}d}{suffix}"
+        nb_path = image_path.parent / nb_name
+        if nb_path.is_file():
+            try:
+                stack[idx_ch] = _read_norm_crop(nb_path, y0, x0, cs)
+            except Exception:
+                missing.append(nb_name)
+        else:
+            missing.append(nb_name)
+    if missing:
+        logger.warning(
+            f"2.5D preview missing sibling neighbor(s) {missing} in {image_path.parent}; "
+            "using center-fill for missing channels."
+        )
+    return stack
 
 
 def save_comparison_panel(
@@ -1097,18 +1170,22 @@ def _save_checkpoint_preview(
     device: torch.device,
     writer: Optional[Any] = None,
 ) -> Dict[str, float]:
-    """Denoise a fixed raw crop and save TIFF + 3-panel PNG + TensorBoard images."""
+    """Denoise a fixed raw 2D `(H, W)` or 2.5D `(C, H, W)` crop and save TIFF + 3-panel PNG."""
     previews_dir.mkdir(parents=True, exist_ok=True)
+    center_crop = raw_crop[raw_crop.shape[0] // 2] if raw_crop.ndim == 3 else raw_crop
     if epoch == 1:
-        raw_u8 = np.clip(raw_crop * 255.0, 0, 255).astype(np.uint8)
+        raw_u8 = np.clip(center_crop * 255.0, 0, 255).astype(np.uint8)
         tifffile.imwrite(str(previews_dir / "raw_crop.tif"), raw_u8)
         if writer is not None:
-            writer.add_image("Preview/Raw", raw_crop[None, ...], global_step=0)
+            writer.add_image("Preview/Raw", center_crop[None, ...], global_step=0)
 
     was_training = model.training
     model.eval()
     with torch.no_grad():
-        inp = torch.from_numpy(raw_crop).unsqueeze(0).unsqueeze(0).to(device)
+        if raw_crop.ndim == 3:
+            inp = torch.from_numpy(raw_crop).unsqueeze(0).to(device)
+        else:
+            inp = torch.from_numpy(raw_crop).unsqueeze(0).unsqueeze(0).to(device)
         if hasattr(model, "ar_decoder"):
             pred = model.denoise(inp)
         else:
@@ -1121,7 +1198,7 @@ def _save_checkpoint_preview(
     tifffile.imwrite(str(previews_dir / f"epoch_{epoch:03d}.tif"), denoised_u8)
 
     stats = save_comparison_panel(
-        raw_255=raw_crop * 255.0,
+        raw_255=center_crop * 255.0,
         denoised_255=denoised * 255.0,
         out_path=previews_dir / f"epoch_{epoch:03d}_comparison.png",
         denoised_title=f"Denoised (Epoch {epoch:02d})",
@@ -1240,13 +1317,107 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _resolve_model_in_channels(
+    cfg: PipelineConfig, is_n2n_mode: bool
+) -> Tuple[int, int]:
+    """Return `(in_channels, z_context_radius)` resolved from config."""
+    if not is_n2n_mode:
+        return 1, 0
+    z_radius = int(getattr(cfg.n2n, "z_context_radius", 0))
+    if z_radius == 0:
+        return 1, 0
+    view = str(getattr(cfg.n2n, "z_context_view", "full")).lower().strip()
+    if view == "center_only":
+        return 1, z_radius
+    z_eval_r = getattr(cfg.n2n, "z_eval_radius", None)
+    eff_r = int(z_eval_r) if z_eval_r is not None else z_radius
+    return 2 * eff_r + 1, z_radius
+
+
+def _infer_checkpoint_in_channels(checkpoint: Dict[str, Any]) -> Optional[int]:
+    """Infer expected model `in_channels` from checkpoint metadata or first-layer weights."""
+    if checkpoint.get("in_channels") is not None:
+        return int(checkpoint["in_channels"])
+    state_dict = checkpoint.get("model_state_dict", {})
+    for key in ("init_conv.weight", "intro.weight", "enc1.conv1.weight"):
+        if key in state_dict and state_dict[key].ndim == 4:
+            return int(state_dict[key].shape[1])
+    return None
+
+
 def _build_n2n_overlap_dataset(
     cfg: PipelineConfig,
     split: str,
     max_pairs: Optional[int],
     augment: bool,
-) -> N2NOverlapPairDataset:
-    """Build an N2NOverlapPairDataset from PipelineConfig for a given split."""
+) -> Dataset:
+    """Build an N2NOverlapPairDataset (2D) or N2N25DOverlapDataset (2.5D) from PipelineConfig."""
+    z_radius = int(getattr(cfg.n2n, "z_context_radius", 0))
+    if z_radius > 0:
+        assert cfg.splitting.origin is not None
+        return N2N25DOverlapDataset(
+            overlaps_dir=Path(cfg.n2n.overlaps_dir),
+            split=split,
+            patch_size=cfg.extraction.patch_size,
+            z_context_radius=z_radius,
+            z_context_view=getattr(cfg.n2n, "z_context_view", "full"),
+            z_eval_radius=getattr(cfg.n2n, "z_eval_radius", None),
+            z_neighbor_dropout_prob=getattr(cfg.n2n, "z_neighbor_dropout_prob", 0.15),
+            z_flip_augment=getattr(cfg.n2n, "z_flip_augment", False),
+            first_sec=cfg.data.first_sec,
+            last_sec=cfg.data.last_sec,
+            split_strategy=cfg.splitting.strategy,
+            block_size=cfg.splitting.block_size,
+            train_ratio=cfg.splitting.train_ratio,
+            val_ratio=cfg.splitting.val_ratio,
+            guard_band_size=cfg.splitting.guard_band_size,
+            split_origin=int(cfg.splitting.origin),
+            orientation=cfg.n2n.orientation,
+            max_pairs=max_pairs,
+            cache_in_ram=cfg.training.cache_in_ram,
+            augment=augment,
+            augment_rot90=cfg.n2n.augment_rot90 if augment else False,
+            seed=cfg.n2n.seed,
+            align_patches=cfg.n2n.align_patches,
+            align_subpixel=getattr(cfg.n2n, "align_subpixel", False),
+            align_max_shift_px=cfg.n2n.align_max_shift_px,
+            align_blur_sigma=cfg.n2n.align_blur_sigma,
+            tile_stride=cfg.n2n.tile_stride,
+            trim_enabled=cfg.n2n.trim_enabled,
+            v_trim_top_px=cfg.n2n.v_trim_top_px,
+            v_trim_left_px=cfg.n2n.v_trim_left_px,
+            v_trim_bottom_px=cfg.n2n.v_trim_bottom_px,
+            v_trim_right_px=cfg.n2n.v_trim_right_px,
+            h_trim_left_px=cfg.n2n.h_trim_left_px,
+            h_trim_top_px=cfg.n2n.h_trim_top_px,
+            h_trim_bottom_px=cfg.n2n.h_trim_bottom_px,
+            h_trim_right_px=cfg.n2n.h_trim_right_px,
+            quality_filter_enabled=cfg.n2n.quality_filter_enabled,
+            quality_metric=cfg.n2n.quality_metric,
+            min_pair_quality=cfg.n2n.min_pair_quality,
+            quality_blur_sigma=cfg.n2n.quality_blur_sigma,
+            min_patch_std=getattr(cfg.n2n, "min_patch_std", 0.0),
+            crop_cache_dir=getattr(cfg.n2n, "crop_cache_dir", None),
+            max_tiles_per_stripe=getattr(cfg.n2n, "max_tiles_per_stripe", None),
+            prep_workers=getattr(cfg.n2n, "prep_workers", 1),
+            z_align_prior_search_px=getattr(cfg.n2n, "z_align_prior_search_px", 32),
+            z_align_min_dog_ncc=getattr(cfg.n2n, "z_align_min_dog_ncc", 0.15),
+            z_align_min_psr=getattr(cfg.n2n, "z_align_min_psr", 7.5),
+            z_align_high_ncc_override=getattr(
+                cfg.n2n, "z_align_high_ncc_override", 0.45
+            ),
+            z_align_high_ncc_min_psr=getattr(cfg.n2n, "z_align_high_ncc_min_psr", 6.0),
+            z_align_missed_cut_max_ncc=getattr(
+                cfg.n2n, "z_align_missed_cut_max_ncc", 0.85
+            ),
+            z_align_closure_tol_px=getattr(cfg.n2n, "z_align_closure_tol_px", 2),
+            z_align_tile_consistency_tol_px=getattr(
+                cfg.n2n, "z_align_tile_consistency_tol_px", 2
+            ),
+            z_align_consensus_tol_px=getattr(cfg.n2n, "z_align_consensus_tol_px", 12.0),
+            z_align_local_refine_px=getattr(cfg.n2n, "z_align_local_refine_px", 0),
+        )
+
     return N2NOverlapPairDataset(
         overlaps_dir=Path(cfg.n2n.overlaps_dir),
         split=split,
@@ -1258,6 +1429,7 @@ def _build_n2n_overlap_dataset(
         train_ratio=cfg.splitting.train_ratio,
         val_ratio=cfg.splitting.val_ratio,
         guard_band_size=cfg.splitting.guard_band_size,
+        split_origin=getattr(cfg.splitting, "origin", None),
         orientation=cfg.n2n.orientation,
         max_pairs=max_pairs,
         pair_direction=cfg.n2n.pair_direction,
@@ -1390,6 +1562,11 @@ def main() -> None:
             "n2n.enabled=True cannot be combined with model_type='n2v'. "
             "Use a non-blind-spot backbone such as 'connectomics', 'residual_unet', or 'modern_unet'."
         )
+    if args.model:
+        cfg.model.model_type = model_type
+    cfg.validate()
+    in_channels, z_context_radius = _resolve_model_in_channels(cfg, is_n2n_mode)
+    split_sections_tracker: Dict[str, np.ndarray] = {}
 
     run_dir = output_dir / exp_name if exp_name else output_dir
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -1531,6 +1708,19 @@ def main() -> None:
                 max_pairs=cfg.n2n.max_val_pairs,
                 augment=False,
             )
+            if (
+                getattr(train_dataset, "cached_tile_sections", None) is not None
+                and getattr(val_dataset, "cached_tile_sections", None) is not None
+            ):
+                split_sections_tracker["train"] = train_dataset.cached_tile_sections
+                split_sections_tracker["val"] = val_dataset.cached_tile_sections
+                if (
+                    z_context_radius > 0
+                    or getattr(cfg.splitting, "origin", None) is not None
+                ):
+                    assert_disjoint_z_supports(
+                        split_sections_tracker, radius=z_context_radius
+                    )
         elif data_dir is not None:
             logger.info(f"Loading custom dataset from directory: {data_dir}")
             root_dir = (
@@ -1750,14 +1940,15 @@ def main() -> None:
         }
     model = build_model(
         model_type=model_type,
-        in_channels=1,
+        in_channels=in_channels,
         out_channels=1,
         base_dim=base_dim,
         **cosdd_opts,
         **n2v_opts,
     ).to(device)
     logger.info(
-        f"Initialized neural network architecture: '{model_type}' (base_dim={base_dim})"
+        f"Initialized neural network architecture: '{model_type}' "
+        f"(in_channels={in_channels}, base_dim={base_dim}, z_context_radius={z_context_radius})"
     )
     if (
         device.type == "cuda"
@@ -1862,6 +2053,7 @@ def main() -> None:
                     crop_size=getattr(cfg.inference, "preview_crop_size", 512),
                     crop_y=getattr(cfg.inference, "preview_crop_y", None),
                     crop_x=getattr(cfg.inference, "preview_crop_x", None),
+                    in_channels=in_channels,
                 )
                 logger.info(
                     f"Checkpoint preview enabled on {preview_crop.shape} crop from: {preview_path}"
@@ -1885,6 +2077,13 @@ def main() -> None:
             resume_ckpt = torch.load(
                 resume_path, map_location=device, weights_only=False
             )
+            ckpt_in_ch = _infer_checkpoint_in_channels(resume_ckpt)
+            if ckpt_in_ch is not None and ckpt_in_ch != in_channels:
+                raise ValueError(
+                    f"Resume checkpoint {resume_path} has in_channels={ckpt_in_ch}, "
+                    f"which does not match current model in_channels={in_channels} "
+                    f"(z_context_radius={z_context_radius})."
+                )
             getattr(model, "_orig_mod", model).load_state_dict(
                 resume_ckpt["model_state_dict"]
             )
@@ -1942,6 +2141,8 @@ def main() -> None:
                 scheduler=scheduler,
                 config=serialized_cfg,
                 save_all_epochs=getattr(cfg.training, "save_all_epochs", True),
+                in_channels=in_channels,
+                z_context_radius=z_context_radius,
             )
             if is_best:
                 best_checkpoint_path = best_ckpt
@@ -2029,6 +2230,13 @@ def main() -> None:
     checkpoint = torch.load(
         best_checkpoint_path, map_location=device, weights_only=False
     )
+    ckpt_in_ch = _infer_checkpoint_in_channels(checkpoint)
+    if ckpt_in_ch is not None and ckpt_in_ch != in_channels:
+        raise ValueError(
+            f"Checkpoint {best_checkpoint_path} has in_channels={ckpt_in_ch}, "
+            f"which does not match current model in_channels={in_channels} "
+            f"(z_context_radius={z_context_radius})."
+        )
     state_dict = checkpoint["model_state_dict"]
     if (
         model_type.lower().strip() in ("residual_unet", "res_unet", "residual")
@@ -2041,7 +2249,7 @@ def main() -> None:
         )
         model = build_model(
             model_type=model_type,
-            in_channels=1,
+            in_channels=in_channels,
             out_channels=1,
             base_dim=base_dim,
             norm_transitions=False,
@@ -2110,6 +2318,15 @@ def main() -> None:
             max_pairs=cfg.n2n.max_test_pairs,
             augment=False,
         )
+        if getattr(test_dataset, "cached_tile_sections", None) is not None:
+            split_sections_tracker["test"] = test_dataset.cached_tile_sections
+            if (
+                z_context_radius > 0
+                or getattr(cfg.splitting, "origin", None) is not None
+            ):
+                assert_disjoint_z_supports(
+                    split_sections_tracker, radius=z_context_radius
+                )
     elif test_clean_dir.exists() and len(list(test_clean_dir.glob("*.tif"))) > 0:
         logger.info(f"Loading test set from TIFF directory: {test_clean_dir}")
         test_denoised_dir = run_dir / "test" / "denoised"

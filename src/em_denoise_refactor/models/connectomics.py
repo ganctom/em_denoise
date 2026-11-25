@@ -2,6 +2,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from em_denoise_refactor.models.residual_unet import (
+    _extract_residual_skip,
+    _validate_residual_channels,
+)
+
 
 # -------------------------------------------------------------------------
 # Core Primitives (NAFBlock)
@@ -83,6 +88,9 @@ class LaplacianEdgeAttention(nn.Module):
 class ConnectomicsDenoisingNet(nn.Module):
     def __init__(self, in_channels: int = 1, out_channels: int = 1, base_dim: int = 32):
         super().__init__()
+        _validate_residual_channels(in_channels, out_channels)
+        self.in_channels = in_channels
+        self.out_channels = out_channels
 
         self.intro = nn.Conv2d(in_channels, base_dim, kernel_size=3, padding=1)
 
@@ -126,5 +134,5 @@ class ConnectomicsDenoisingNet(nn.Module):
         u2 = self.up2(dec1) + e1
         dec2 = self.dec2(u2)
 
-        # Global residual reconstruction
-        return self.outro(dec2) + x
+        # Global residual reconstruction (center channel for 2.5D inputs)
+        return self.outro(dec2) + _extract_residual_skip(x, self.out_channels)

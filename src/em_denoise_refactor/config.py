@@ -71,6 +71,9 @@ class SplittingConfig:
     val_ratio: float = 0.1
     test_ratio: float = 0.1
     guard_band_size: int = 5
+    origin: Optional[int] = (
+        None  # Absolute block-grid anchor (e.g. 0); required when z_context_radius > 0
+    )
 
 
 @dataclass
@@ -262,11 +265,80 @@ class N2NConfig:
     prep_workers: int = 1  # Threads for alignment & QA during tile materialization
     streaming: bool = False
     shuffle_buffer_size: int = 2048
+    # True 2.5D Noise2Noise configuration (0 = standard 2D N2N, 1 = 3-slice, 2 = 5-slice)
+    z_context_radius: int = 0
+    z_context_view: str = "full"  # "full" | "center_only" (same-patch 2D control) | "center_filled" (ablation)
+    z_eval_radius: Optional[int] = (
+        None  # Optional inner-channel slice when evaluating R=1 on a frozen R=2 cache
+    )
+    z_neighbor_dropout_prob: float = (
+        0.15  # Per-neighbor center-fill dropout probability during training
+    )
+    z_flip_augment: bool = (
+        False  # Default False (SBEM subsurface BSE asymmetry); opt-in A/B
+    )
+    # Locked Phase 0 registration thresholds
+    z_align_prior_search_px: int = (
+        32  # Prior-centered search half-width around (mov.fy0-ref.fy0, mov.fx0-ref.fx0)
+    )
+    z_align_min_dog_ncc: float = 0.15  # Fine-stage 1x DoG-NCC threshold
+    z_align_min_psr: float = (
+        7.5  # Coarse-stage fixed-window Peak-to-Sidelobe Ratio threshold
+    )
+    z_align_high_ncc_override: float = 0.45  # Wide-lobe soma high-NCC override
+    z_align_high_ncc_min_psr: float = 6.0  # Minimum coarse PSR for high-NCC override
+    z_align_missed_cut_max_ncc: float = (
+        0.85  # Section-median hop DoG-NCC upper bound (missed-cut rejection)
+    )
+    z_align_closure_tol_px: int = 2  # Cycle closure max error (px)
+    z_align_tile_consistency_tol_px: int = (
+        2  # Per-first_exposed_tile_id _v/_h shift consistency tolerance (px)
+    )
+    z_align_consensus_tol_px: float = (
+        12.0  # Outer section-median physical shift sanity tolerance (<=0 disables)
+    )
+    z_align_local_refine_px: int = (
+        0  # Per-patch local integer Z-refine (0=stripe-rigid default; benchmark 0 vs 4)
+    )
 
     def __post_init__(self):
         if self.tile_stride is not None:
             sh, sw = normalize_hw_pair(self.tile_stride, "n2n.tile_stride")
             self.tile_stride = sh if sh == sw else [sh, sw]
+        if isinstance(self.z_context_radius, bool) or self.z_context_radius not in (
+            0,
+            1,
+            2,
+        ):
+            raise ValueError(
+                f"n2n.z_context_radius must be 0, 1, or 2, got {self.z_context_radius!r}"
+            )
+        self.z_context_view = str(self.z_context_view).lower().strip()
+        if self.z_context_view not in ("full", "center_only", "center_filled"):
+            raise ValueError(
+                f"n2n.z_context_view must be 'full', 'center_only', or 'center_filled', "
+                f"got {self.z_context_view!r}"
+            )
+        if not (0.0 <= float(self.z_neighbor_dropout_prob) < 1.0):
+            raise ValueError(
+                f"n2n.z_neighbor_dropout_prob must be in [0.0, 1.0), got {self.z_neighbor_dropout_prob}"
+            )
+        if self.z_align_prior_search_px <= 0:
+            raise ValueError(
+                f"n2n.z_align_prior_search_px must be > 0, got {self.z_align_prior_search_px}"
+            )
+        if self.z_align_local_refine_px < 0:
+            raise ValueError(
+                f"n2n.z_align_local_refine_px must be >= 0, got {self.z_align_local_refine_px}"
+            )
+        if self.z_eval_radius is not None:
+            if isinstance(self.z_eval_radius, bool) or not (
+                0 <= int(self.z_eval_radius) <= self.z_context_radius
+            ):
+                raise ValueError(
+                    f"n2n.z_eval_radius must be in [0, z_context_radius={self.z_context_radius}], "
+                    f"got {self.z_eval_radius!r}"
+                )
 
 
 @dataclass
@@ -292,9 +364,70 @@ class PipelineConfig:
     loss: LossConfig = field(default_factory=LossConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
 
+    def validate(self) -> None:
+        """Validate cross-section configuration invariants (especially for 2.5D N2N)."""
+        import logging
+
+        r = int(self.n2n.z_context_radius)
+        if r == 0:
+            if self.n2n.z_context_view != "full":
+                raise ValueError(
+                    f"n2n.z_context_view='{self.n2n.z_context_view}' requires n2n.z_context_radius > 0."
+                )
+            return
+
+        if not self.n2n.enabled:
+            raise ValueError(f"n2n.z_context_radius={r} requires n2n.enabled=True.")
+        source = str(self.n2n.source).lower().strip()
+        if source != "overlaps":
+            raise ValueError(
+                f"n2n.z_context_radius={r} is only supported with n2n.source='overlaps', got '{source}'."
+            )
+        pair_dir = str(self.n2n.pair_direction).lower().strip()
+        if pair_dir != "first_to_second":
+            raise ValueError(
+                f"n2n.z_context_radius={r} requires n2n.pair_direction='first_to_second' so all input "
+                f"channels are virgin single-exposure tissue, got '{pair_dir}'."
+            )
+        if self.n2n.streaming:
+            raise ValueError(
+                f"n2n.z_context_radius={r} is incompatible with n2n.streaming=True; "
+                "use patch_sampling='tile' with crop_cache_dir or cache_in_ram=True."
+            )
+        if str(self.n2n.patch_sampling).lower().strip() != "tile":
+            raise ValueError(
+                f"n2n.z_context_radius={r} requires n2n.patch_sampling='tile', got '{self.n2n.patch_sampling}'."
+            )
+        m_type = str(self.model.model_type).lower().strip()
+        if m_type in ("n2v", "noise2void", "n2v2", "cosdd", "cosdd_lvae"):
+            raise ValueError(
+                f"n2n.z_context_radius={r} is incompatible with model_type='{self.model.model_type}'. "
+                "Use 'residual_unet', 'connectomics', or 'modern_unet'."
+            )
+        if str(self.splitting.strategy).lower().strip() != "block":
+            raise ValueError(
+                f"n2n.z_context_radius={r} requires splitting.strategy='block' to prevent Z-leakage, "
+                f"got '{self.splitting.strategy}'."
+            )
+        if int(self.splitting.guard_band_size) < r:
+            raise ValueError(
+                f"n2n.z_context_radius={r} requires splitting.guard_band_size >= {r} to guarantee "
+                f"disjoint Z-support sets across splits, got {self.splitting.guard_band_size}."
+            )
+        if self.splitting.origin is None:
+            raise ValueError(
+                f"n2n.z_context_radius={r} requires an explicit absolute splitting.origin (e.g. 0) "
+                "so block boundaries cannot shift across filtered queries or superset cache slices."
+            )
+        if self.n2n.trim_enabled and int(self.n2n.v_trim_top_px) > 35:
+            logging.getLogger("train_and_infer").warning(
+                f"n2n.v_trim_top_px={self.n2n.v_trim_top_px} is tight for 2.5D N2N on ~180px vertical "
+                "stripes under inter-section shift; v_trim_top_px <= 25 is recommended."
+            )
+
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "PipelineConfig":
-        return cls(
+        cfg = cls(
             experiment=ExperimentConfig(**d.get("experiment", {})),
             data=DataConfig(**d.get("data", {})),
             splitting=SplittingConfig(**d.get("splitting", {})),
@@ -308,6 +441,8 @@ class PipelineConfig:
             loss=LossConfig(**d.get("loss", {})),
             inference=InferenceConfig(**d.get("inference", {})),
         )
+        cfg.validate()
+        return cfg
 
     @classmethod
     def from_yaml(cls, yaml_path: Path | str = "config.yaml") -> "PipelineConfig":

@@ -178,11 +178,15 @@ def _build_section_split_filter(
     train_ratio: float = 0.8,
     val_ratio: float = 0.1,
     guard_band_size: int = 5,
+    origin: Optional[int] = None,
 ) -> Dict[str, set[int]]:
     """
     Partition sorted section numbers into train/val/test sets without Z-leakage.
 
     Matches the splitting semantics of `SplittingConfig` in `config.py`.
+    When `origin` is provided (e.g., `0`), block boundaries are anchored at that
+    absolute section index rather than `sorted_secs[0]`, preventing anchor drift
+    across filtered queries or superset cache slicing.
     """
     if not sections:
         return {"train": set(), "val": set(), "test": set()}
@@ -202,12 +206,12 @@ def _build_section_split_filter(
         return splits
 
     # Default: "block" volumetric splitting with guard bands
-    min_s = sorted_secs[0]
+    anchor = int(origin) if origin is not None else sorted_secs[0]
     train_cut = train_ratio
     val_cut = train_ratio + val_ratio
 
     for s in sorted_secs:
-        offset = s - min_s
+        offset = s - anchor
         block_idx = offset // max(block_size, 1)
         pos_in_block = offset % max(block_size, 1)
 
@@ -231,13 +235,21 @@ def _build_section_split_filter(
 
 
 class _NpyChunkWriter:
-    """Constant-RAM sequential writer for standard NumPy .npy v1.0 (N, 2, H, W) uint8 files."""
+    """Constant-RAM sequential writer for standard NumPy .npy v1.0 (N, C, H, W) uint8 files."""
 
     HEADER_LEN = 128
 
-    def __init__(self, path: Path, patch_size: int | Sequence[int]) -> None:
+    def __init__(
+        self,
+        path: Path,
+        patch_size: int | Sequence[int],
+        num_channels: int = 2,
+    ) -> None:
         self.path = Path(path)
         self.patch_h, self.patch_w = normalize_hw_pair(patch_size, "patch_size")
+        self.num_channels = int(num_channels)
+        if self.num_channels <= 0:
+            raise ValueError(f"num_channels must be > 0, got {num_channels}")
         self.patch_size: int | Tuple[int, int] = (
             self.patch_h
             if self.patch_h == self.patch_w
@@ -249,9 +261,13 @@ class _NpyChunkWriter:
 
     def append(self, chunk: np.ndarray) -> None:
         arr = np.ascontiguousarray(chunk, dtype=np.uint8)
-        if arr.ndim != 4 or arr.shape[1:] != (2, self.patch_h, self.patch_w):
+        if arr.ndim != 4 or arr.shape[1:] != (
+            self.num_channels,
+            self.patch_h,
+            self.patch_w,
+        ):
             raise ValueError(
-                f"Expected chunk shape (N, 2, {self.patch_h}, {self.patch_w}), "
+                f"Expected chunk shape (N, {self.num_channels}, {self.patch_h}, {self.patch_w}), "
                 f"got {arr.shape}"
             )
         if arr.shape[0] == 0:
@@ -263,7 +279,7 @@ class _NpyChunkWriter:
         try:
             header_dict = (
                 f"{{'descr': '|u1', 'fortran_order': False, "
-                f"'shape': ({self.count}, 2, {self.patch_h}, {self.patch_w}), }}"
+                f"'shape': ({self.count}, {self.num_channels}, {self.patch_h}, {self.patch_w}), }}"
             ).encode("latin1")
             dict_target_len = self.HEADER_LEN - 10
             pad_len = dict_target_len - len(header_dict) - 1
@@ -383,6 +399,7 @@ class N2NOverlapPairDataset(Dataset):
         train_ratio: float = 0.8,
         val_ratio: float = 0.1,
         guard_band_size: int = 5,
+        split_origin: Optional[int] = None,
         orientation: str = "all",
         max_pairs: Optional[int] = None,
         pair_direction: str = "random_swap",
@@ -539,6 +556,7 @@ class N2NOverlapPairDataset(Dataset):
             train_ratio=train_ratio,
             val_ratio=val_ratio,
             guard_band_size=guard_band_size,
+            split_origin=split_origin,
             orientation=orientation,
             max_pairs=max_pairs,
             seed=seed,
@@ -568,6 +586,7 @@ class N2NOverlapPairDataset(Dataset):
                 train_ratio=train_ratio,
                 val_ratio=val_ratio,
                 guard_band_size=guard_band_size,
+                split_origin=split_origin,
                 orientation=orientation,
                 max_pairs=record_limit,
                 seed=seed,
@@ -582,6 +601,7 @@ class N2NOverlapPairDataset(Dataset):
                 train_ratio=train_ratio,
                 val_ratio=val_ratio,
                 guard_band_size=guard_band_size,
+                split_origin=split_origin,
                 orientation=orientation,
                 max_pairs=record_limit,
                 seed=seed,
@@ -641,6 +661,7 @@ class N2NOverlapPairDataset(Dataset):
         max_pairs: Optional[int],
         seed: int,
         order_by_shard: bool = False,
+        split_origin: Optional[int] = None,
     ) -> List[Tuple[str, str, int, int, int, int, int]]:
         """Query manifest.parquet via DuckDB and return byte-offset records."""
         ph, pw = normalize_hw_pair(patch_size, "patch_size")
@@ -682,6 +703,7 @@ class N2NOverlapPairDataset(Dataset):
             train_ratio=train_ratio,
             val_ratio=val_ratio,
             guard_band_size=guard_band_size,
+            origin=split_origin,
         )
         target_sections = sorted(split_map[self.split])
         if not target_sections:
@@ -749,6 +771,7 @@ class N2NOverlapPairDataset(Dataset):
         orientation: str,
         max_pairs: Optional[int],
         seed: int,
+        split_origin: Optional[int] = None,
     ) -> List[Tuple[str, str, int, int, int, int, int]]:
         """Scan local .tar shards directly when manifest.parquet is not present."""
         tar_files = sorted(self.overlaps_dir.glob("*.tar"))
@@ -805,6 +828,7 @@ class N2NOverlapPairDataset(Dataset):
             train_ratio=train_ratio,
             val_ratio=val_ratio,
             guard_band_size=guard_band_size,
+            origin=split_origin,
         )
         target_sections = split_map[self.split]
         if not target_sections:
@@ -977,6 +1001,7 @@ class N2NOverlapPairDataset(Dataset):
         orientation: str,
         max_pairs: Optional[int],
         seed: int,
+        split_origin: Optional[int] = None,
     ) -> Tuple[Dict[str, Any], str, str]:
         """Build preprocessing fingerprint, its hash, and the exact cache directory key."""
         source_sig = (
@@ -1027,6 +1052,8 @@ class N2NOverlapPairDataset(Dataset):
                 else None
             ),
         }
+        if split_origin is not None:
+            prep_fingerprint["split_origin"] = int(split_origin)
         prep_hash = _hash_payload(prep_fingerprint)
         exact_payload = {
             **prep_fingerprint,
@@ -2110,6 +2137,7 @@ class N2NStreamingShardDataset(IterableDataset):
         train_ratio: float = 0.8,
         val_ratio: float = 0.1,
         guard_band_size: int = 5,
+        split_origin: Optional[int] = None,
         orientation: str = "all",
         max_pairs: Optional[int] = None,
         pair_direction: str = "random_swap",
@@ -2177,6 +2205,7 @@ class N2NStreamingShardDataset(IterableDataset):
             train_ratio=train_ratio,
             val_ratio=val_ratio,
             guard_band_size=guard_band_size,
+            origin=split_origin,
         )
         self.target_sections = sorted(split_map[self.split])
         if not self.target_sections:

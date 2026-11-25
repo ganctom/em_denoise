@@ -20,6 +20,28 @@ class UNetConfig:
     norm_transitions: bool = True
 
 
+def _validate_residual_channels(in_channels: int, out_channels: int) -> None:
+    """Validate that global residual skip is well-defined for (in_channels, out_channels)."""
+    if in_channels == out_channels:
+        return
+    if out_channels == 1 and in_channels > 0 and in_channels % 2 == 1:
+        return
+    raise ValueError(
+        f"Global residual skip requires in_channels == out_channels or "
+        f"(out_channels == 1 and odd in_channels for 2.5D center-slice skip), "
+        f"got in_channels={in_channels}, out_channels={out_channels}."
+    )
+
+
+def _extract_residual_skip(x: torch.Tensor, out_channels: int) -> torch.Tensor:
+    """Return full input for 2D (C_in == C_out) or center slice for 2.5D (odd C_in -> 1)."""
+    c_in = x.shape[1]
+    if c_in == out_channels:
+        return x
+    center = c_in // 2
+    return x[:, center : center + 1]
+
+
 def _group_count(channels: int) -> int:
     """Return a valid GroupNorm group count dividing `channels` (preferring 8)."""
     for g in (8, 4, 2):
@@ -140,6 +162,8 @@ class ResidualUNet(nn.Module):
         if config is None:
             config = UNetConfig(**kwargs)
         self.config = config
+        if config.global_residual:
+            _validate_residual_channels(config.in_channels, config.out_channels)
 
         self.init_conv = nn.Conv2d(
             config.in_channels, config.base_channels, kernel_size=3, padding=1
@@ -251,7 +275,7 @@ class ResidualUNet(nn.Module):
 
         out = self.final_conv(self.final_act(self.final_norm(x)))
         if self.config.global_residual:
-            out = out + input_x
+            out = out + _extract_residual_skip(input_x, self.config.out_channels)
         return out
 
 
@@ -284,6 +308,9 @@ class ModernUNet(nn.Module):
 
     def __init__(self, in_channels: int = 1, out_channels: int = 1, base_dim: int = 32):
         super().__init__()
+        _validate_residual_channels(in_channels, out_channels)
+        self.in_channels = in_channels
+        self.out_channels = out_channels
         self.enc1 = ResConvBlock(in_channels, base_dim)
         self.enc2 = ResConvBlock(base_dim, base_dim * 2)
         self.pool = nn.MaxPool2d(2, 2)
@@ -310,4 +337,4 @@ class ModernUNet(nn.Module):
         u1 = self.up_conv1(self.up1(dec2))
         dec1 = self.dec1(torch.cat([u1, x1], dim=1))
 
-        return self.final(dec1) + x
+        return self.final(dec1) + _extract_residual_skip(x, self.out_channels)
