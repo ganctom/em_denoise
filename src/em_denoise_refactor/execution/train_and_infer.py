@@ -834,11 +834,17 @@ class DenoisingEvaluator:
         use_amp: bool = False,
         patch_size: int | Sequence[int] = 128,
         tiled_inference: bool = False,
+        tile_size: Optional[int | Sequence[int]] = None,
     ) -> None:
         self.model = model
         self.device = device
         self.use_amp = use_amp
         self.patch_hw = normalize_hw_pair(patch_size, "patch_size")
+        self.tile_hw = (
+            normalize_hw_pair(tile_size, "tile_size")
+            if tile_size is not None
+            else self.patch_hw
+        )
         self.tiled_inference = bool(tiled_inference)
         self.amp_dtype = (
             torch.bfloat16
@@ -866,7 +872,7 @@ class DenoisingEvaluator:
         elif patch_size is not None:
             ph, pw = normalize_hw_pair(patch_size, "patch_size")
         else:
-            ph, pw = self.patch_hw
+            ph, pw = self.tile_hw
 
         B, C, H, W = x.shape
         eff_h = min(ph, H)
@@ -943,8 +949,8 @@ class DenoisingEvaluator:
                 if hasattr(self.model, "ar_decoder") or (
                     self.tiled_inference
                     and (
-                        noisy_b.shape[-2] > self.patch_hw[0]
-                        or noisy_b.shape[-1] > self.patch_hw[1]
+                        noisy_b.shape[-2] > self.tile_hw[0]
+                        or noisy_b.shape[-1] > self.tile_hw[1]
                     )
                 ):
                     pred_b = self._denoise_tiled(noisy_b)
@@ -2286,11 +2292,6 @@ def main() -> None:
                     getattr(cfg.inference, "z_register_block_size", 1024)
                 ),
             )
-            if not bool(getattr(cfg.inference, "tiled", False)):
-                logger.warning(
-                    "Running 2.5D custom_input_dir inference with inference.tiled=False; "
-                    "enable inference.tiled=True for large 3072x4096 tiles."
-                )
         else:
             test_dataset = CustomTIFFDataset(custom_input_dir, cache_in_ram=True)
         test_denoised_dir = run_dir / "custom_inference" / "denoised"
@@ -2368,12 +2369,22 @@ def main() -> None:
         )
 
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
+    tiled_inf = bool(getattr(cfg.inference, "tiled", False))
+    infer_tile_size = getattr(cfg.inference, "tile_size", None)
+    if tiled_inf and infer_tile_size is None and not hasattr(model, "crop_size"):
+        # Avoid 128x128 GroupNorm local-variance shifts on UNets when tiled=True
+        infer_tile_size = 1024
+        logger.info(
+            "Tiled inference enabled without inference.tile_size; defaulting to 1024x1024 "
+            "for fully-convolutional models (set inference.tile_size to override)."
+        )
     evaluator = DenoisingEvaluator(
         model=model,
         device=device,
         use_amp=use_amp,
         patch_size=cfg.extraction.patch_size,
-        tiled_inference=bool(getattr(cfg.inference, "tiled", False)),
+        tiled_inference=tiled_inf,
+        tile_size=infer_tile_size,
     )
     results = evaluator.evaluate_test_set(test_loader, test_denoised_dir)
 

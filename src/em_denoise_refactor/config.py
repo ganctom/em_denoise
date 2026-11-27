@@ -139,6 +139,7 @@ class InferenceConfig:
     preview_crop_y: Optional[int] = None
     preview_crop_x: Optional[int] = None
     tiled: bool = False
+    tile_size: Optional[int | Tuple[int, int]] = None
     z_register: bool = True
     z_register_max_shift_px: int = 64
     z_register_block_size: int = 1024
@@ -153,6 +154,9 @@ class InferenceConfig:
         else:
             self.preview_image = None
         self.tiled = bool(self.tiled)
+        if self.tile_size is not None:
+            th, tw = normalize_hw_pair(self.tile_size, "inference.tile_size")
+            self.tile_size = th if th == tw else (th, tw)
 
 
 @dataclass

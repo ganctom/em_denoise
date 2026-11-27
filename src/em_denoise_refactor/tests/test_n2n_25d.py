@@ -447,8 +447,13 @@ def test_r2_bfloat16_smoke_and_tiled_output_single_channel():
 
     # _denoise_tiled must output (1, 1, H, W), never broadcast to (1, 5, H, W)
     evaluator = train_and_infer.DenoisingEvaluator(
-        model=model, device=torch.device("cpu"), patch_size=64, tiled_inference=True
+        model=model,
+        device=torch.device("cpu"),
+        patch_size=64,
+        tiled_inference=True,
+        tile_size=80,
     )
+    assert evaluator.tile_hw == (80, 80)
     big_x = torch.rand(1, 5, 96, 112)
     out = evaluator._denoise_tiled(big_x)
     assert out.shape == (1, 1, 96, 112)

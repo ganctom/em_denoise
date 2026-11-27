@@ -109,4 +109,5 @@ inference:
   custom_input_dir: null
   preview_image: null
   preview_crop_size: 512
-  tiled: true
+  tiled: false                        # Keep false for full-frame 3072x4096 (avoids small-tile GroupNorm shifts); set true + tile_size: 1024 if VRAM-limited
+  tile_size: null
